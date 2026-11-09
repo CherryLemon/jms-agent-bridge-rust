@@ -56,6 +56,8 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_target(false)
+        // stdout carries MCP messages in stdio mode; logs always go to stderr.
+        .with_writer(std::io::stderr)
         .try_init();
 }
 
@@ -201,44 +203,65 @@ async fn serve(flags: Flags) -> Result<(), BridgeError> {
 }
 
 async fn doctor(flags: Flags) -> Result<(), BridgeError> {
-    let runtime = BridgeRuntime::start(flags.config.as_deref(), false).await?;
+    // Diagnostics must not claim the resident state directory, start its cleanup
+    // workers or rewrite terminal/result state: they only need REST plus a cache.
+    jms_bridge::tls::install_default_provider();
+    let cfg = Arc::new(jms_bridge::config::load_config(flags.config.as_deref())?);
+    let mut settings = jms_bridge::config::load_settings(flags.config.as_deref())?;
+    settings.state_dir =
+        std::env::temp_dir().join(format!("jms-bridge-doctor-{}", std::process::id()));
+    let settings = Arc::new(settings);
+    let catalog = jms_bridge::rest::catalog::AssetCatalog::new(cfg.clone(), settings.clone())?;
     println!("jms-bridge {}", jms_bridge::version());
-    println!("bastion: {}", runtime.cfg.url);
-    println!("ssh port: {}", runtime.cfg.ssh_port);
+    println!("bastion: {}", cfg.url);
+    println!("ssh port: {}", cfg.ssh_port);
     println!(
         "login user: {}",
-        runtime
-            .cfg
-            .login_user
-            .clone()
-            .unwrap_or_else(|| "-".to_string())
+        cfg.login_user.clone().unwrap_or_else(|| "-".to_string())
     );
-    println!("state dir: {}", runtime.settings.state_dir.display());
-    match runtime.catalog.probe_health(Duration::from_secs(10)).await {
+    println!("state dir (resident): {}", settings.state_dir.display());
+    match settings.resolve_known_hosts() {
+        Ok(path) => println!("known_hosts: {}", path.display()),
+        Err(error) => println!("known_hosts: NOT CONFIGURED ({})", error.message()),
+    }
+    match catalog.probe_health(Duration::from_secs(10)).await {
         Ok(value) => println!("/api/health/: OK {value}"),
         Err(error) => {
             println!("/api/health/: FAIL {}", error.message());
-            match runtime.catalog.probe_version(Duration::from_secs(10)).await {
+            match catalog.probe_version(Duration::from_secs(10)).await {
                 Ok(Some(version)) => println!("settings/public/open/: OK version {version}"),
                 Ok(None) => println!("settings/public/open/: no version field"),
                 Err(error) => println!("settings/public/open/: FAIL {}", error.message()),
             }
         }
     }
-    match runtime.catalog.ensure().await {
+    match catalog.ensure().await {
         Ok(inventory) => {
             println!("inventory: {} permitted assets", inventory.hosts.len());
-            let status = runtime.catalog.status();
+            let status = catalog.status();
             println!("snapshot: {status}");
         }
         Err(error) => println!("inventory: FAIL {}", error.message()),
     }
-    runtime.shutdown().await;
+    catalog.close();
+    let _ = std::fs::remove_dir_all(&settings.state_dir);
     Ok(())
 }
 
 async fn probe(flags: Flags) -> Result<(), BridgeError> {
-    let runtime = BridgeRuntime::start(flags.config.as_deref(), false).await?;
+    // Either this process owns the state directory, or the resident service does
+    // and this probe goes through its MCP endpoint.
+    let runtime = match BridgeRuntime::start(flags.config.as_deref(), true).await {
+        Ok(runtime) => runtime,
+        Err(error)
+            if error
+                .message()
+                .contains("state directory is already in use") =>
+        {
+            return probe_over_http(&flags).await;
+        }
+        Err(error) => return Err(error),
+    };
     let arguments = json!({
         "targets": [flags.target],
         "script": "uname -s; uname -m",
@@ -256,6 +279,89 @@ async fn probe(flags: Flags) -> Result<(), BridgeError> {
     println!("{}", summarize(&value));
     runtime.shutdown().await;
     Ok(())
+}
+
+/// `probe` against the running service, so a resident state directory is never
+/// opened by a second process.
+async fn probe_over_http(flags: &Flags) -> Result<(), BridgeError> {
+    let endpoint = format!("http://{}:{}/mcp", flags.host, flags.port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|error| BridgeError::config(format!("cannot build HTTP client: {error}")))?;
+    let call = |id: u64, method: &'static str, params: Value| {
+        let client = client.clone();
+        let endpoint = endpoint.clone();
+        async move {
+            let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+            let response = client
+                .post(&endpoint)
+                .header("Accept", "application/json, text/event-stream")
+                .header("MCP-Protocol-Version", "2025-06-18")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| BridgeError::ssh(format!("{endpoint}: {error}")))?;
+            let text = response
+                .text()
+                .await
+                .map_err(|error| BridgeError::ssh(format!("{endpoint}: {error}")))?;
+            parse_jsonrpc(&text)
+        }
+    };
+    call(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "jms-bridge-probe", "version": jms_bridge::version()},
+        }),
+    )
+    .await?;
+    let value = call(
+        2,
+        "tools/call",
+        json!({
+            "name": "run",
+            "arguments": {
+                "targets": [flags.target],
+                "script": "uname -s; uname -m",
+                "timeout": 30,
+                "max_output_bytes": 4096,
+            },
+        }),
+    )
+    .await?;
+    let text = value
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BridgeError::ssh("service returned no tool result"))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// Accept both plain JSON bodies and SSE-framed JSON-RPC responses.
+fn parse_jsonrpc(text: &str) -> Result<Value, BridgeError> {
+    let trimmed = text.trim();
+    let payload = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        trimmed.to_string()
+    } else {
+        trimmed
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .filter(|line| line.starts_with('{'))
+            .next_back()
+            .ok_or_else(|| BridgeError::ssh("service returned no JSON-RPC payload"))?
+            .to_string()
+    };
+    let value: Value = serde_json::from_str(&payload)
+        .map_err(|error| BridgeError::ssh(format!("invalid JSON-RPC payload: {error}")))?;
+    if let Some(error) = value.get("error") {
+        return Err(BridgeError::ssh(format!("service error: {error}")));
+    }
+    Ok(value)
 }
 
 /// One-line JSON diagnostic used by `probe` and operators.

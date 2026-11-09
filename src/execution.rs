@@ -154,7 +154,7 @@ pub struct Runner {
     pub scheduler: Arc<ExecutionSlots>,
     pub queue_timeout: f64,
     pub rsync_binary: crate::transport::rsync::RsyncBinary,
-    shells: AsyncMutex<HashMap<(String, String), ShellSession>>,
+    shells: Arc<AsyncMutex<HashMap<(String, String), ShellSession>>>,
     session_gates: Mutex<HashMap<(String, String), Arc<AsyncMutex<()>>>>,
     known_sessions: Mutex<HashSet<(String, String)>>,
     registry: std::path::PathBuf,
@@ -208,7 +208,7 @@ impl Runner {
             store,
             queue_timeout,
             rsync_binary: crate::transport::rsync::RsyncBinary::default(),
-            shells: AsyncMutex::new(HashMap::new()),
+            shells: Arc::new(AsyncMutex::new(HashMap::new())),
             session_gates: Mutex::new(HashMap::new()),
             known_sessions: Mutex::new(known),
             registry,
@@ -381,6 +381,18 @@ impl Runner {
             let key = host.connection_key()?;
             let pool = self.pool.clone();
             let host_for_replace = host.clone();
+            // A connection that still carries named shells must not be replaced
+            // underneath them: those sessions would be lost without a trace.
+            let shells = self.shells.clone();
+            let protect_key = key.clone();
+            let protected = std::sync::Arc::new(move || {
+                match shells.try_lock() {
+                    Ok(map) => map.keys().any(|(shell_key, _)| shell_key == &protect_key),
+                    // Busy means an operation is using the map right now: assume the
+                    // shells are live rather than tearing the connection down.
+                    Err(_) => true,
+                }
+            });
             let recovery = self
                 .recovery
                 .clone()
@@ -393,7 +405,7 @@ impl Runner {
                             Ok(())
                         })
                     }),
-                    std::sync::Arc::new(|| false),
+                    protected,
                     false,
                     queue_timeout,
                 )
@@ -473,12 +485,27 @@ impl Runner {
             prefix.push(format!("export {key}={}", shell_quote(value)));
         }
         prefix.push(script.to_string());
-        let mut body = prefix.join("\n") + "\n";
+        let body_text = prefix.join("\n") + "\n";
+        // Isolated runs execute in a subshell so `set -e` still stops the script while
+        // the wrapper survives to report `$?`. A named shell must *not* do that: `cd`
+        // and exports have to persist for the next call on the same session.
+        let mut body = if spec.session_id.is_none() {
+            format!("(\n{body_text})\n__jms_exec_rc=$?\n")
+        } else {
+            body_text
+        };
         if let Some(cwd) = spec.cwd.as_deref().filter(|value| !value.is_empty()) {
-            body = format!(
-                "if builtin cd -- {}; then\n{body}\nelse\n false\nfi\n",
-                shell_quote(cwd)
-            );
+            body = if spec.session_id.is_none() {
+                format!(
+                    "if builtin cd -- {}; then\n{body}else\n__jms_exec_rc=1\nfi\n",
+                    shell_quote(cwd)
+                )
+            } else {
+                format!(
+                    "if builtin cd -- {}; then\n{body}else\nfalse\nfi\n",
+                    shell_quote(cwd)
+                )
+            };
         }
         let sent = Arc::new(AtomicBool::new(false));
         let mut timings = Timings::default();
@@ -601,10 +628,12 @@ impl Runner {
             Value::Bool(attempt.queue_timed_out),
         );
         values.insert("connection_timing".into(), timings.connection_snapshot());
-        values.insert(
-            "connection_generation".into(),
-            json!(self.recovery.generation(&host.connection_key()?)),
-        );
+        // Report the pool's real generation and mirror it into the recovery tracker,
+        // which is what decides whether a replacement already happened.
+        let generation = self.pool.generation(&host.connection_key()?);
+        self.recovery
+            .set_generation(&host.connection_key()?, generation);
+        values.insert("connection_generation".into(), json!(generation));
         if attempt.warning.is_some()
             || attempt
                 .failure_stage
@@ -825,16 +854,21 @@ impl Runner {
         }
         timings.channel_seconds += channel_started.elapsed().as_secs_f64();
         let nonce = new_nonce();
-        let marker = format!("__JMS_EXEC_{nonce}__\n").into_bytes();
+        let start = crate::transport::session::exec_start_marker(&nonce);
+        let end = crate::transport::session::exec_end_marker(&nonce);
         let mut packet = Vec::new();
         packet.extend_from_slice(
+            format!("printf '\\036START{nonce}\\037'; printf '\\036START{nonce}\\037' >&2\n")
+                .as_bytes(),
+        );
+        packet.extend_from_slice(body.as_bytes());
+        packet.extend_from_slice(
             format!(
-                "printf '%s\\n' {}\n",
-                shell_quote(&String::from_utf8_lossy(&marker).trim_end_matches('\n'))
+                "printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\"; \
+printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
             )
             .as_bytes(),
         );
-        packet.extend_from_slice(body.as_bytes());
         let execution_started = Instant::now();
         sent.store(true, Ordering::SeqCst);
         let write = session.writer.write(&packet).await;
@@ -842,32 +876,44 @@ impl Runner {
         let pump = match write {
             Ok(()) => {
                 session
-                    .pump(out_path, err_path, Some(marker.clone()), Some(deadline))
+                    .pump(out_path, err_path, Some(start), Some(end), Some(deadline))
                     .await
             }
             Err(error) => Err(error),
         };
         timings.execution_seconds += execution_started.elapsed().as_secs_f64();
-        let exit_code = session.exit_code().unwrap_or(255);
+        let channel_exit = session.exit_code();
         session.close().await;
         match pump {
-            Ok(started) => {
-                let completed = started && exit_code >= 0;
+            Ok(outcome) => {
+                if outcome.rejected {
+                    return Attempt::not_started(
+                        Some("SSH channel rejected the execution request".to_string()),
+                        "channel",
+                    );
+                }
+                let started = outcome.started;
+                // Completion needs real evidence: the script's own end marker, or the
+                // transport's exit status. A missing status is `unknown`, never a
+                // synthetic 255 that looks like a finished run.
+                let end_code = outcome.end_code;
+                let evidence = end_code.or(channel_exit.or(outcome.exit_status));
+                let completed = started && evidence.is_some();
+                let code = evidence.unwrap_or(255) as i64;
                 let warning = if !started {
                     Some(
                         "SSH channel ended without the script start acknowledgment after transmission; remote completion is unknown; do not replay automatically.".to_string(),
                     )
                 } else if !completed {
-                    Some("SSH channel ended without a completion status; remote completion is unknown.".to_string())
+                    Some(
+                        "SSH channel ended without a completion status; remote completion is unknown; inspect before rerunning."
+                            .to_string(),
+                    )
                 } else {
                     None
                 };
                 Attempt {
-                    code: if !started && exit_code == 0 {
-                        75
-                    } else {
-                        exit_code as i64
-                    },
+                    code: if !started { 75 } else { code },
                     executed: Some(started),
                     timed_out: false,
                     warning,
@@ -969,7 +1015,9 @@ impl Runner {
                     return Attempt::not_started(Some(error.message()), "channel");
                 }
             };
-            shells.insert(session_key.clone(), ShellSession::new(shell));
+            let mut session_shell = ShellSession::new(shell);
+            session_shell.launch = Some(command.to_string());
+            shells.insert(session_key.clone(), session_shell);
             if !spec.internal_session {
                 self.known_sessions
                     .lock()
@@ -983,6 +1031,20 @@ impl Runner {
             timings.channel_seconds += channel_started.elapsed().as_secs_f64();
         }
         let shell = shells.get_mut(&session_key).expect("session present");
+        // A shell keeps the container/image/docker arguments it was opened with: a
+        // later call cannot silently run somewhere else than its metadata claims.
+        if let Some(launch) = &shell.launch {
+            if launch != command {
+                return Attempt::not_started(
+                    Some(
+                        "session was opened with a different container/image/docker_args; \
+close it or use a new session_id"
+                            .to_string(),
+                    ),
+                    "session",
+                );
+            }
+        }
         if shell.is_closing() {
             shells.remove(&session_key);
             return Attempt::not_started(
@@ -1040,13 +1102,20 @@ impl Runner {
                 }
             }
             Err(error) if error.message().contains("timed out") => {
+                // The shell still has an unknown command in flight. Close its channel and
+                // stop reusing it, but keep the registry entry so a later call reports the
+                // loss instead of silently rebuilding a fresh shell behind the same id.
+                shell.lost = true;
+                shell.close().await;
+                shells.remove(&session_key);
                 drop(shells);
                 Attempt {
                     code: 124,
                     executed: Some(true),
                     timed_out: true,
                     warning: Some(
-                        "Execution timed out; remote completion is unknown. Inspect before rerunning."
+                        "Execution timed out; remote completion is unknown. This session_id was \
+closed and must not be reused. Inspect before rerunning."
                             .to_string(),
                     ),
                     sent: true,

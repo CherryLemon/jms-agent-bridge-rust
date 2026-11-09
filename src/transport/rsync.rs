@@ -467,10 +467,7 @@ async fn serve_stream(
     let (writer, mut reader) = channel.split();
     let ready_started = Instant::now();
     let mut ready: Vec<u8> = Vec::new();
-    while !ready
-        .windows(READY_MARKER.len())
-        .any(|window| window == READY_MARKER.as_bytes())
-    {
+    while take_ready(&ready).is_none() {
         if ready_started.elapsed() > Duration::from_secs(15) {
             return Err(BridgeError::ssh(
                 "remote side did not confirm the rsync channel; transfer state is unknown",
@@ -485,6 +482,14 @@ async fn serve_stream(
                 ))
             }
         }
+    }
+    // The marker and the first rsync protocol bytes can share one SSH packet; only
+    // the marker is stripped and everything after it must reach the local rsync.
+    let leftover = take_ready(&ready).expect("marker verified above");
+    if !leftover.is_empty() && stream.write_all(&leftover).await.is_err() {
+        return Err(BridgeError::ssh(
+            "rsync socket closed before the protocol started",
+        ));
     }
     sent.store(true, Ordering::SeqCst);
     let err_handle = err_path.to_path_buf();
@@ -541,6 +546,19 @@ async fn serve_stream(
         }
     });
     Ok(())
+}
+
+/// Bytes that follow the readiness marker, or `None` while it has not fully arrived.
+///
+/// The marker is only a prefix of the stream: a single SSH packet may carry it and
+/// the first rsync protocol bytes together, and dropping those bytes breaks the
+/// handshake even though the relay looks healthy.
+fn take_ready(buffer: &[u8]) -> Option<Vec<u8>> {
+    let marker = READY_MARKER.as_bytes();
+    let position = buffer
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    Some(buffer[position + marker.len()..].to_vec())
 }
 
 /// The relay child: connect to the service socket, then copy bytes both ways.
@@ -645,5 +663,33 @@ mod tests {
         let directory = relay.directory.clone();
         drop(relay);
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn readiness_keeps_protocol_bytes_from_the_same_packet() {
+        let mut packet = READY_MARKER.as_bytes().to_vec();
+        packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x1f]);
+        assert_eq!(
+            take_ready(&packet),
+            Some(vec![0x00, 0x00, 0x00, 0x1f]),
+            "protocol bytes sent with the marker must reach the local rsync"
+        );
+    }
+
+    #[test]
+    fn readiness_alone_yields_no_leftover() {
+        assert_eq!(take_ready(READY_MARKER.as_bytes()), Some(Vec::new()));
+    }
+
+    #[test]
+    fn readiness_waits_until_the_marker_is_complete() {
+        let marker = READY_MARKER.as_bytes();
+        assert_eq!(take_ready(&marker[..marker.len() - 1]), None);
+        assert_eq!(take_ready(b"banner\n"), None);
+        // A split marker becomes visible once the second half arrives.
+        let mut buffer = marker[..3].to_vec();
+        buffer.extend_from_slice(&marker[3..]);
+        buffer.extend_from_slice(b"payload");
+        assert_eq!(take_ready(&buffer), Some(b"payload".to_vec()));
     }
 }

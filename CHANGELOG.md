@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.3.1
+
+Correctness pass after an external review of `0.3.0`: the item below changes
+behaviour, the rest closes gaps between modules.
+
+### Behaviour changes
+* The gateway host key is verified by default (`~/.ssh/known_hosts` or
+  `bridge.known_hosts`); an unknown or changed key is refused instead of
+  accepted silently.
+* An asset with several permitted accounts is no longer resolved by guessing:
+  set `bridge.preferred_account`, otherwise it stays explicitly unusable.
+* `jms_job_cancel` reports the real outcome (`killed`, `status_before`,
+  `already_finished`, launcher `result_id`) instead of forcing `ok: true`.
+* `jms_list_assets` pages (`offset`/`limit`/`next_offset`), `jms_job_logs`
+  defaults to a 4 KiB window, and any `call` response above 8 KiB is saved and
+  returned as a bounded summary with a `result_id`.
+* Authentication has a 60 s budget: a gateway that keeps prompting fails with an
+  authentication error instead of holding the request.
+
+### Fixed
+* A run whose channel closed after the start marker but before any completion
+  evidence is now `unknown`; an exit status that arrives after `Eof` is kept;
+  an exit status without the start marker is never treated as success.
+* `pump` flushes buffered output when the channel ends, so the tail of a run is
+  not lost; split end markers are reassembled.
+* Terminal commands wait for *both* streams, and a start+end pair in one packet
+  registers as started.
+* Named shells keep their launch configuration: reusing a `session_id` with a
+  different container/image is refused, and a timed-out shell is closed and
+  marked lost instead of being reused while an unknown command is in flight.
+* A cancelled queued task returns its execution slot instead of leaking it, and
+  cancelled waiters no longer inflate the queue depth.
+* Request progress rows are written under one journal lock, so concurrent
+  targets cannot overwrite each other; run/transfer progress records the result
+  id before the response is written.
+* `doctor` uses a throwaway state directory and never touches a live service;
+  `probe` takes the state lock, or speaks to the running service over HTTP.
+* stdio logging goes to stderr, so stdout carries protocol frames only.
+* The rsync relay forwards protocol bytes that share a packet with the readiness
+  marker.
+* The job launcher acknowledges a job that already finished, and detached
+  commands receive absolute paths instead of a `$R` the tmux server may not have.
+* A transient error while reading one asset detail fails the whole refresh and
+  keeps the previous snapshot; only an explicit 403/404 removes an asset.
+* `NO_PROXY` is honoured for the REST client, and an inherited egress proxy is
+  no longer used for hosts it excludes.
+* The advertised schemas shrank from 10.2 KB to 5.8 KB; validation uses the
+  complete definitions, and `discover(operation=<tool>)` returns them.
+* `env` values are type-checked before execution (`{"A": 0}` is rejected instead
+  of silently dropped), and the schema test that used to swallow validation
+  errors now runs a valid and an invalid sample per tool.
+* `session_list` reports both session kinds and `session_close` resolves the
+  handle; the recovery tracker follows the pool's real connection generation and
+  refuses to replace a connection that still carries named shells.
+* A `run` fingerprint is computed over the normalized call, matching the Python
+  bridge so an equivalent retry is recognized across implementations.
+
 ## 0.3.0
 
 Rust reimplementation of `jms-agent-bridge` (reference `fd2085f`), following its migration plan.

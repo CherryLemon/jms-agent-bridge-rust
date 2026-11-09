@@ -89,7 +89,10 @@ pub fn build_runner_script(
 ) -> String {
     let mut lines = vec![
         "set -uo pipefail".to_string(),
-        "R=\"$(cd \"$(dirname \"$0\")\" && pwd)\"".to_string(),
+        // The launcher passes the job root explicitly; the fallback keeps the script
+        // usable when run by hand.
+        "R=\"${1-}\"".to_string(),
+        "[ -n \"$R\" ] || R=\"$(cd \"$(dirname \"$0\")\" && pwd)\"".to_string(),
     ];
     if let Some(env_setup) = env_setup.filter(|value| !value.is_empty()) {
         // Vendor env scripts reference variables that may be unset.
@@ -129,25 +132,36 @@ pub fn launch_script(
     workdir: Option<&str>,
 ) -> String {
     let runner = build_runner_script(job_id, body, env_setup, workdir);
+    // `root` is a shell expression such as "$HOME"/jobs/abcd1234: it is expanded here,
+    // in the launcher shell, so the detached command never depends on inherited
+    // environment (a tmux server keeps its own).
     [
         "set -eu".to_string(),
-        // Exported so the detached launcher (tmux/setsid) can expand "$R".
-        format!("export R={root}"),
+        format!("R={root}"),
+        "export R".to_string(),
         "mkdir -p \"$R\"".to_string(),
         format!("cat > \"$R/run.sh\" <<'JMS_RUNNER_EOF'\n{runner}JMS_RUNNER_EOF"),
+        // Ack means "the job wrote its own pid or status", which also covers jobs that
+        // finished before the launcher looked at them.
+        "wait_started() { i=0; while [ \"$i\" -lt 15 ]; do [ -f \"$R/pid\" ] || \
+[ -f \"$R/status\" ] && return 0; i=$((i + 1)); sleep 1; done; return 1; }".to_string(),
         "if command -v tmux >/dev/null 2>&1; then".to_string(),
         format!(
-            "  tmux new-session -d -s {} 'bash \"$R/run.sh\" > \"$R/stdout.log\" 2>&1; echo $? > \"$R/tmux_exit\"'",
+            "  tmux new-session -d -s {} \"bash \\\"$R/run.sh\\\" \\\"$R\\\" > \
+\\\"$R/stdout.log\\\" 2>&1; echo \\$? > \\\"$R/tmux_exit\\\"\" || \
+{{ echo 'tmux refused the session' >&2; exit 4; }}",
             shell_quote(session)
         ),
-        format!("  tmux has-session -t {} && echo LAUNCHER=tmux", shell_quote(session)),
+        "  if wait_started; then echo LAUNCHER=tmux; else echo 'job did not start' >&2; exit 5; fi"
+            .to_string(),
         "else".to_string(),
         "  command -v setsid >/dev/null 2>&1 || { echo 'no tmux and no setsid' >&2; exit 3; }"
             .to_string(),
-        "  setsid bash \"$R/run.sh\" > \"$R/stdout.log\" 2>&1 < /dev/null &".to_string(),
+        "  setsid bash \"$R/run.sh\" \"$R\" > \"$R/stdout.log\" 2>&1 < /dev/null &".to_string(),
         "  echo \"$!\" > \"$R/launcher_pid\"".to_string(),
-        "  sleep 1".to_string(),
-        "  kill -0 \"$(cat \"$R/launcher_pid\")\" 2>/dev/null && echo LAUNCHER=setsid".to_string(),
+        // A job that already finished has no live pid; its own status file is the ack.
+        "  if wait_started; then echo LAUNCHER=setsid; else echo 'job did not start' >&2; exit 5; fi"
+            .to_string(),
         "fi".to_string(),
     ]
     .join("\n")
@@ -215,6 +229,9 @@ impl Jobs {
             }
         };
         let acknowledged = outcome.ok() && outcome.stdout.contains("LAUNCHER=");
+        // Without the launcher line the job may still have started; the caller keeps the
+        // id and the uncertainty instead of being told the submission failed outright.
+        let launcher = launcher_of(&outcome.stdout);
         let metadata = &outcome.meta;
         receipt.insert("result_id".into(), Value::from(outcome.result_id.clone()));
         receipt.insert("launch_acknowledged".into(), Value::Bool(acknowledged));
@@ -247,13 +264,17 @@ impl Jobs {
         if let Some(progress) = progress {
             progress.record("submission_receipts", Value::Object(receipt));
         }
-        if acknowledged {
+        let transmitted = outcome.meta.get("executed") == Some(&Value::Bool(true))
+            || outcome.meta.get("execution_state").and_then(Value::as_str) == Some("unknown");
+        if acknowledged || transmitted {
+            // A transmitted launcher keeps its id even when the ack is missing: the
+            // remote side may be running, and a fresh id could duplicate its side effects.
             return (
                 Some(JobHandle {
                     job_id,
                     host: host.name.clone(),
                     session,
-                    launcher: launcher_of(&outcome.stdout),
+                    launcher,
                 }),
                 outcome,
             );
@@ -364,21 +385,39 @@ tail -c +{} {log_path} | head -c {max_bytes}; else echo 'size=0'; fi",
         let root = job_root(host, job_id);
         let command = format!(
             "killed=no; \
-if tmux has-session -t jms-{job_id} 2>/dev/null; then tmux kill-session -t jms-{job_id} && killed=yes; fi; \
+status_before=$(cat {root}/status 2>/dev/null || echo missing); \
+if tmux has-session -t jms-{job_id} 2>/dev/null; then \
+tmux kill-session -t jms-{job_id} 2>/dev/null && killed=yes; fi; \
 if [ -f {root}/pid ]; then pid=$(cat {root}/pid); \
-kill -TERM \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null; killed=yes; fi; \
-echo cancelled > {root}/status 2>/dev/null || true; \
-echo \"killed=$killed\""
+if kill -TERM \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null; then killed=yes; fi; fi; \
+if [ \"$killed\" = yes ]; then echo cancelled > {root}/status 2>/dev/null || true; fi; \
+echo \"killed=$killed\"; \
+echo \"status_before=$status_before\""
         );
         let outcome = self
             .runner
             .exec_on(host, &command, 60.0, false, false, false)
             .await?;
+        let killed = outcome.stdout.contains("killed=yes");
+        let status_before = outcome
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("status_before="))
+            .unwrap_or("missing")
+            .trim()
+            .to_string();
+        let already_finished = matches!(status_before.as_str(), "done" | "failed" | "cancelled");
         Ok(json!({
             "host": host.name,
             "job_id": job_id,
-            "killed": outcome.stdout.contains("killed=yes"),
+            "killed": killed,
+            "cancelled": killed,
+            "status_before": status_before,
+            "already_finished": already_finished,
             "ok": outcome.ok(),
+            "result_id": outcome.result_id,
+            "execution_state": outcome.meta.get("execution_state").cloned().unwrap_or(Value::Null),
+            "completion_unknown": outcome.meta.get("completion_unknown").cloned().unwrap_or(Value::Null),
         }))
     }
 
@@ -502,8 +541,83 @@ mod tests {
         assert!(script.contains("command -v tmux"));
         assert!(script.contains("tmux new-session -d -s 'jms-abcd1234'"));
         assert!(script.contains("echo LAUNCHER=tmux"));
-        assert!(script.contains("setsid bash \"$R/run.sh\""));
+        // Detached commands use absolute paths: a tmux/setsid child does not inherit
+        // the launcher's shell variables.
+        assert!(script.contains("R=\"$HOME\"/jobs/abcd1234"));
+        assert!(script.contains("wait_started"));
+        // The detached pane gets an expanded absolute path, never a bare "$R".
+        assert!(script.contains("tmux new-session -d -s 'jms-abcd1234'"));
+        assert!(script.contains("\\\"$R/run.sh\\\""));
         assert!(script.contains("no tmux and no setsid"));
+    }
+
+    /// A job that finishes before the launcher looks at it must still be
+    /// acknowledged: the runner writes `pid`/`status` before it does any work.
+    #[test]
+    fn fast_job_is_acknowledged_even_though_its_process_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("jobs");
+        let script = launch_script(
+            root.to_str().unwrap(),
+            "jms-abc12345",
+            "abc12345",
+            "echo quick; exit 3",
+            None,
+            None,
+        );
+        // Force the setsid branch: a PATH with setsid but without tmux.
+        let bin = directory.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for tool in [
+            "setsid", "bash", "sh", "cat", "sleep", "kill", "mkdir", "echo", "dirname",
+        ] {
+            let source = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|dir| std::path::Path::new(dir).join(tool))
+                .find(|path| path.exists());
+            if let Some(source) = source {
+                let _ = std::os::unix::fs::symlink(source, bin.join(tool));
+            }
+        }
+        let output = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", &bin)
+            .output()
+            .expect("launcher script runs");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("LAUNCHER=setsid"),
+            "launcher did not acknowledge a fast job: rc={:?} stdout={stdout:?} stderr={:?} tree={:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            std::fs::read_dir(&root)
+                .map(|entries| entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
+        let status = std::fs::read_to_string(root.join("status")).unwrap_or_default();
+        assert_eq!(status.trim(), "failed", "exit 3 must be recorded as failed");
+        let code = std::fs::read_to_string(root.join("exit_code")).unwrap_or_default();
+        assert_eq!(code.trim(), "3");
+        let log = std::fs::read_to_string(root.join("stdout.log")).unwrap_or_default();
+        assert!(log.contains("quick"), "job output missing: {log:?}");
+    }
+
+    #[test]
+    fn dump_launcher_script() {
+        let script = crate::jobs::launch_script(
+            "/root/jms_mcp_rust/.tmp/launch/root",
+            "jms-abc12345",
+            "abc12345",
+            "echo quick; exit 3",
+            None,
+            None,
+        );
+        std::fs::create_dir_all("/root/jms_mcp_rust/.tmp/launch").unwrap();
+        std::fs::write("/root/jms_mcp_rust/.tmp/launch/launch.sh", script).unwrap();
     }
 
     #[test]

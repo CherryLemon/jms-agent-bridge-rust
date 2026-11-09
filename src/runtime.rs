@@ -188,7 +188,11 @@ impl BridgeRuntime {
 
     // --- run -----------------------------------------------------------------
 
-    async fn run_inner(&self, arguments: Map<String, Value>) -> BridgeResult<Value> {
+    async fn run_inner(
+        &self,
+        arguments: Map<String, Value>,
+        progress: Option<Arc<dyn crate::storage::journal::ProgressSink>>,
+    ) -> BridgeResult<Value> {
         let targets = string_list(arguments.get("targets"));
         let script = arguments
             .get("script")
@@ -248,9 +252,10 @@ impl BridgeRuntime {
             let runner = self.runner.clone();
             let script = script.clone();
             let spec = spec.clone();
+            let progress = progress.clone();
             set.spawn(async move {
                 runner
-                    .execute_to_store(&host, &script, timeout, &spec, None)
+                    .execute_to_store(&host, &script, timeout, &spec, progress.as_deref())
                     .await
             });
         }
@@ -324,21 +329,20 @@ require allow_dangerous=true",
             .and_then(Value::as_str)
             .map(str::to_string)
         {
-            let mut identity = arguments.clone();
-            identity.remove("request_id");
+            // The fingerprint is computed over the normalized call (defaults filled,
+            // absent optionals as null) so an equivalent retry matches receipts written
+            // by the Python bridge as well as by this service.
+            let identity = normalize_run_arguments(&arguments);
             let runtime = self.clone();
-            let work = identity.clone();
+            let work = arguments.clone();
             return self
                 .journal
-                .execute(
-                    &request_id,
-                    "run",
-                    &Value::Object(identity),
-                    move |_progress| async move { runtime.run_inner(work).await },
-                )
+                .execute(&request_id, "run", &identity, move |progress| async move {
+                    runtime.run_inner(work, Some(progress)).await
+                })
                 .await;
         }
-        self.run_inner(arguments).await
+        self.run_inner(arguments, None).await
     }
 
     // --- fs ------------------------------------------------------------------
@@ -370,11 +374,13 @@ require allow_dangerous=true",
                     &request_id,
                     "jms_fs",
                     &Value::Object(identity),
-                    move |_progress| async move { filesystem.execute(work).await },
+                    move |progress| async move {
+                        filesystem.execute(work, Some(progress.as_ref())).await
+                    },
                 )
                 .await;
         }
-        self.filesystem.execute(arguments).await
+        self.filesystem.execute(arguments, None).await
     }
 
     // --- terminal ------------------------------------------------------------
@@ -603,6 +609,24 @@ require allow_dangerous=true",
             if operation == "jms_fs" && !query.is_empty() {
                 return schemas::fs_action_schema(&query).map_err(BridgeError::invalid);
             }
+            // A tool name returns its complete schema: this is where the fields kept out
+            // of the advertised `options` bag are documented.
+            if let Some(spec) = schemas::full_specs()
+                .into_iter()
+                .find(|spec| spec.name == operation)
+            {
+                return Ok(json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                    "inputSchema": spec.input_schema,
+                    "annotations": {
+                        "readOnlyHint": spec.read_only,
+                        "destructiveHint": spec.destructive,
+                        "openWorldHint": spec.open_world,
+                    },
+                    "advertised": true,
+                }));
+            }
             let schema = operations.get(operation).ok_or_else(|| {
                 BridgeError::invalid("unknown operation; use discover(query=...)")
             })?;
@@ -715,7 +739,15 @@ require allow_dangerous=true",
                 .await;
         }
         let _ = &mut payload;
-        self.dispatch_operation(&operation, payload).await
+        let value = self.dispatch_operation(&operation, payload).await?;
+        // Bounded response: a large operation payload is saved whole and the model gets
+        // a summary plus a result id instead of the entire object in context.
+        self.stage_operation_result(&operation, value)
+    }
+
+    /// Keep every `call` response inside a fixed budget; overflow is saved, not truncated.
+    fn stage_operation_result(&self, operation: &str, value: Value) -> BridgeResult<Value> {
+        crate::runtime::stage_if_large(&self.store, operation, value)
     }
 
     async fn dispatch_operation(
@@ -740,12 +772,33 @@ require allow_dangerous=true",
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let total = self.catalog.snapshot_assets().len();
-                let mut value = self.catalog.search(&search, 0, total.max(1));
+                // Page the inventory like every other listing: an unpaged dump of the
+                // whole permitted inventory is both a token cost and a latency cost.
+                let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 100) as usize;
+                let mut value = self.catalog.search(&search, offset, limit);
                 let matched = value.get("matched").cloned().unwrap_or(json!(0));
                 if let Some(map) = value.as_object_mut() {
                     map.insert("ok".into(), Value::Bool(true));
-                    map.insert("count".into(), matched);
+                    map.insert("count".into(), matched.clone());
+                    let shown = map
+                        .get("assets")
+                        .and_then(Value::as_array)
+                        .map(|rows| rows.len())
+                        .unwrap_or(0);
+                    map.insert("returned".into(), json!(shown));
+                    map.insert(
+                        "next_offset".into(),
+                        if offset + shown < matched.as_u64().unwrap_or(0) as usize {
+                            json!(offset + shown)
+                        } else {
+                            Value::Null
+                        },
+                    );
                 }
                 Ok(value)
             }
@@ -769,14 +822,55 @@ require allow_dangerous=true",
             }
             "jms_inventory_reload" => Ok(self.catalog.refresh().await),
             "session_list" => {
-                let sessions = self.terminals.sessions().await;
-                Ok(json!({"sessions": sessions["sessions"]}))
+                // Both session kinds are listed with an explicit kind so a handle is
+                // never passed to the wrong close path.
+                let mut rows: Vec<Value> = self
+                    .terminals
+                    .sessions()
+                    .await
+                    .get("sessions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|mut row| {
+                        if let Some(map) = row.as_object_mut() {
+                            map.insert("kind".into(), Value::from("terminal"));
+                        }
+                        row
+                    })
+                    .collect();
+                for mut row in self.runner.sessions() {
+                    if let Some(map) = row.as_object_mut() {
+                        map.insert("kind".into(), Value::from("shell"));
+                    }
+                    rows.push(row);
+                }
+                Ok(json!({"sessions": rows}))
             }
             "session_close" => {
                 let target = used_string(&arguments, "target")?;
                 let session_id = used_string(&arguments, "session_id")?;
+                let kind = arguments
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 let host = self.resolve_one(&target).await?;
-                self.runner.close_session(&host, &session_id, false).await
+                match kind.as_str() {
+                    "terminal" => self.terminals.close(&session_id).await,
+                    "shell" => self.runner.close_session(&host, &session_id, false).await,
+                    "" => {
+                        // Without a kind, close whichever registry owns the handle.
+                        match self.terminals.close(&session_id).await {
+                            Ok(value) => Ok(value),
+                            Err(_) => self.runner.close_session(&host, &session_id, false).await,
+                        }
+                    }
+                    other => Err(BridgeError::invalid(format!(
+                        "session kind must be terminal or shell, got {other:?}"
+                    ))),
+                }
             }
             "request_status" => {
                 let request_id = used_string(&arguments, "request_id")?;
@@ -819,18 +913,16 @@ require allow_dangerous=true",
                 let max_bytes = arguments
                     .get("max_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(65536);
+                    .unwrap_or(4096)
+                    .clamp(1024, 16384);
                 self.jobs.logs(&host, &job_id, offset, max_bytes).await
             }
             "jms_job_cancel" => {
                 let host = self.resolve_one(&used_string(&arguments, "host")?).await?;
                 let job_id = used_string(&arguments, "job_id")?;
-                let mut value = self.jobs.cancel(&host, &job_id).await?;
-                if let Some(map) = value.as_object_mut() {
-                    let killed = map.get("killed").cloned().unwrap_or(Value::Bool(false));
-                    map.insert("ok".into(), Value::Bool(true));
-                    map.insert("killed".into(), killed);
-                }
+                let value = self.jobs.cancel(&host, &job_id).await?;
+                // Keep the underlying verdict: a queued or failed cancellation must not
+                // be reported as success just because the call reached the host.
                 Ok(value)
             }
             "jms_job_wait" => {
@@ -1220,7 +1312,105 @@ pub fn string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn string_pairs(value: Option<&Value>) -> Vec<(String, String)> {
+/// Save an oversized operation payload and return a bounded summary of it.
+pub fn stage_if_large(
+    store: &crate::storage::results::ResultStore,
+    operation: &str,
+    value: Value,
+) -> BridgeResult<Value> {
+    const BUDGET: usize = 8 * 1024;
+    let text = value.to_string();
+    if text.len() <= BUDGET {
+        return Ok(value);
+    }
+    let mut metadata = Map::new();
+    metadata.insert("kind".into(), Value::from("operation"));
+    metadata.insert("operation".into(), Value::from(operation));
+    metadata.insert("bytes".into(), json!(text.len()));
+    let result_id = store.save_json(&value, metadata)?;
+    let mut summary = Map::new();
+    summary.insert(
+        "ok".into(),
+        value.get("ok").cloned().unwrap_or(Value::Bool(true)),
+    );
+    summary.insert("staged".into(), Value::Bool(true));
+    summary.insert("operation".into(), Value::from(operation));
+    summary.insert("result_id".into(), Value::from(result_id.clone()));
+    summary.insert("bytes".into(), json!(text.len()));
+    // Business-level shape the caller usually needs, without the bulk.
+    for key in [
+        "host",
+        "count",
+        "matched",
+        "returned",
+        "next_offset",
+        "jobs",
+        "status",
+    ] {
+        if let Some(item) = value.get(key) {
+            if item.to_string().len() <= 512 {
+                summary.insert(key.to_string(), item.clone());
+            }
+        }
+    }
+    summary.insert(
+        "preview".into(),
+        Value::from(text.chars().take(1024).collect::<String>()),
+    );
+    summary.insert(
+        "note".into(),
+        Value::from(format!(
+            "response exceeded {BUDGET} bytes; full payload saved as {result_id} (read_result with stream='result')"
+        )),
+    );
+    Ok(Value::Object(summary))
+}
+
+/// Canonical `run` arguments used for the request fingerprint.
+///
+/// Mirrors the Python bridge: every option is present, unset optionals are `null`,
+/// and the documented defaults are filled in. A `script_path` call is normalized to
+/// the script text it resolved to, so both implementations produce one identity per
+/// logical request.
+fn normalize_run_arguments(arguments: &Map<String, Value>) -> Value {
+    let optional = |key: &str| arguments.get(key).cloned().unwrap_or(Value::Null);
+    let mut out = Map::new();
+    out.insert("targets".into(), optional("targets"));
+    out.insert(
+        "script".into(),
+        arguments.get("script").cloned().unwrap_or(Value::Null),
+    );
+    out.insert("cwd".into(), optional("cwd"));
+    out.insert("env".into(), optional("env"));
+    out.insert("container".into(), optional("container"));
+    out.insert("image".into(), optional("image"));
+    out.insert("docker_args".into(), optional("docker_args"));
+    out.insert("session_id".into(), optional("session_id"));
+    out.insert(
+        "timeout".into(),
+        arguments
+            .get("timeout")
+            .cloned()
+            .unwrap_or_else(|| json!(60)),
+    );
+    out.insert(
+        "max_output_bytes".into(),
+        arguments
+            .get("max_output_bytes")
+            .cloned()
+            .unwrap_or_else(|| json!(4096)),
+    );
+    out.insert(
+        "allow_dangerous".into(),
+        arguments
+            .get("allow_dangerous")
+            .cloned()
+            .unwrap_or_else(|| json!(false)),
+    );
+    Value::Object(out)
+}
+
+fn string_pairs(value: Option<&Value>) -> Vec<(String, String)> {
     value
         .and_then(Value::as_object)
         .map(|map| {
@@ -1236,4 +1426,45 @@ pub fn string_pairs(value: Option<&Value>) -> Vec<(String, String)> {
 /// Description used by both the advertised schema and diagnostics.
 pub fn dangerous_flag_description() -> &'static str {
     DANGEROUS_FLAG_DESCRIPTION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_operation_payloads_are_returned_as_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::storage::results::ResultStore::new(
+            directory.path().to_path_buf(),
+            3600.0,
+            3600.0,
+        )
+        .unwrap();
+        let value = json!({"ok": true, "host": "h1"});
+        let out = stage_if_large(&store, "jms_job_status", value.clone()).unwrap();
+        assert_eq!(out, value);
+    }
+
+    #[test]
+    fn oversized_operation_payloads_are_saved_and_summarised() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::storage::results::ResultStore::new(
+            directory.path().to_path_buf(),
+            3600.0,
+            3600.0,
+        )
+        .unwrap();
+        let rows: Vec<Value> = (0..400)
+            .map(|index| json!({"host": format!("h{index}"), "x": "y".repeat(40)}))
+            .collect();
+        let value = json!({"ok": true, "count": 400, "hosts": rows});
+        let out = stage_if_large(&store, "jms_accelerator_status", value.clone()).unwrap();
+        assert_eq!(out["staged"], true);
+        assert!(out.to_string().len() < 4096, "summary must stay bounded");
+        let result_id = out["result_id"].as_str().unwrap();
+        let saved = std::fs::read_to_string(store.path(result_id, "result").unwrap()).unwrap();
+        assert_eq!(saved.len(), value.to_string().len());
+        assert!(saved.contains("h399"));
+    }
 }

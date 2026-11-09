@@ -11,8 +11,8 @@ use serde_json::{json, Map, Value};
 
 use crate::schema::strip_titles;
 
-pub const DANGEROUS_FLAG_DESCRIPTION: &str = "Acknowledge the local guard for this authorized \
-command; it does not grant authorization and cannot override client or JumpServer policy.";
+pub const DANGEROUS_FLAG_DESCRIPTION: &str = "Acknowledges the local guard for this authorized \
+command; it grants no authorization.";
 
 pub struct ToolSpec {
     pub name: &'static str,
@@ -50,7 +50,8 @@ fn array_of_strings(description: &str, maximum: Option<u64>) -> Value {
     value
 }
 
-pub fn advertised() -> Vec<ToolSpec> {
+/// Complete tool definitions: every accepted field, used for validation.
+pub fn full_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "run",
@@ -62,14 +63,14 @@ Full output is saved; read_result fetches it. Advanced fields may also be passed
                 "additionalProperties": false,
                 "required": ["targets"],
                 "properties": {
-                    "targets": array_of_strings("Exact asset names, IDs, IPs, unique aliases, or all.", None),
+                    "targets": array_of_strings("Asset names, IDs, IPs, aliases, or all.", None),
                     "script": {"type": "string", "maxLength": 1048576,
-                               "description": "Literal Bash. Values are data; no local quoting."},
+                               "description": "Literal Bash; values are data."},
                     "script_path": string("Absolute local file read instead of script."),
-                    "cwd": string("Remote working directory; the script is not sent when cd fails."),
+                    "cwd": string("Remote working directory; cd failure skips the script."),
                     "env": {"type": "object", "additionalProperties": {"type": "string"},
                             "description": "Exported before the script."},
-                    "container": string("Existing Docker container; never creates one."),
+                    "container": string("Existing container; never created."),
                     "image": string("Image for a new disposable container; never both with container."),
                     "docker_args": {"type": "array", "items": {"type": "string"},
                                     "description": "Extra docker arguments; needs container or image."},
@@ -79,14 +80,14 @@ Full output is saved; read_result fetches it. Advanced fields may also be passed
                     "max_output_bytes": integer(256, 16384, 4096,
                         "Preview budget shared by all targets."),
                     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
-                                   "description": "Caller-generated id; recover with request_status."},
+                                   "description": "Caller id; recover with request_status."},
                     "allow_dangerous": {"type": "boolean", "default": false,
                                         "description": DANGEROUS_FLAG_DESCRIPTION},
                     "options": {"type": "object", "additionalProperties": false,
                         "description": "Same advanced fields, for callers that prefer one bag.",
                         "properties": {
                             "script_path": string("Absolute local file read instead of script."),
-                            "container": string("Existing Docker container; never creates one."),
+                            "container": string("Existing container; never created."),
                             "image": string("Image for a new disposable container; never both with container."),
                             "docker_args": {"type": "array", "items": {"type": "string"}},
                             "session_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$"},
@@ -113,12 +114,12 @@ Put advanced fields in options; discover(operation='jms_fs', query=action) lists
                 "additionalProperties": false,
                 "required": ["target", "action"],
                 "properties": {
-                    "target": string("One exact REST asset name, ID, IP or unique alias; no wildcards."),
+                    "target": string("One exact asset name, ID, IP or alias."),
                     "action": {"type": "string", "enum": ["list", "stat", "read", "read_many", "glob",
                         "search", "tree", "checksum", "upload", "download"]},
                     "path": string("Absolute remote path; required except read_many."),
                     "pattern": string("Glob (glob) or search pattern (search)."),
-                    "container": string("Existing Docker container; never creates one."),
+                    "container": string("Existing container; never created."),
                     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
                                    "description": "Transfers only: recover with request_status."},
                     "options": {"type": "object", "additionalProperties": false,
@@ -377,18 +378,22 @@ original ID after reply loss; reusing it never replays.",
         "session_list".to_string(),
         json!({
             "name": "session_list",
-            "description": "List explicit persistent shells owned by this MCP service.",
+            "description": "List live sessions of both kinds (kind=terminal handles from terminal(action='open'), kind=shell from run(session_id=...)).",
             "inputSchema": {"type": "object", "additionalProperties": false, "properties": {}},
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false},
         }),
     );
     map.insert("session_close".to_string(), json!({
         "name": "session_close",
-        "description": "Close one named shell on one permitted asset; its shell state is discarded.",
+        "description": "Close one session on one permitted asset: kind=terminal for terminal(action='open') handles, kind=shell for run(session_id=...) shells. Without a kind the handle is looked up in both registries.",
         "inputSchema": {
             "type": "object", "additionalProperties": false,
             "required": ["target", "session_id"],
-            "properties": {"target": {"type": "string"}, "session_id": {"type": "string"}},
+            "properties": {
+                "target": {"type": "string"},
+                "session_id": {"type": "string"},
+                "kind": {"type": "string", "enum": ["terminal", "shell"]},
+            },
         },
         "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
     }));
@@ -533,7 +538,7 @@ fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool
                 "host": {"type": "string"},
                 "job_id": {"type": "string", "pattern": "^[0-9a-f]{8}$"},
                 "offset": int(0, 1099511627776, 0),
-                "max_bytes": int(1, 1048576, 65536),
+                "max_bytes": int(1024, 16384, 4096),
             }),
             json!(["host", "job_id"]),
             true,
@@ -774,22 +779,171 @@ pub fn fs_action_schema(action: &str) -> Result<Value, String> {
     })))
 }
 
+/// Tools advertised to clients: the fields that are worth a permanent schema.
+///
+/// Validation always uses [`full_specs`], so unadvertised fields stay accepted for
+/// compatibility while the model only pays for the common ones.
+pub fn advertised() -> Vec<ToolSpec> {
+    full_specs()
+        .into_iter()
+        .map(|spec| {
+            let schema = public_view(&spec.name, spec.input_schema.clone());
+            ToolSpec {
+                input_schema: schema,
+                ..spec
+            }
+        })
+        .collect()
+}
+
+/// Per-tool keep list for the advertised schema (mirrors the Python bridge).
+fn public_view(name: &str, schema: Value) -> Value {
+    let keep: &[&str] = match name {
+        "run" => &[
+            "targets",
+            "script",
+            "request_id",
+            "allow_dangerous",
+            "options",
+        ],
+        "fs" => &[
+            "target",
+            "action",
+            "path",
+            "pattern",
+            "container",
+            "request_id",
+            "options",
+        ],
+        "terminal" => &["action", "target", "session", "script", "input", "options"],
+        _ => return schema,
+    };
+    let mut value = schema;
+    let Some(map) = value.as_object_mut() else {
+        return value;
+    };
+    if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.retain(|key, _| keep.contains(&key.as_str()));
+    }
+    if let Some(required) = map.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|item| {
+            item.as_str()
+                .map(|key| keep.contains(&key))
+                .unwrap_or(false)
+        });
+    }
+    // The options bag is advertised as an entry point only: its fields live in
+    // `discover(operation='run')` so they do not cost tokens in every session.
+    if let Some(options) = map
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("options"))
+        .and_then(Value::as_object_mut)
+    {
+        let hint = match name {
+            "run" => "script_path, cwd, env, container, image, docker_args, session_id, timeout, max_output_bytes",
+            "fs" => "action-specific fields (offset, limit, start_line, local_path, overwrite, ...)",
+            _ => "target, container, image, docker_args, cwd, env, wait_ms, max_bytes, cursor, signal, eof",
+        };
+        options.clear();
+        options.insert("type".into(), Value::from("object"));
+        options.insert(
+            "description".into(),
+            Value::from(format!(
+                "Advanced fields: {hint}. discover(operation='{name}') lists them."
+            )),
+        );
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::validate;
 
+    /// One valid and one invalid sample per advertised tool. A sample that fails
+    /// validation must fail loudly: swallowing the error proves nothing.
+    fn samples() -> Vec<(&'static str, Value, Value)> {
+        vec![
+            (
+                "run",
+                json!({"targets": ["a"], "script": "ls", "request_id": "r-1",
+                       "options": {"timeout": 5, "env": {"A": "1"}}}),
+                json!({"targets": ["a"], "script": 5}),
+            ),
+            (
+                "fs",
+                json!({"target": "a", "action": "read", "path": "/etc/hostname",
+                       "options": {"start_line": 1}}),
+                json!({"target": "a", "action": "nope"}),
+            ),
+            (
+                "terminal",
+                json!({"action": "open", "target": "a", "options": {"cwd": "/tmp"}}),
+                json!({"action": "nope"}),
+            ),
+            (
+                "read_result",
+                json!({"result_id": "abc", "limit": 1024, "tail": true}),
+                json!({"result_id": "abc", "limit": 999999}),
+            ),
+            (
+                "discover",
+                json!({"query": "job", "topic": "operations", "limit": 5}),
+                json!({"topic": "nope", "limit": 0}),
+            ),
+            (
+                "call",
+                json!({"operation": "jms_job_status", "arguments": {}}),
+                json!({}),
+            ),
+            (
+                "meta",
+                json!({"ref": "service", "section": "summary"}),
+                json!({"ref": "service", "section": "nope"}),
+            ),
+        ]
+    }
+
     #[test]
-    fn every_advertised_schema_validates_its_own_example() {
+    fn every_advertised_schema_accepts_and_rejects_samples() {
+        let samples = samples();
         for spec in advertised() {
             assert_eq!(spec.input_schema["type"], "object", "{}", spec.name);
-            validate(
-                &spec.input_schema,
-                &json!({"targets": ["a"], "script": "ls"}),
-            )
-            .or_else(|_| Ok::<(), crate::schema::SchemaError>(()))
-            .unwrap();
+            let (_, good, bad) = samples
+                .iter()
+                .find(|(name, _, _)| *name == spec.name)
+                .unwrap_or_else(|| panic!("{} has no schema sample", spec.name));
+            validate(&spec.input_schema, good)
+                .unwrap_or_else(|error| panic!("{} rejected its valid sample: {error}", spec.name));
+            assert!(
+                validate(&spec.input_schema, bad).is_err(),
+                "{} accepted an invalid sample",
+                spec.name
+            );
         }
+    }
+
+    #[test]
+    fn env_accepts_only_string_values() {
+        let run = advertised()
+            .into_iter()
+            .find(|spec| spec.name == "run")
+            .unwrap();
+        let full = full_specs()
+            .into_iter()
+            .find(|spec| spec.name == "run")
+            .unwrap();
+        let error = validate(
+            &full.input_schema,
+            &json!({"targets": ["a"], "script": "ls", "env": {"CUDA_VISIBLE_DEVICES": 0}}),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("CUDA_VISIBLE_DEVICES"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -807,12 +961,75 @@ mod tests {
             &json!({"targets": ["a"], "script": "ls"})
         )
         .is_ok());
-        // options are closed: an unknown advanced field is a clear argument error.
+        // The advertised options bag is an entry point; the validation schema is what
+        // rejects an unknown advanced field.
+        let full = full_specs()
+            .into_iter()
+            .find(|spec| spec.name == "run")
+            .unwrap();
         assert!(validate(
-            &run.input_schema,
+            &full.input_schema,
             &json!({"targets": ["a"], "script": "ls", "options": {"sandbox": true}})
         )
         .is_err());
+    }
+
+    /// `tools/list` is paid on every session, so its size is a contract.
+    #[test]
+    fn advertised_tools_stay_within_their_token_budget() {
+        let payload = serde_json::to_string(
+            &advertised()
+                .iter()
+                .map(|spec| {
+                    json!({
+                        "name": spec.name,
+                        "description": spec.description,
+                        "inputSchema": spec.input_schema,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            payload.len() <= 6144,
+            // 10 KiB before the options/discover split; keep it from creeping back.
+            "tools/list grew to {} bytes; move details into options or discover",
+            payload.len()
+        );
+        // Every advertised field must also be a real field: the lists may shrink, never drift.
+        for spec in advertised() {
+            let full = full_specs()
+                .into_iter()
+                .find(|full| full.name == spec.name)
+                .unwrap();
+            for key in spec.input_schema["properties"]
+                .as_object()
+                .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+            {
+                assert!(
+                    full.input_schema["properties"].get(&key).is_some(),
+                    "{} advertises unknown field {key}",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn measure_sizes() {
+        for spec in crate::schemas::advertised() {
+            let payload = serde_json::json!({"name": spec.name, "description": spec.description,
+                                         "inputSchema": spec.input_schema})
+            .to_string();
+            println!(
+                "{:10} {:5} desc={:4} schema={:5}",
+                spec.name,
+                payload.len(),
+                spec.description.len(),
+                spec.input_schema.to_string().len()
+            );
+        }
     }
 
     #[test]

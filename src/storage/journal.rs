@@ -81,6 +81,11 @@ impl RequestJournal {
 
     pub fn save(&self, receipt: &Map<String, Value>) -> BridgeResult<()> {
         let _guard = self.fs.lock().expect("journal lock");
+        self.save_unlocked(receipt)
+    }
+
+    /// Save with the caller already holding the journal lock.
+    fn save_unlocked(&self, receipt: &Map<String, Value>) -> BridgeResult<()> {
         let request_id = receipt
             .get("request_id")
             .and_then(Value::as_str)
@@ -95,6 +100,12 @@ impl RequestJournal {
     }
 
     pub fn load(&self, request_id: &str) -> BridgeResult<Map<String, Value>> {
+        let _guard = self.fs.lock().expect("journal lock");
+        self.load_unlocked(request_id)
+    }
+
+    /// Load with the caller already holding the journal lock.
+    fn load_unlocked(&self, request_id: &str) -> BridgeResult<Map<String, Value>> {
         let directory = self.directory(request_id)?;
         let path = directory.join("state.json");
         match std::fs::read_to_string(&path) {
@@ -127,7 +138,8 @@ impl RequestJournal {
     }
 
     pub fn status(&self, request_id: &str, duplicate: bool) -> BridgeResult<Value> {
-        let mut receipt = self.load(request_id)?;
+        let _guard = self.fs.lock().expect("journal lock");
+        let mut receipt = self.load_unlocked(request_id)?;
         let live = self
             .tasks
             .lock()
@@ -142,7 +154,7 @@ impl RequestJournal {
                     "no live request owner; reconcile saved job/result IDs before new work",
                 ),
             );
-            self.save(&receipt)?;
+            self.save_unlocked(&receipt)?;
         }
         let mut response = match receipt.get("response") {
             Some(Value::Object(map)) => map.clone(),
@@ -163,7 +175,10 @@ impl RequestJournal {
     }
 
     fn progress(&self, request_id: &str, field: &str, value: Value) -> BridgeResult<()> {
-        let mut receipt = self.load(request_id)?;
+        // One lock for the whole read-modify-write: several targets finishing at once
+        // must not overwrite each other's rows.
+        let _guard = self.fs.lock().expect("journal lock");
+        let mut receipt = self.load_unlocked(request_id)?;
         let identity = if field == "execution_results" {
             "result_id"
         } else {
@@ -182,7 +197,7 @@ impl RequestJournal {
             rows.push(value);
         }
         receipt.insert(field.to_string(), Value::Array(rows));
-        self.save(&receipt)
+        self.save_unlocked(&receipt)
     }
 
     /// Reserve the request id before any side effect. `Ok((false, status))` means the
@@ -508,5 +523,42 @@ mod tests {
             canonical_json(&value),
             r#"{"a":{"c":[3,{"e":5,"f":4}],"d":2},"b":1}"#
         );
+    }
+
+    /// Several targets finishing at once must not overwrite each other's rows.
+    #[test]
+    fn concurrent_progress_keeps_every_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal =
+            std::sync::Arc::new(RequestJournal::new(directory.path().to_path_buf()).unwrap());
+        journal
+            .claim("req-1", "run", &serde_json::json!({"targets": ["a"]}))
+            .unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let journal = journal.clone();
+                std::thread::spawn(move || {
+                    journal
+                        .progress(
+                            "req-1",
+                            "execution_results",
+                            serde_json::json!({
+                                "host": format!("host-{index}"),
+                                "result_id": format!("result-{index}"),
+                            }),
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let receipt = journal.load("req-1").unwrap();
+        let rows = receipt
+            .get("execution_results")
+            .and_then(serde_json::Value::as_array)
+            .expect("rows");
+        assert_eq!(rows.len(), 8, "rows were lost: {rows:?}");
     }
 }

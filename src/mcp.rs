@@ -56,7 +56,9 @@ impl BridgeServer {
         name: &str,
         arguments: Map<String, Value>,
     ) -> Result<Value, BridgeError> {
-        let spec = schemas::advertised()
+        // Validate against the complete definition: the advertised schema is a
+        // token-saving subset, not the contract.
+        let spec = schemas::full_specs()
             .into_iter()
             .find(|spec| spec.name == name)
             .ok_or_else(|| BridgeError::invalid(format!("unknown tool {name:?}")))?;

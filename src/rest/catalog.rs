@@ -398,7 +398,7 @@ impl AssetCatalog {
             return Err(BridgeError::rest("REST returned a partial asset list"));
         }
         let semaphore = Arc::new(Semaphore::new(4));
-        let mut set: JoinSet<Option<Value>> = JoinSet::new();
+        let mut set: JoinSet<DetailOutcome> = JoinSet::new();
         let preferred = self.settings.preferred_account.clone();
         let login = self.cfg.login_user.clone();
         for asset in assets {
@@ -411,30 +411,43 @@ impl AssetCatalog {
                 continue;
             };
             set.spawn(async move {
-                let _permit = permit.acquire_owned().await.ok()?;
+                let _permit = match permit.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => return DetailOutcome::Failed("detail semaphore closed".into()),
+                };
                 let api = match ApiClient::new(api_cfg, proxy.as_deref()) {
                     Ok(api) => api,
-                    Err(_) => return None,
+                    Err(error) => return DetailOutcome::Failed(error.message().to_string()),
                 };
                 match api.get_asset(&id).await {
-                    Ok(data) => Some(asset_row(&data, &preferred, &login)),
-                    // Permission can change during a refresh; drop that asset only.
-                    Err(error) if permission_denied(&error) => None,
-                    Err(_) => None,
+                    Ok(data) => DetailOutcome::Row(asset_row(&data, &preferred, &login)),
+                    // Only an explicit permission answer removes an asset; a timeout or
+                    // server error must not silently shrink the snapshot.
+                    Err(error) if permission_denied(&error) => DetailOutcome::Gone,
+                    Err(error) => DetailOutcome::Failed(error.message().to_string()),
                 }
             });
         }
         let mut rows = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok(Some(row)) => rows.push(row),
-                Ok(None) => {}
+                Ok(DetailOutcome::Row(row)) => rows.push(row),
+                Ok(DetailOutcome::Gone) => {}
+                Ok(DetailOutcome::Failed(message)) => failures.push(message),
                 Err(error) => {
                     return Err(BridgeError::rest(format!(
                         "asset detail task failed: {error}"
                     )))
                 }
             }
+        }
+        if let Some(first) = failures.first() {
+            // Keep the previous complete snapshot instead of publishing a partial one.
+            return Err(BridgeError::rest(format!(
+                "{} asset detail request(s) failed (first: {first}); refusing a partial snapshot",
+                failures.len()
+            )));
         }
         Ok(rows)
     }
@@ -529,6 +542,14 @@ impl AssetCatalog {
     }
 }
 
+/// Result of one per-asset detail request during a snapshot refresh.
+enum DetailOutcome {
+    Row(Value),
+    /// The API explicitly answered that this asset is no longer permitted.
+    Gone,
+    Failed(String),
+}
+
 fn permission_denied(error: &BridgeError) -> bool {
     let message = error.message();
     message.contains(" -> 403:") || message.contains(" -> 404:")
@@ -564,26 +585,17 @@ fn asset_row(data: &Value, preferred: &Option<String>, login: &Option<String>) -
             }
         }
     }
-    // Account order of preference: an explicitly configured account, then the
-    // conventional `root` account JumpServer deployments bind to most assets, then a
-    // sole permitted account. Several equally plausible accounts stay unresolved
-    // instead of guessing an identity.
+    // Exactly one permitted account, or the one explicitly configured. Several
+    // equally plausible accounts stay unresolved: the bridge never picks an
+    // identity on the caller's behalf, because file ownership and environment
+    // differ per account.
     let account = match preferred {
         Some(preferred) => usable
             .iter()
             .find(|candidate| *candidate == preferred)
             .cloned(),
-        None => usable
-            .iter()
-            .find(|candidate| candidate.as_str() == "root")
-            .cloned()
-            .or_else(|| {
-                if usable.len() == 1 {
-                    usable.first().cloned()
-                } else {
-                    None
-                }
-            }),
+        None if usable.len() == 1 => usable.first().cloned(),
+        None => None,
     };
     let protocols: Vec<String> = data
         .get("permed_protocols")
@@ -952,9 +964,9 @@ mod tests {
         );
         assert_eq!(row["account"], "ops");
         assert_eq!(row["accounts"], json!(["root", "ops"]));
-        // JumpServer binds `root` to almost every asset, so an unconfigured deployment
-        // resolves it by name instead of asking the operator to choose.
-        let root_preferred = asset_row(
+        // Two permitted accounts stay unresolved until the operator configures one:
+        // the bridge never decides an identity on the caller's behalf.
+        let root_unresolved = asset_row(
             &json!({
                 "id": "11111111-1111-1111-1111-111111111111", "name": "a",
                 "permed_accounts": [
@@ -965,7 +977,7 @@ mod tests {
             &None,
             &None,
         );
-        assert_eq!(root_preferred["account"], "root");
+        assert_eq!(root_unresolved["account"], Value::Null);
         // Two non-root accounts stay unresolved: an identity is never guessed.
         let ambiguous = asset_row(
             &json!({

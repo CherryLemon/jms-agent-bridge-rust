@@ -9,9 +9,26 @@ credentials are deliberately not recorded here.
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 97 passed |
+| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 123 passed |
+| Inventory refresh against a mock bastion (transient vs. explicit detail errors, account ambiguity) | `cargo test --test catalog_refresh` | 2 passed |
 | Offline contracts (tool list, schema validation, guard, receipts, saved-result reads, discovery) | `cargo test --test mcp_offline` | 1 passed |
+| Real `serve --stdio` subprocess: every stdout line parses as JSON-RPC while logging is at `info` | `cargo test --test mcp_stdio` | 1 passed |
 | Exec-channel plumbing against a live bastion | `cargo test --test ssh_pipe -- --ignored` | passed (manual) |
+
+Regression tests added for the defects found in review: marker/exit-status
+ordering (`start_then_close_without_status_is_unknown`,
+`exit_status_arriving_after_eof_is_kept`,
+`an_exit_status_without_the_start_marker_is_not_success`,
+`end_marker_split_across_packets_is_reassembled`), terminal stream pairing
+(`completion_needs_both_streams_and_matching_statuses`,
+`capture_stream_waits_for_the_second_stream`), scheduler cancellation
+(`cancelled_waiter_returns_its_slot`), journal fan-in
+(`concurrent_progress_keeps_every_row`), rsync readiness
+(`readiness_keeps_protocol_bytes_from_the_same_packet`), the job launcher
+(`fast_job_is_acknowledged_even_though_its_process_is_gone`), host-key policy
+(`missing_known_hosts_is_refused`, `known_hosts_defaults_to_the_ssh_file`) and
+the tool-schema budget (`advertised_tools_stay_within_their_token_budget`,
+`env_accepts_only_string_values`).
 
 ## Live MCP session (`streamable HTTP`, stateless JSON at `/mcp`)
 
@@ -23,7 +40,7 @@ credentials are deliberately not recorded here.
 | 4 | `session_id` reuse (`cd /tmp`, `export KEEP=42`) | second call shows `42` and `/tmp`; `session_close` succeeds |
 | 5 | `fs` list/stat/read/search/glob/tree/checksum/read_many | all `ok`, line/byte cursors reported |
 | 6 | `fs` upload + download of a 1.9 KB payload | `ok:true`, downloaded bytes identical, itemized `<f+++++++++`/`<f.st......` |
-| 7 | `jms_submit_job` (tmux launcher) → status → logs → wait → cancel | `running`→`done` with pid and `exit_code`, logs by byte offset, `killed` reported |
+| 7 | `jms_submit_job` (tmux launcher) → status → logs → wait → cancel | `running`→`done` with pid and `exit_code`, logs by byte offset; cancel reports `killed:true, status_before:"running", already_finished:false` plus the launcher `result_id` |
 | 8 | `run` with `timeout: 3` around `sleep 30` | `exit_code 124`, `timed_out`, `execution_state: unknown`, `completion_unknown: true` |
 | 9 | `terminal open` → `exec python3 -i` → `write print(6*7)` → `eof` → `close` | prompt captured, `42` returned, state `closed` |
 | 10 | `call jms_accelerator_status` on an accelerator host | 8 devices reported `busy`, with occupants, worker commands and container names |
@@ -31,12 +48,20 @@ credentials are deliberately not recorded here.
 | 12 | `call jms_inventory_reload`, `session_list`, `request_status`, `result_metadata` (summary/transport/timing/all), `meta(service, policy)` | all consistent: 99 permitted assets, receipts with `result_status` |
 | 13 | hard `kill -9` mid-request, then restart | `request_status` reports `request_state: interrupted`, `completion_unknown: true`, nothing replayed |
 | 14 | `discover` (categories, search, one operation schema, `topic=assets`, `topic=status`) | schemas served on demand; assets show `usable` and the resolved account |
+| 15 | `discover(operation="run")` | returns the complete schema (14 fields) that the advertised `options` entry point points at |
+| 16 | `call jms_list_assets` | paged: `matched:99`, `returned:20`, `next_offset:20` instead of dumping the inventory |
+| 17 | same `request_id`, arguments spelled with the documented defaults | still a `duplicate` with `execution_replayed:false` (fingerprint normalization) |
+| 18 | same `request_id`, different script | refused: "request_id already claimed … (arguments cannot change)" |
+| 19 | `session_close` on a `terminal(action="open")` handle | closed through the unified registry (`state:"closed"`) |
+| 20 | persistent shell after the isolated-run rework (`cd /tmp`, `export KEEP=42`) | second call still shows `42` and `/tmp` |
+| 21 | `jms_submit_job` with a job that finishes in under a second | `launched:true` and its log/exit code available immediately (no waiting for the process to die) |
 
 ## Deliberately not exercised here
 
 | Area | Why | How to check |
 | --- | --- | --- |
 | Docker `container`/`image` execution | No Docker daemon on the probed assets | `run` with `container` on a host that has Docker |
+| Connection replacement with live named shells | Needs a deliberately broken pooled connection while a shell is open | the recovery path now refuses to replace a connection that still carries shells (`protected` reflects them); unit test covers the tracker, not a real disconnect |
 | `session_id` loss across a normal (non-kill) restart | Requires restarting the resident service holding live shells | restart `serve`, then reuse the same `session_id`: expect `not_started` with "session state was lost" |
 | Result expiry sweep (7 days) | Would need a week of wall clock | covered by unit tests with injected timestamps |
 | Very large transfers (>1 GB) | Time budget | `fs` upload/download paginate by design; rsync streams without buffering |
@@ -49,13 +74,12 @@ the gateway:
 
 | Check | Result |
 | --- | --- |
-| `doctor` (REST) | full permitted inventory pulled over HTTPS, gateway version reported |
-| `probe` (SSH) | refused as `not_started` |
+| `doctor` (REST) | full permitted inventory pulled over HTTPS (99 assets), gateway version reported |
+| `probe` (SSH) | refused as `not_started` on that host |
 
-The gateway did not accept the credentials this build provides from that host,
-so the probe stopped before transmitting anything and reported `not_started`
-rather than a partial success. The resident service therefore belongs on a host
-whose authentication path (key or password) this build can complete.
+The resident service belongs on the host that holds the deployment's login
+material; nothing was transmitted before the refusal, so the probe reported
+`not_started` rather than a partial success.
 
 ## Notes and known limits
 

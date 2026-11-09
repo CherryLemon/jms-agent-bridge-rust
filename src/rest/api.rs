@@ -106,7 +106,11 @@ impl ApiClient {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs_f64(cfg.api_timeout.max(0.5)))
             .danger_accept_invalid_certs(!cfg.verify_tls);
-        let proxy_url = proxy.map(str::to_string).or_else(env_proxy);
+        let proxy_url = proxy
+            .map(str::to_string)
+            .or_else(env_proxy)
+            .filter(|_| !host_is_excluded(&cfg.url));
+        let using_proxy = proxy_url.is_some();
         if let Some(proxy_url) = proxy_url {
             let proxy = reqwest::Proxy::all(&proxy_url)
                 .map_err(|error| BridgeError::config(format!("invalid REST proxy: {error}")))?;
@@ -114,6 +118,12 @@ impl ApiClient {
         } else {
             builder = builder.no_proxy();
         }
+        // Never log the proxy URL itself: it can carry credentials.
+        tracing::debug!(
+            proxy = using_proxy,
+            excluded = host_is_excluded(&cfg.url),
+            "REST client configured"
+        );
         let client = builder
             .build()
             .map_err(|error| BridgeError::rest(format!("HTTP client: {error}")))?;
@@ -225,6 +235,12 @@ impl ApiClient {
             .map_err(|error| BridgeError::rest(format!("{method} {path} -> body: {error}")))?;
         if !status.is_success() {
             let preview: String = text.chars().take(500).collect();
+            tracing::debug!(
+                path,
+                status = status.as_u16(),
+                body = preview.as_str(),
+                "REST error"
+            );
             return Err(BridgeError::rest(format!(
                 "{method} {path} -> {}: {preview}",
                 status.as_u16()
@@ -324,6 +340,34 @@ impl ApiClient {
             .and_then(Value::as_str)
             .map(str::to_string)
     }
+}
+
+/// Whether `NO_PROXY`/`no_proxy` excludes this URL's host.
+///
+/// A deployment proxy is only an egress path: localhost or an internal host listed
+/// in `NO_PROXY` must be reached directly instead of through it.
+fn host_is_excluded(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    let list = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    list.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            let entry = entry.to_ascii_lowercase();
+            if entry == "*" {
+                return true;
+            }
+            let entry = entry.trim_start_matches('.');
+            host == entry || host.ends_with(&format!(".{entry}"))
+        })
 }
 
 fn env_proxy() -> Option<String> {

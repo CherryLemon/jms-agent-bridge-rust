@@ -127,6 +127,35 @@ impl Default for BridgeSettings {
 }
 
 impl BridgeSettings {
+    /// known_hosts file used to verify the gateway's host key.
+    ///
+    /// Verification is never skipped implicitly: without an explicit setting the
+    /// conventional `~/.ssh/known_hosts` is used, and when neither exists the
+    /// connection is refused instead of trusting an unverified key.
+    pub fn resolve_known_hosts(&self) -> BridgeResult<PathBuf> {
+        self.resolve_known_hosts_in(&home_dir()?)
+    }
+
+    fn resolve_known_hosts_in(&self, home: &Path) -> BridgeResult<PathBuf> {
+        if let Some(path) = &self.known_hosts {
+            if path.is_file() {
+                return Ok(path.clone());
+            }
+            return Err(BridgeError::config(format!(
+                "known_hosts file {} does not exist; SSH host key verification is never skipped",
+                path.display()
+            )));
+        }
+        let default = home.join(".ssh/known_hosts");
+        if default.is_file() {
+            return Ok(default);
+        }
+        Err(BridgeError::config(
+            "SSH host key verification is not configured: create ~/.ssh/known_hosts or set \
+bridge.known_hosts (JMS_BRIDGE_KNOWN_HOSTS). Refusing to connect to an unverified gateway.",
+        ))
+    }
+
     /// Host the KoKo SSH gateway is reached on.
     pub fn gateway_host(&self, cfg: &BastionConfig) -> BridgeResult<String> {
         if let Some(host) = &self.ssh_host {
@@ -236,6 +265,29 @@ fn as_f64(map: &toml::map::Map<String, toml::Value>, key: &str) -> Option<f64> {
     }
 }
 
+/// `[credentials]` table of a credential file; empty when it cannot be read.
+fn credentials_from(path: &Path) -> toml::map::Map<String, toml::Value> {
+    match read_toml(path) {
+        Ok(data) => table(&data, "credentials"),
+        Err(_) => toml::map::Map::new(),
+    }
+}
+
+fn credential_value(
+    credentials: &toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Option<String> {
+    credentials
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn credential_text(key: &str) -> Option<String> {
+    credential_value(&credentials_from(&credentials_path(None)), key)
+}
+
 /// Load the persisted SSH password saved by `jms-bridge login --save-password`.
 pub fn stored_password() -> Option<String> {
     if let Some(value) = env_value("JMS_BRIDGE_PASSWORD") {
@@ -308,13 +360,17 @@ pub fn load_config(explicit: Option<&Path>) -> BridgeResult<BastionConfig> {
         max_parallel,
         org_id: env_value("JMS_BRIDGE_ORG_ID").or_else(|| as_string(&bastion, "org_id")),
         access_key_id: env_value("JMS_BRIDGE_ACCESS_KEY_ID")
-            .or_else(|| as_string(&bastion, "access_key_id")),
+            .or_else(|| as_string(&bastion, "access_key_id"))
+            .or_else(|| credential_text("access_key_id")),
         access_key_secret: env_value("JMS_BRIDGE_ACCESS_KEY_SECRET")
-            .or_else(|| as_string(&bastion, "access_key_secret")),
+            .or_else(|| as_string(&bastion, "access_key_secret"))
+            .or_else(|| credential_text("access_key_secret")),
         private_token: env_value("JMS_BRIDGE_PRIVATE_TOKEN")
-            .or_else(|| as_string(&bastion, "private_token")),
+            .or_else(|| as_string(&bastion, "private_token"))
+            .or_else(|| credential_text("private_token")),
         session_token: env_value("JMS_BRIDGE_SESSION_TOKEN")
-            .or_else(|| as_string(&bastion, "session_token")),
+            .or_else(|| as_string(&bastion, "session_token"))
+            .or_else(|| credential_text("session_token")),
         api_base: as_string(&bastion, "api_base").unwrap_or_else(|| "/api/v1".into()),
     })
 }
@@ -518,6 +574,81 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("config.toml"), body).unwrap();
         directory
+    }
+
+    #[test]
+    fn credential_file_supplies_tokens_and_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credentials.toml");
+        std::fs::write(
+            &path,
+            "[credentials]\nsession_token = \"token-value\"\nprivate_token = \"\"\naccess_key_id = \"kid\"\n",
+        )
+        .unwrap();
+        let credentials = credentials_from(&path);
+        assert_eq!(
+            credential_value(&credentials, "session_token").as_deref(),
+            Some("token-value")
+        );
+        assert_eq!(credential_value(&credentials, "private_token"), None);
+        assert_eq!(
+            credential_value(&credentials, "access_key_id").as_deref(),
+            Some("kid")
+        );
+    }
+
+    #[test]
+    fn missing_credential_file_is_silent() {
+        let directory = tempfile::tempdir().unwrap();
+        let credentials = credentials_from(&directory.path().join("absent.toml"));
+        assert!(credentials.is_empty());
+    }
+
+    #[test]
+    fn known_hosts_defaults_to_the_ssh_file() {
+        let home = tempfile::tempdir().unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let known_hosts = ssh.join("known_hosts");
+        std::fs::write(&known_hosts, "bastion.example ssh-ed25519 AAAA\n").unwrap();
+        let settings = BridgeSettings::default();
+        let resolved = settings.resolve_known_hosts_in(home.path()).unwrap();
+        assert_eq!(resolved, known_hosts);
+    }
+
+    #[test]
+    fn missing_known_hosts_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let settings = BridgeSettings::default();
+        let error = settings.resolve_known_hosts_in(home.path()).unwrap_err();
+        assert!(error.message().contains("host key verification"));
+    }
+
+    #[test]
+    fn configured_known_hosts_must_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = BridgeSettings::default();
+        settings.known_hosts = Some(directory.path().join("absent"));
+        let error = settings
+            .resolve_known_hosts_in(directory.path())
+            .unwrap_err();
+        assert!(error.message().contains("does not exist"));
+    }
+
+    #[test]
+    fn shipped_example_config_loads() {
+        let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/config.toml");
+        let data = read_toml(&example).unwrap();
+        let bastion = table(&data, "bastion");
+        assert_eq!(
+            as_string(&bastion, "url").as_deref(),
+            Some("https://bastion.example.com")
+        );
+        assert_eq!(as_i64(&bastion, "ssh_port"), Some(2224));
+        // Settings live under [bridge]; the example must not put them under [bastion].
+        assert!(data.get("bridge").and_then(toml::Value::as_table).is_some());
+        assert_eq!(as_string(&bastion, "state_dir"), None);
+        assert_eq!(as_string(&bastion, "queue_limit"), None);
     }
 
     #[test]

@@ -309,13 +309,18 @@ impl FilesystemWorkers {
         script: &str,
         timeout: f64,
         container: Option<&str>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
     ) -> BridgeResult<Map<String, Value>> {
-        let first = self.execute_once(host, script, timeout, container).await?;
+        let first = self
+            .execute_once(host, script, timeout, container, progress)
+            .await?;
         if !startup_failed(&first) {
             return Ok(first);
         }
         *self.startup_retries.lock().await += 1;
-        let second = self.execute_once(host, script, timeout, container).await?;
+        let second = self
+            .execute_once(host, script, timeout, container, progress)
+            .await?;
         Ok(second)
     }
 
@@ -325,6 +330,7 @@ impl FilesystemWorkers {
         script: &str,
         timeout: f64,
         container: Option<&str>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
     ) -> BridgeResult<Map<String, Value>> {
         self.ensure_sweeper();
         let key = format!(
@@ -343,7 +349,7 @@ impl FilesystemWorkers {
                     ..Default::default()
                 };
                 self.runner
-                    .execute_to_store(host, script, timeout, &spec, None)
+                    .execute_to_store(host, script, timeout, &spec, progress)
                     .await
             }
             Some(session_id) => {
@@ -355,7 +361,7 @@ impl FilesystemWorkers {
                 };
                 let result = self
                     .runner
-                    .execute_to_store(host, script, timeout, &spec, None)
+                    .execute_to_store(host, script, timeout, &spec, progress)
                     .await;
                 let failed = match &result {
                     Ok(meta) => meta.get("ok") != Some(&Value::Bool(true)),
@@ -485,7 +491,11 @@ impl Filesystem {
         }
     }
 
-    pub async fn execute(&self, arguments: Map<String, Value>) -> BridgeResult<Value> {
+    pub async fn execute(
+        &self,
+        arguments: Map<String, Value>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
+    ) -> BridgeResult<Value> {
         validate(&arguments)?;
         let target = arguments
             .get("target")
@@ -529,6 +539,18 @@ impl Filesystem {
                     options.overwrite,
                 )
                 .await?;
+            if let Some(progress) = progress {
+                // Record the saved transfer before it can be reported, so a crash
+                // still leaves the caller a result id to reconcile.
+                progress.record(
+                    "execution_results",
+                    serde_json::json!({
+                        "host": host.name,
+                        "result_id": outcome.result_id,
+                        "action": action,
+                    }),
+                );
+            }
             let meta = self.store.metadata(&outcome.result_id)?;
             let mut row = Map::new();
             for key in [
@@ -566,7 +588,13 @@ impl Filesystem {
         let timeout = options.timeout.unwrap_or(30) as f64 + 5.0;
         let meta = self
             .workers
-            .execute(&host, &script, timeout, options.container.as_deref())
+            .execute(
+                &host,
+                &script,
+                timeout,
+                options.container.as_deref(),
+                progress,
+            )
             .await?;
         let rid = meta
             .get("result_id")

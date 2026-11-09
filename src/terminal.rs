@@ -276,32 +276,37 @@ impl TerminalShell {
         );
         let mut out_state = CaptureState::default();
         let mut err_state = CaptureState::default();
+        let mut out_code: Option<i32> = None;
+        let mut err_code: Option<i32> = None;
         let began = Instant::now();
         loop {
-            // Drain what is already buffered before waiting for the next packet.
-            match capture_stream(
-                &mut streams.out.buffer,
-                &mut out_file,
-                &start,
-                &end,
-                &mut out_state,
-            )? {
-                Some(code) => return finish_capture(code, &out_file),
-                None => {}
+            // Drain what is already buffered before waiting for the next packet. Both
+            // streams are scanned every round: the command is only complete once both
+            // reported their end marker, so a late stderr line is never dropped.
+            if out_code.is_none() {
+                out_code = capture_stream(
+                    &mut streams.out.buffer,
+                    &mut out_file,
+                    &start,
+                    &end,
+                    &mut out_state,
+                )?;
             }
-            match capture_stream(
-                &mut streams.err.buffer,
-                &mut err_file,
-                &start,
-                &end,
-                &mut err_state,
-            )? {
-                Some(code) => return finish_capture(code, &err_file),
-                None => {}
+            if err_code.is_none() {
+                err_code = capture_stream(
+                    &mut streams.err.buffer,
+                    &mut err_file,
+                    &start,
+                    &end,
+                    &mut err_state,
+                )?;
             }
             if out_state.started || err_state.started {
                 started.store(true, Ordering::SeqCst);
                 changed.notify_waiters();
+            }
+            if let Some(resolved) = resolve_completion(out_code, err_code) {
+                return resolved.and_then(|code| finish_capture(code, &out_file));
             }
             let remaining = deadline.checked_sub(began.elapsed()).unwrap_or_default();
             if began.elapsed() >= deadline {
@@ -337,6 +342,18 @@ impl TerminalShell {
 
 fn finish_capture(code: i32, _file: &std::fs::File) -> BridgeResult<i32> {
     Ok(code)
+}
+
+/// A command is complete only when both streams reported the same status.
+fn resolve_completion(out_code: Option<i32>, err_code: Option<i32>) -> Option<BridgeResult<i32>> {
+    match (out_code, err_code) {
+        (Some(exit_out), Some(exit_err)) if exit_out == exit_err => Some(Ok(exit_out)),
+        (Some(exit_out), Some(exit_err)) => Some(Err(BridgeError::ssh(format!(
+            "terminal streams reported different statuses ({exit_out} and {exit_err}); \
+completion is unknown"
+        )))),
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -1191,6 +1208,95 @@ pub fn command_rejection(meta: &Map<String, Value>) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_needs_both_streams_and_matching_statuses() {
+        // One stream alone is not evidence: stderr may still be in flight.
+        assert!(resolve_completion(Some(0), None).is_none());
+        assert!(resolve_completion(None, Some(0)).is_none());
+        assert!(resolve_completion(None, None).is_none());
+        assert!(matches!(resolve_completion(Some(0), Some(0)), Some(Ok(0))));
+        match resolve_completion(Some(4), Some(0)) {
+            Some(Err(error)) => assert!(error.message().contains("different statuses")),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_stream_handles_start_and_end_in_one_packet() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("out.log");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let nonce = "n1";
+        let mut start = b"\x1eSTART".to_vec();
+        start.extend_from_slice(nonce.as_bytes());
+        start.push(MARKER_SUFFIX);
+        let end = format!("\x1eEND{nonce}:").into_bytes();
+        let mut buffer = start.clone();
+        buffer.extend_from_slice(b"hi\n");
+        buffer.extend_from_slice(&end);
+        buffer.extend_from_slice(b"7");
+        buffer.push(MARKER_SUFFIX);
+        let mut state = CaptureState::default();
+        let code = capture_stream(&mut buffer, &mut file, &start, &end, &mut state).unwrap();
+        // The same packet must both mark the command started and finish it.
+        assert!(
+            state.started,
+            "start marker in a combined packet must register"
+        );
+        assert_eq!(code, Some(7));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi\n");
+    }
+
+    #[test]
+    fn capture_stream_waits_for_the_second_stream() {
+        // stdout finishes first; the caller must keep waiting for stderr rather than
+        // returning a completion that silently drops the error output.
+        let directory = tempfile::tempdir().unwrap();
+        let out_path = directory.path().join("out.log");
+        let err_path = directory.path().join("err.log");
+        let mut out_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out_path)
+            .unwrap();
+        let mut err_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&err_path)
+            .unwrap();
+        let nonce = "n1";
+        let mut start = b"\x1eSTART".to_vec();
+        start.extend_from_slice(nonce.as_bytes());
+        start.push(MARKER_SUFFIX);
+        let end = format!("\x1eEND{nonce}:").into_bytes();
+        let complete = |body: &[u8]| {
+            let mut buffer = start.clone();
+            buffer.extend_from_slice(body);
+            buffer.extend_from_slice(&end);
+            buffer.extend_from_slice(b"0");
+            buffer.push(MARKER_SUFFIX);
+            buffer
+        };
+        let mut out_buffer = complete(b"ok\n");
+        let mut err_buffer = complete(b"");
+        let mut out_state = CaptureState::default();
+        let mut err_state = CaptureState::default();
+        let out_code =
+            capture_stream(&mut out_buffer, &mut out_file, &start, &end, &mut out_state).unwrap();
+        let err_code =
+            capture_stream(&mut err_buffer, &mut err_file, &start, &end, &mut err_state).unwrap();
+        assert_eq!(out_code, Some(0));
+        assert_eq!(err_code, Some(0));
+        assert!(matches!(
+            resolve_completion(out_code, err_code),
+            Some(Ok(0))
+        ));
+    }
 
     #[test]
     fn capture_stream_strips_markers_and_reports_the_status() {

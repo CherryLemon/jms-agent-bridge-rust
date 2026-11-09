@@ -46,6 +46,24 @@ Python one on the same state directory keeps dedupe working. New receipts
 written by Rust are plain JSON with the same keys; the Python journal ignores
 any extra field it does not know.
 
+## Stricter defaults in the Rust bridge
+
+Three behaviours are deliberately fail-closed where the Python bridge was
+permissive. They are listed here because they change what a copied config does:
+
+| Topic | Python bridge | Rust bridge |
+| --- | --- | --- |
+| Gateway host key | verification only when `known_hosts` is configured | always verified against `~/.ssh/known_hosts` (or `bridge.known_hosts`); an unknown or changed key is refused |
+| Assets with several permitted accounts | resolved by name | stay unresolved until `bridge.preferred_account` names one; `discover(topic="assets")` explains why |
+| SSH authentication | may include interactive steps | must complete with a key or password; anything else fails fast with an authentication error |
+
+## Not supported
+
+* SSH agent authentication is not implemented: provide `bastion.ssh_key` (with
+  an unencrypted key file, or a key the running agent already unlocked) or a
+  password.
+* Only Linux targets are tested; the remote probes assume GNU userland.
+
 ## What is not carried over
 
 * Result directories are shared, so `read_result` keeps working for both. Saved

@@ -1,23 +1,44 @@
-# Copy to ~/.config/jms-bridge/config.toml and fill in the credential file.
+# Copy to ~/.config/jms-bridge/config.toml (mode 0600) and put secrets in
+# credentials.toml next to it. Every key below is read by the service.
+
 [bastion]
 url = "https://bastion.example.com"
 ssh_port = 2224
 login_user = "your-login"
 
-# Optional: raise the fan-out ceiling for many-target reads.
+# Reach the bastion through an HTTP proxy (REST and SSH both use it).
+# proxy = "http://proxy.internal:8080"
+# Set to false only for a bastion with a self-signed certificate.
+# verify_tls = true
 # max_parallel = 8
-# inspection_parallel = 4
+
+[bridge]
+# Where results, request receipts and the inventory cache live.
+# state_dir = "~/.local/state/jms-bridge"
+
+# Inventory refresh and result retention.
+# refresh_interval = 3600
+# result_ttl_seconds = 604800
+# result_cleanup_interval_seconds = 3600
+
+# Execution capacity and queueing (defaults: CPU count, 60s, 64 tasks).
+# execution_limit = 8
+# inspection_reserved = 2
 # queue_limit = 64
 # inspection_queue_limit = 16
 # queue_timeout = 60
-#
-# Proxy for the REST API and SSH when the bastion is only reachable through one.
-# proxy = "http://proxy.internal:8080"
-#
-# Set to false only for a bastion with a self-signed certificate.
-# verify_tls = true
 
-# Optional state location (results, request receipts, inventory cache).
-# state_dir = "~/.local/state/jms-bridge"
-# result_ttl_seconds = 604800
-# result_cleanup_interval_seconds = 3600
+# Account binding. Assets that permit several accounts stay unresolved until this
+# is set to one of them; the bridge never picks an identity on its own.
+# preferred_account = "root"
+
+# SSH host key verification. Defaults to ~/.ssh/known_hosts and refuses unknown
+# or changed keys; point this elsewhere if the gateway is pinned in another file.
+# known_hosts = "~/.ssh/known_hosts"
+# Name to look up in known_hosts when the gateway is reached under another alias.
+# host_key_alias = "bastion.example.com"
+
+# Override how the SSH gateway is reached, independent of the REST URL.
+# ssh_host = "bastion.example.com"
+# Proxy for the REST API when it differs from the SSH path.
+# rest_proxy = "http://proxy.internal:8080"

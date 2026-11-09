@@ -90,6 +90,8 @@ struct Inner {
     active: [usize; 2],
     waiters: VecDeque<Waiter>,
     queue_full_rejections: [u64; 2],
+    /// Grants whose waiter vanished before delivery; the slot was returned.
+    granted_but_cancelled: u64,
     peak_active: usize,
 }
 
@@ -147,6 +149,7 @@ impl ExecutionSlots {
                 active: [0, 0],
                 waiters: VecDeque::new(),
                 queue_full_rejections: [0, 0],
+                granted_but_cancelled: 0,
                 peak_active: 0,
             }),
             next_id: AtomicU64::new(1),
@@ -189,6 +192,9 @@ impl ExecutionSlots {
         if inner.waiters.is_empty() {
             return;
         }
+        // Drop waiters whose future was cancelled (aborted task, closed channel)
+        // before they can hold capacity or inflate the queue depth.
+        inner.waiters.retain(|waiter| !waiter.notify.is_closed());
         let mut index = 0;
         while index < inner.waiters.len() {
             let lane = inner.waiters[index].lane;
@@ -200,7 +206,12 @@ impl ExecutionSlots {
             inner.active[lane.index()] += 1;
             inner.peak_active = inner.peak_active.max(inner.active[0] + inner.active[1]);
             waiter.granted = true;
-            let _ = waiter.notify.send(());
+            if waiter.notify.send(()).is_err() {
+                // The waiter disappeared between the grant and its delivery: give the
+                // slot straight back instead of leaking capacity for the process life.
+                inner.active[lane.index()] = inner.active[lane.index()].saturating_sub(1);
+                inner.granted_but_cancelled += 1;
+            }
         }
     }
 
@@ -339,6 +350,50 @@ mod tests {
 
     fn timings() -> Timings {
         Timings::default()
+    }
+
+    /// A cancelled waiter must not consume capacity forever: an aborted task keeps
+    /// its slot lease, so a later release would otherwise leak one execution slot.
+    #[tokio::test]
+    async fn cancelled_waiter_returns_its_slot() {
+        let slots = ExecutionSlots::new(1, 0, 4, 0).unwrap();
+        let mut t = timings();
+        let guard = slots
+            .acquire(Lane::General, Duration::from_secs(1), &mut t)
+            .await
+            .expect("first slot");
+
+        // Queue a waiter, then cancel it the way an aborted terminal command would.
+        let waiting = {
+            let slots = slots.clone();
+            tokio::spawn(async move {
+                let mut t = timings();
+                let _ = slots
+                    .acquire(Lane::General, Duration::from_secs(30), &mut t)
+                    .await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waiting.abort();
+        let _ = waiting.await;
+
+        drop(guard);
+        // The release pump needs a turn of the runtime before capacity returns.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut t2 = timings();
+        let next = tokio::time::timeout(
+            Duration::from_secs(1),
+            slots.acquire(Lane::General, Duration::from_secs(1), &mut t2),
+        )
+        .await
+        .expect("capacity must come back after a cancelled waiter");
+        assert!(
+            next.is_ok(),
+            "slot should be granted after the cancelled waiter: {:?}",
+            next.err()
+        );
+        drop(next);
     }
 
     #[tokio::test]

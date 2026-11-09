@@ -89,6 +89,8 @@ pub struct ShellSession {
     pub lost: bool,
     pub ready_marker: Option<Vec<u8>>,
     pub last_used: Instant,
+    /// Launch command the shell was created with; reused shells must match it.
+    pub launch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,6 +115,7 @@ impl ShellSession {
             lost: false,
             ready_marker: None,
             last_used: Instant::now(),
+            launch: None,
         }
     }
 
@@ -210,12 +213,19 @@ target connection",
         &mut self,
         out_path: &Path,
         err_path: &Path,
-        marker: Option<Vec<u8>>,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
         deadline: Option<Duration>,
-    ) -> BridgeResult<bool> {
-        let mut out = PumpStream::new(std::mem::take(&mut self.out), out_path, marker)?;
-        let mut err = PumpStream::new(std::mem::take(&mut self.err), err_path, None)?;
+    ) -> BridgeResult<PumpOutcome> {
+        let mut out = PumpStream::new(
+            std::mem::take(&mut self.out),
+            out_path,
+            start.clone(),
+            end.clone(),
+        )?;
+        let mut err = PumpStream::new(std::mem::take(&mut self.err), err_path, start, end)?;
         let limit = deadline.map(|value| Instant::now() + value);
+        let mut outcome = PumpOutcome::default();
         let result = loop {
             out.flush_buffer()?;
             err.flush_buffer()?;
@@ -239,16 +249,30 @@ target connection",
                 None => self.reader.next().await,
             };
             match event {
-                Some(ShellEvent::Data(data)) => out.push(&data),
-                Some(ShellEvent::ExtData(data)) => err.push(&data),
-                _ => break Ok(out.started),
+                Some(event) => {
+                    if !feed_pump(&mut out, &mut err, &mut outcome, event)? {
+                        break Ok(());
+                    }
+                }
+                None => {
+                    outcome.closed = true;
+                    break Ok(());
+                }
             }
         };
+        // The channel is over: whatever is still buffered is real output.
+        out.flush_all()?;
+        err.flush_all()?;
+        let marker_started = out.started || err.started;
+        let end_code = out.end_code.or(err.end_code);
         self.out = out.into_buffer();
         self.err = err.into_buffer();
-        // A closed channel is a normal end here: whether the command ran is decided by
-        // the start marker and the exit status, not by the channel's lifetime.
-        result
+        result.map(|()| {
+            let mut done = outcome;
+            done.started = marker_started;
+            done.end_code = end_code;
+            done
+        })
     }
 
     /// Capture one acknowledged command on a persistent shell.
@@ -314,21 +338,72 @@ target connection",
     }
 }
 
+/// What one pumped channel reported: marker evidence plus the transport's own
+/// exit status. Completion is decided from this, never from a placeholder code.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PumpOutcome {
+    /// The script's start marker (or the transport ran without one).
+    pub started: bool,
+    /// `$?` reported by the end marker written by the script itself.
+    pub end_code: Option<i32>,
+    /// Exit status of the SSH channel, when the transport delivered one.
+    pub exit_status: Option<i32>,
+    pub rejected: bool,
+    pub closed: bool,
+}
+
+/// Apply one channel event to a pump. Returns `false` when the channel is over.
+///
+/// Exposed for tests: the completion rules must hold for any event order the
+/// transport can produce, not only for the usual one.
+fn feed_pump(
+    out: &mut PumpStream,
+    err: &mut PumpStream,
+    outcome: &mut PumpOutcome,
+    event: ShellEvent,
+) -> BridgeResult<bool> {
+    match event {
+        ShellEvent::Data(data) => out.push(&data),
+        ShellEvent::ExtData(data) => err.push(&data),
+        // The exit status can arrive after Eof, so keep reading until Close.
+        ShellEvent::Exit(code) => outcome.exit_status = Some(code),
+        ShellEvent::Eof => {}
+        ShellEvent::ExecRejected => {
+            outcome.rejected = true;
+            return Ok(false);
+        }
+        ShellEvent::Closed => {
+            outcome.closed = true;
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 struct PumpStream {
     buffer: Vec<u8>,
     file: File,
-    marker: Option<Vec<u8>>,
+    start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
     started: bool,
+    end_code: Option<i32>,
 }
 
 impl PumpStream {
-    fn new(buffer: Vec<u8>, path: &Path, marker: Option<Vec<u8>>) -> BridgeResult<Self> {
-        let started = marker.is_none();
+    fn new(
+        buffer: Vec<u8>,
+        path: &Path,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+    ) -> BridgeResult<Self> {
+        let started = start.is_none();
         Ok(Self {
             buffer,
             file: File::create(path)?,
-            marker,
+            start,
+            end,
             started,
+            end_code: None,
         })
     }
 
@@ -337,26 +412,77 @@ impl PumpStream {
     }
 
     fn flush_buffer(&mut self) -> BridgeResult<()> {
-        let Some(marker) = self.marker.clone() else {
-            let _ = self.file.write_all(&self.buffer);
-            self.buffer.clear();
-            return Ok(());
-        };
-        if let Some(position) = find(&self.buffer, &marker) {
-            let _ = self.file.write_all(&self.buffer[..position]);
-            let rest = self.buffer[position + marker.len()..].to_vec();
-            let _ = self.file.write_all(&rest);
-            self.buffer.clear();
-            self.started = true;
-            self.marker = None;
-            return Ok(());
+        loop {
+            if let Some(start) = self.start.clone() {
+                match find(&self.buffer, &start) {
+                    Some(position) => {
+                        let _ = self.file.write_all(&self.buffer[..position]);
+                        self.buffer.drain(..position + start.len());
+                        self.start = None;
+                        self.started = true;
+                        continue;
+                    }
+                    None => {
+                        if self.buffer.len() >= start.len() {
+                            let cut = self.buffer.len() - (start.len() - 1);
+                            let _ = self.file.write_all(&self.buffer[..cut]);
+                            self.buffer.drain(..cut);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            let Some(end) = self.end.clone() else {
+                let _ = self.file.write_all(&self.buffer);
+                self.buffer.clear();
+                return Ok(());
+            };
+            match find(&self.buffer, &end) {
+                Some(position) => {
+                    let suffix_start = position + end.len();
+                    match self.buffer[suffix_start..]
+                        .iter()
+                        .position(|byte| *byte == MARKER_SUFFIX)
+                    {
+                        Some(offset) => {
+                            let code_text = String::from_utf8_lossy(
+                                &self.buffer[suffix_start..suffix_start + offset],
+                            )
+                            .trim()
+                            .to_string();
+                            let _ = self.file.write_all(&self.buffer[..position]);
+                            let rest = self.buffer[suffix_start + offset + 1..].to_vec();
+                            self.buffer.clear();
+                            self.buffer.extend_from_slice(&rest);
+                            self.end_code = Some(code_text.parse().unwrap_or(255));
+                            self.end = None;
+                            continue;
+                        }
+                        None => {
+                            // The status digits have not fully arrived yet.
+                            let _ = self.file.write_all(&self.buffer[..position]);
+                            self.buffer.drain(..position);
+                            return Ok(());
+                        }
+                    }
+                }
+                None => {
+                    let keep = end.len() + 16;
+                    if self.buffer.len() > keep {
+                        let cut = self.buffer.len() - keep;
+                        let _ = self.file.write_all(&self.buffer[..cut]);
+                        self.buffer.drain(..cut);
+                    }
+                    return Ok(());
+                }
+            }
         }
-        if self.buffer.len() >= marker.len() {
-            let keep = marker.len() - 1;
-            let cut = self.buffer.len() - keep;
-            let _ = self.file.write_all(&self.buffer[..cut]);
-            self.buffer.drain(..cut);
-        }
+    }
+
+    /// Write everything still buffered: no further data can arrive.
+    fn flush_all(&mut self) -> BridgeResult<()> {
+        let _ = self.file.write_all(&self.buffer);
+        self.buffer.clear();
         Ok(())
     }
 
@@ -476,6 +602,7 @@ pub fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn markers_are_control_character_bounded() {
@@ -510,6 +637,119 @@ mod tests {
         assert!(packet.contains("$'a\\nb\\'c\\\\d'"));
         // Exactly one physical line: a foreground read must not consume the marker.
         assert_eq!(packet.lines().count(), 1);
+    }
+
+    /// Drive a pump with a scripted event sequence and report what it concluded.
+    fn pump_sequence(events: Vec<ShellEvent>) -> (PumpOutcome, String, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let out_path = directory.path().join("stdout.log");
+        let err_path = directory.path().join("stderr.log");
+        let nonce = "n1";
+        let start = exec_start_marker(nonce);
+        let end = exec_end_marker(nonce);
+        let mut out = PumpStream::new(
+            Vec::new(),
+            &out_path,
+            Some(start.clone()),
+            Some(end.clone()),
+        )
+        .unwrap();
+        let mut err = PumpStream::new(Vec::new(), &err_path, Some(start), Some(end)).unwrap();
+        let mut outcome = PumpOutcome::default();
+        for event in events {
+            out.flush_buffer().unwrap();
+            err.flush_buffer().unwrap();
+            feed_pump(&mut out, &mut err, &mut outcome, event).unwrap();
+        }
+        out.flush_all().unwrap();
+        err.flush_all().unwrap();
+        outcome.started = out.started || err.started;
+        outcome.end_code = out.end_code.or(err.end_code);
+        out.into_buffer();
+        err.into_buffer();
+        let stdout = std::fs::read_to_string(&out_path).unwrap();
+        let stderr = std::fs::read_to_string(&err_path).unwrap();
+        (outcome, stdout, stderr)
+    }
+
+    fn start_packet(nonce: &str) -> Vec<u8> {
+        let mut packet = exec_start_marker(nonce);
+        packet.extend_from_slice(b"hello\n");
+        packet
+    }
+
+    fn end_packet(nonce: &str, code: i32) -> Vec<u8> {
+        let mut packet = exec_end_marker(nonce);
+        packet.extend_from_slice(format!("{code}").as_bytes());
+        packet.push(MARKER_SUFFIX);
+        packet
+    }
+
+    #[test]
+    fn start_then_close_without_status_is_unknown() {
+        // The channel dies after the acknowledgement but before any completion
+        // evidence: that must never be reported as a finished run.
+        let (outcome, stdout, _) = pump_sequence(vec![
+            ShellEvent::Data(Bytes::from(start_packet("n1"))),
+            ShellEvent::Closed,
+        ]);
+        assert!(outcome.started);
+        assert_eq!(outcome.end_code, None);
+        assert_eq!(outcome.exit_status, None);
+        assert_eq!(stdout, "hello\n");
+    }
+
+    #[test]
+    fn exit_status_arriving_after_eof_is_kept() {
+        let (outcome, _, _) = pump_sequence(vec![
+            ShellEvent::Data(Bytes::from(start_packet("n1"))),
+            ShellEvent::Eof,
+            ShellEvent::Exit(7),
+            ShellEvent::Closed,
+        ]);
+        assert!(outcome.started);
+        assert_eq!(outcome.exit_status, Some(7));
+        assert!(outcome.closed);
+    }
+
+    #[test]
+    fn end_marker_carries_the_exit_code_and_trailing_output_is_written() {
+        let mut events = vec![
+            ShellEvent::Data(Bytes::from(start_packet("n1"))),
+            ShellEvent::Data(Bytes::from(end_packet("n1", 3))),
+        ];
+        events.push(ShellEvent::Data(Bytes::from_static(b"after\n")));
+        events.push(ShellEvent::Closed);
+        let (outcome, stdout, _) = pump_sequence(events);
+        assert!(outcome.started);
+        assert_eq!(outcome.end_code, Some(3));
+        assert_eq!(stdout, "hello\nafter\n");
+    }
+
+    #[test]
+    fn an_exit_status_without_the_start_marker_is_not_success() {
+        // No acknowledgement: the script may never have run, whatever the channel says.
+        let (outcome, _, _) = pump_sequence(vec![
+            ShellEvent::Data(Bytes::from_static(b"banner\n")),
+            ShellEvent::Exit(0),
+            ShellEvent::Closed,
+        ]);
+        assert!(!outcome.started);
+        assert_eq!(outcome.exit_status, Some(0));
+    }
+
+    #[test]
+    fn end_marker_split_across_packets_is_reassembled() {
+        let end = end_packet("n1", 9);
+        let (first, second) = end.split_at(6);
+        let (outcome, stdout, _) = pump_sequence(vec![
+            ShellEvent::Data(Bytes::from(start_packet("n1"))),
+            ShellEvent::Data(Bytes::from(first.to_vec())),
+            ShellEvent::Data(Bytes::from(second.to_vec())),
+            ShellEvent::Closed,
+        ]);
+        assert_eq!(outcome.end_code, Some(9));
+        assert_eq!(stdout, "hello\n");
     }
 
     #[test]

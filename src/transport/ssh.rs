@@ -27,6 +27,8 @@ pub enum ShellEvent {
     Data(Bytes),
     ExtData(Bytes),
     Exit(i32),
+    /// The remote stopped writing but may still report an exit status.
+    Eof,
     /// The remote refused the exec request itself.
     ExecRejected,
     Closed,
@@ -35,7 +37,7 @@ pub enum ShellEvent {
 struct ClientHandler {
     host: String,
     port: u16,
-    known_hosts: Option<PathBuf>,
+    known_hosts: PathBuf,
 }
 
 #[derive(Debug)]
@@ -62,16 +64,21 @@ impl client::Handler for ClientHandler {
         &mut self,
         server_public_key: &ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        match &self.known_hosts {
-            // Without a configured known_hosts file the gateway key cannot be
-            // verified; that is the documented default of the Python bridge too.
-            None => Ok(true),
-            Some(path) => {
-                match check_known_hosts_path(&self.host, self.port, server_public_key, path) {
-                    Ok(found) => Ok(found),
-                    Err(error) => Err(HandlerError(format!("known_hosts: {error}"))),
-                }
-            }
+        // Fail closed: an unknown or changed key is never accepted silently.
+        match check_known_hosts_path(&self.host, self.port, server_public_key, &self.known_hosts) {
+            Ok(true) => Ok(true),
+            Ok(false) => Err(HandlerError(format!(
+                "host key for {}:{} is not in {}; add it deliberately (ssh-keyscan -p {}) \
+before connecting",
+                self.host,
+                self.port,
+                self.known_hosts.display(),
+                self.port
+            ))),
+            Err(error) => Err(HandlerError(format!(
+                "host key verification against {} failed: {error}",
+                self.known_hosts.display()
+            ))),
         }
     }
 }
@@ -146,7 +153,10 @@ impl ChannelShell {
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         ShellEvent::Exit(exit_status as i32)
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => ShellEvent::Closed,
+                    // `Eof` only ends the byte stream: an exit status can still follow,
+                    // so it must not terminate the reader.
+                    Some(ChannelMsg::Eof) => ShellEvent::Eof,
+                    Some(ChannelMsg::Close) => ShellEvent::Closed,
                     Some(ChannelMsg::OpenFailure(_)) | Some(ChannelMsg::Failure) => {
                         ShellEvent::ExecRejected
                     }
@@ -433,6 +443,9 @@ impl SshPool {
             nodelay: true,
             ..Default::default()
         });
+        // Resolve before the handshake so an unverifiable connection is refused
+        // with a configuration error instead of being trusted.
+        let known_hosts = self.settings.resolve_known_hosts()?;
         let handler = ClientHandler {
             host: self
                 .settings
@@ -440,7 +453,7 @@ impl SshPool {
                 .clone()
                 .unwrap_or_else(|| gateway.clone()),
             port,
-            known_hosts: self.settings.known_hosts.clone(),
+            known_hosts,
         };
         let stream = self.open_transport(&gateway, port).await?;
         let connect = tokio::time::timeout(
@@ -459,7 +472,10 @@ impl SshPool {
         })?;
         let mut handle = connect;
         let user = host.login_string(self.cfg.login_user.as_deref())?;
+        // Authentication must not hang: a gateway waiting on a prompt nobody can
+        // answer would otherwise hold the request until the deadline expires.
         let mut result: Option<AuthResult> = None;
+        let auth_deadline = Duration::from_secs(60);
         if let Some(key_path) = &self.cfg.ssh_key {
             let private = load_private_key(key_path)?;
             let hash = handle
@@ -501,12 +517,19 @@ impl SshPool {
             if let Some(password) = &password {
                 // JumpServer may answer with a keyboard-interactive challenge instead of
                 // plain password auth; only the password and username prompts are filled in.
-                let mut response = handle
-                    .authenticate_keyboard_interactive_start(user.clone(), None::<String>)
-                    .await
-                    .map_err(|error| {
-                        BridgeError::ssh(format!("SSH authentication failed ({error})"))
-                    })?;
+                let mut response = tokio::time::timeout(
+                    auth_deadline,
+                    handle.authenticate_keyboard_interactive_start(user.clone(), None::<String>),
+                )
+                .await
+                .map_err(|_| {
+                    BridgeError::ssh(
+                        "SSH authentication timed out; the gateway did not finish the challenge",
+                    )
+                })?
+                .map_err(|error| {
+                    BridgeError::ssh(format!("SSH authentication failed ({error})"))
+                })?;
                 loop {
                     match response {
                         KeyboardInteractiveAuthResponse::Success => {
@@ -526,12 +549,20 @@ impl SshPool {
                                     replies.push(String::new());
                                 }
                             }
-                            response = handle
-                                .authenticate_keyboard_interactive_respond(replies)
-                                .await
-                                .map_err(|error| {
-                                    BridgeError::ssh(format!("SSH authentication failed ({error})"))
-                                })?;
+                            response = tokio::time::timeout(
+                                auth_deadline,
+                                handle.authenticate_keyboard_interactive_respond(replies),
+                            )
+                            .await
+                            .map_err(|_| {
+                                BridgeError::ssh(
+                                    "SSH authentication timed out; the gateway did not accept the \
+credentials",
+                                )
+                            })?
+                            .map_err(|error| {
+                                BridgeError::ssh(format!("SSH authentication failed ({error})"))
+                            })?;
                         }
                     }
                 }

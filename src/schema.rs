@@ -86,10 +86,10 @@ fn walk(schema: &Value, value: &Value, path: &mut Vec<String>) -> Result<(), Sch
                 }
             }
             let properties = schema.get("properties").and_then(Value::as_object);
-            let closed = schema
-                .get("additionalProperties")
-                .map(|value| value == &Value::Bool(false))
-                .unwrap_or(false);
+            // `additionalProperties: false` closes the object; an object form is a
+            // schema for the extra values (for example `env` must map to strings).
+            let additional = schema.get("additionalProperties");
+            let closed = additional == Some(&Value::Bool(false));
             if closed {
                 if let Some(properties) = properties {
                     for key in map.keys() {
@@ -100,6 +100,19 @@ fn walk(schema: &Value, value: &Value, path: &mut Vec<String>) -> Result<(), Sch
                             ));
                         }
                     }
+                }
+            }
+            if let Some(extra_schema) = additional.filter(|value| value.is_object()) {
+                for (key, item) in map {
+                    if properties
+                        .map(|properties| properties.contains_key(key))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    path.push(key.clone());
+                    walk(extra_schema, item, path)?;
+                    path.pop();
                 }
             }
             if let Some(properties) = properties {
