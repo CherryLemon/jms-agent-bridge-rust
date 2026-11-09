@@ -157,3 +157,7 @@ upload/download round trips, job lifecycle, timeouts, an interactive Python REPL
 through `terminal`, accelerator inspection, and restart-interruption
 receipts. The full matrix, plus what was deliberately not exercised, is in
 `docs/verification.md`, and the switch/rollback story is in `docs/migration.md`.
+
+## License
+
+Apache-2.0; see `LICENSE`.
