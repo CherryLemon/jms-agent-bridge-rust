@@ -1,0 +1,77 @@
+[package]
+name = "jms-agent-bridge"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Resident JumpServer bridge with a compact MCP surface (Rust)"
+license = "Apache-2.0"
+repository = "https://github.com/lvyufeng/jms-agent-bridge"
+default-run = "jms-bridge"
+
+[lib]
+name = "jms_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jms-bridge"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+futures = "0.3"
+hex = "0.4"
+hmac = "0.12"
+httpdate = "1"
+libc = "0.2"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "json",
+    "charset",
+    "http2",
+] }
+rmcp = { version = "3.9", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+    "server-side-http",
+    "transport-streamable-http-server",
+] }
+russh = { version = "0.54", default-features = false, features = ["ring", "rsa"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "io-util",
+    "io-std",
+    "process",
+    "fs",
+    "signal",
+] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.release]
+opt-level = 2
+lto = false
+codegen-units = 16
