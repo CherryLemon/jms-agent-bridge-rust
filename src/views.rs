@@ -168,6 +168,57 @@ pub fn compact(
     arguments: &Map<String, Value>,
     addresses: &HashMap<String, String>,
 ) -> Value {
+    // Staging metadata is added by the runtime, not by the tool, so it is re-attached
+    // after the per-tool projection: dropping it would hide that the payload is on disk.
+    let staged = season_staging(value);
+    let projected = compact_inner(tool, value, arguments, addresses);
+    attach_staging(projected, staged)
+}
+
+/// Staging fields worth keeping, in the order they are attached.
+const STAGING_KEYS: [&str; 6] = [
+    "staged",
+    "operation",
+    "bytes",
+    "result_id",
+    "preview",
+    "note",
+];
+
+fn season_staging(value: &Value) -> Option<Map<String, Value>> {
+    let map = value.as_object()?;
+    if map.get("staged") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    let mut out = Map::new();
+    for key in STAGING_KEYS {
+        if let Some(item) = map.get(key) {
+            out.insert(key.to_string(), item.clone());
+        }
+    }
+    Some(out)
+}
+
+fn attach_staging(projected: Value, staged: Option<Map<String, Value>>) -> Value {
+    let Some(staged) = staged else {
+        return projected;
+    };
+    let mut out = match projected {
+        Value::Object(map) => map,
+        other => return other,
+    };
+    for (key, value) in staged {
+        out.insert(key, value);
+    }
+    Value::Object(out)
+}
+
+fn compact_inner(
+    tool: &str,
+    value: &Value,
+    arguments: &Map<String, Value>,
+    addresses: &HashMap<String, String>,
+) -> Value {
     let Some(map) = value.as_object() else {
         return value.clone();
     };
@@ -236,6 +287,19 @@ pub fn compact(
             "stdout_truncated",
             "stderr_truncated",
             "warning",
+            // A staged response must stay readable as such: without these keys the
+            // caller sees only a result id and no hint that the payload moved to disk.
+            "staged",
+            "operation",
+            "bytes",
+            "preview",
+            "note",
+            "request_id",
+            "request_state",
+            "execution_state",
+            "completion_unknown",
+            "failure_stage",
+            "error",
         ] {
             if let Some(item) = map.get(key) {
                 out.insert(key.to_string(), item.clone());
@@ -421,6 +485,32 @@ mod tests {
 
     fn arguments(value: Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_staged_payload_keeps_its_read_instructions() {
+        // `call jms_fs` with a payload above the budget: the runtime replaced `data`
+        // with a summary, so the fs projection must not strip the summary away.
+        let value = json!({
+            "ok": true,
+            "host": "h1",
+            "staged": true,
+            "operation": "jms_fs",
+            "bytes": 40000,
+            "result_id": "abc",
+            "preview": "{\"ok\":true",
+            "note": "response exceeded 8192 bytes; full payload saved as abc (read_result with stream='result')",
+        });
+        let out = compact(
+            "call",
+            &value,
+            &arguments(json!({"operation": "jms_fs"})),
+            &HashMap::new(),
+        );
+        assert_eq!(out["staged"], true);
+        assert_eq!(out["result_id"], "abc");
+        assert!(out["note"].as_str().unwrap().contains("read_result"));
+        assert_eq!(out["bytes"], 40000);
     }
 
     #[test]

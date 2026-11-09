@@ -18,7 +18,7 @@ use crate::inspection::AcceleratorInspector;
 use crate::inventory::Host;
 use crate::jobs::{validate_job_id, Jobs};
 use crate::rest::AssetCatalog;
-use crate::scheduler::Lane;
+use crate::scheduler::{queue_rejection, Lane};
 use crate::schemas::{self, DANGEROUS_FLAG_DESCRIPTION};
 use crate::storage::journal::RequestJournal;
 use crate::storage::results::{now, ResultStore};
@@ -119,7 +119,7 @@ impl BridgeRuntime {
         let mut value = json!({
             "inventory": self.catalog.status(),
             "ssh_connections": self.runner.connection_status().await,
-            "persistent_shells": self.runner.sessions(),
+            "persistent_shells": self.runner.sessions().await,
             "result_directory": self.store.root.to_string_lossy(),
             "result_retention": self.store.retention_status(),
             "filesystem_workers": self.filesystem.workers.status().await,
@@ -728,7 +728,8 @@ require allow_dangerous=true",
             let runtime = self.clone();
             let work = Value::Object(payload.clone());
             let work_for_task = work.clone();
-            return self
+            let operation_for_task = operation.clone();
+            let mut value = self
                 .journal
                 .execute(&request_id, &operation, &work, move |sink| async move {
                     let sink: Arc<dyn crate::storage::journal::ProgressSink> = sink;
@@ -736,7 +737,13 @@ require allow_dangerous=true",
                         .submit_jobs(&work_for_task, Some(sink.as_ref()))
                         .await
                 })
-                .await;
+                .await?;
+            // The receipt path returns the same kind of payload as a direct call, so it
+            // gets the same budget: a many-target submission must not bypass staging.
+            if let Some(map) = value.as_object_mut() {
+                map.insert("request_id".into(), Value::from(request_id.clone()));
+            }
+            return self.stage_operation_result(&operation_for_task, value);
         }
         let _ = &mut payload;
         let value = self.dispatch_operation(&operation, payload).await?;
@@ -840,7 +847,7 @@ require allow_dangerous=true",
                         row
                     })
                     .collect();
-                for mut row in self.runner.sessions() {
+                for mut row in self.runner.sessions().await {
                     if let Some(map) = row.as_object_mut() {
                         map.insert("kind".into(), Value::from("shell"));
                     }
@@ -997,43 +1004,36 @@ require allow_dangerous=true",
         let hosts = self.resolve_many(&targets).await?;
         let mut rows: Vec<Value> = Vec::new();
         let mut all_launched = true;
+        let mut any_unknown = false;
         for host in hosts {
-            let (handle, outcome) = self.jobs.submit(&host, &command, progress).await;
-            let mut row = Map::new();
-            row.insert(
-                "host".into(),
-                Value::from(
-                    handle
-                        .as_ref()
-                        .map(|handle| handle.host.clone())
-                        .unwrap_or_else(|| host.name.clone()),
-                ),
-            );
-            row.insert(
-                "job_id".into(),
-                handle
-                    .as_ref()
-                    .map(|handle| Value::from(handle.job_id.clone()))
-                    .unwrap_or(Value::Null),
-            );
-            let launched = handle.is_some();
-            row.insert("launched".into(), Value::Bool(launched));
-            row.insert(
-                "stderr".into(),
-                Value::from(if launched {
-                    String::new()
-                } else {
-                    outcome.stderr.trim().chars().take(400).collect::<String>()
-                }),
-            );
-            if let Some(handle) = &handle {
-                row.insert("session".into(), Value::from(handle.session.clone()));
-                row.insert("launcher".into(), Value::from(handle.launcher.clone()));
-            }
-            all_launched &= launched;
-            rows.push(Value::Object(row));
+            let (handle, outcome) = match self.jobs.submit(&host, &command, progress).await {
+                Ok(submitted) => submitted,
+                Err(error) => {
+                    // The receipt could not be persisted, so nothing was transmitted.
+                    rows.push(json!({
+                        "host": host.name,
+                        "job_id": Value::Null,
+                        "launch_state": "rejected",
+                        "launched": false,
+                        "execution_state": "not_started",
+                        "completion_unknown": false,
+                        "error": error.message(),
+                    }));
+                    all_launched = false;
+                    continue;
+                }
+            };
+            all_launched &= handle.state == crate::jobs::LaunchState::Acknowledged;
+            any_unknown |= handle.state == crate::jobs::LaunchState::Unknown;
+            rows.push(job_row(&handle, &outcome));
         }
-        Ok(json!({"ok": all_launched, "jobs": rows}))
+        let mut value = json!({"ok": all_launched, "jobs": rows});
+        if let Some(map) = value.as_object_mut() {
+            if any_unknown {
+                map.insert("completion_unknown".into(), Value::Bool(true));
+            }
+        }
+        Ok(value)
     }
 
     async fn legacy_exec(&self, arguments: Map<String, Value>) -> BridgeResult<Value> {
@@ -1312,6 +1312,43 @@ pub fn string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One job row: the id is always reported, `launched` only when the launcher said so.
+fn job_row(handle: &crate::jobs::JobHandle, outcome: &crate::execution::ExecOutcome) -> Value {
+    let acknowledged = handle.state == crate::jobs::LaunchState::Acknowledged;
+    let mut row = Map::new();
+    row.insert("host".into(), Value::from(handle.host.clone()));
+    // The id stays visible for every outcome: it is how a lost reply is reconciled.
+    row.insert("job_id".into(), Value::from(handle.job_id.clone()));
+    row.insert("session".into(), Value::from(handle.session.clone()));
+    row.insert("launcher".into(), Value::from(handle.launcher.clone()));
+    row.insert("launch_state".into(), Value::from(handle.state.as_str()));
+    row.insert("launched".into(), Value::Bool(acknowledged));
+    row.insert("result_id".into(), Value::from(outcome.result_id.clone()));
+    if !acknowledged {
+        // Keep the reason: the launcher's own message is the useful part.
+        row.insert(
+            "stderr".into(),
+            Value::from(outcome.stderr.trim().chars().take(400).collect::<String>()),
+        );
+        row.insert(
+            "execution_state".into(),
+            outcome
+                .meta
+                .get("execution_state")
+                .cloned()
+                .unwrap_or(Value::from("unknown")),
+        );
+        row.insert(
+            "completion_unknown".into(),
+            Value::Bool(handle.state == crate::jobs::LaunchState::Unknown),
+        );
+    }
+    for (key, value) in queue_rejection(&outcome.meta) {
+        row.insert(key, value);
+    }
+    Value::Object(row)
+}
+
 /// Save an oversized operation payload and return a bounded summary of it.
 pub fn stage_if_large(
     store: &crate::storage::results::ResultStore,
@@ -1338,13 +1375,24 @@ pub fn stage_if_large(
     summary.insert("result_id".into(), Value::from(result_id.clone()));
     summary.insert("bytes".into(), json!(text.len()));
     // Business-level shape the caller usually needs, without the bulk.
+    // Short state fields stay on top: a staged reply must still tell the caller whether
+    // the work finished and how to continue.
     for key in [
+        "request_id",
+        "request_state",
+        "execution_state",
+        "completion_unknown",
+        "duplicate",
+        "execution_replayed",
+        "failure_stage",
         "host",
+        "job_id",
+        "launch_state",
+        "launched",
         "count",
         "matched",
         "returned",
         "next_offset",
-        "jobs",
         "status",
     ] {
         if let Some(item) = value.get(key) {
@@ -1431,6 +1479,82 @@ pub fn dangerous_flag_description() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A staged summary must not swallow the fields that say whether the work finished.
+    #[test]
+    fn staged_summary_keeps_the_short_state_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::storage::results::ResultStore::new(
+            directory.path().to_path_buf(),
+            3600.0,
+            3600.0,
+        )
+        .unwrap();
+        let rows: Vec<Value> = (0..500)
+            .map(|index| json!({"host": format!("h{index}"), "pad": "x".repeat(40)}))
+            .collect();
+        let value = json!({
+            "ok": false,
+            "request_id": "req-1",
+            "request_state": "interrupted",
+            "completion_unknown": true,
+            "jobs": rows,
+        });
+        let out = stage_if_large(&store, "jms_submit_job", value).unwrap();
+        assert_eq!(out["staged"], true);
+        assert_eq!(out["request_id"], "req-1");
+        assert_eq!(out["request_state"], "interrupted");
+        assert_eq!(out["completion_unknown"], true);
+        assert!(out["note"].as_str().unwrap().contains("read_result"));
+        assert!(out.to_string().len() < 4096);
+    }
+
+    /// The full chain: a launcher that refused must never look like a running job.
+    #[test]
+    fn job_rows_distinguish_acknowledged_rejected_and_unknown() {
+        let handle = |state| crate::jobs::JobHandle {
+            job_id: "abcd1234".into(),
+            host: "asset-1".into(),
+            session: "jms-abcd1234".into(),
+            launcher: "unknown".into(),
+            state,
+        };
+        let outcome = |executed: bool| crate::execution::ExecOutcome {
+            host: "asset-1".into(),
+            exit_code: 3,
+            stdout: String::new(),
+            stderr: "no tmux and no setsid\n".into(),
+            timed_out: false,
+            result_id: "r1".into(),
+            preview: None,
+            rejection: Map::new(),
+            recovery: Map::new(),
+            meta: json!({"executed": executed, "execution_state": "completed"})
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        };
+
+        let acknowledged = job_row(
+            &handle(crate::jobs::LaunchState::Acknowledged),
+            &outcome(true),
+        );
+        assert_eq!(acknowledged["launched"], true);
+        assert_eq!(acknowledged["launch_state"], "acknowledged");
+        assert!(acknowledged.get("stderr").is_none());
+
+        let rejected = job_row(&handle(crate::jobs::LaunchState::Rejected), &outcome(true));
+        assert_eq!(rejected["launched"], false);
+        assert_eq!(rejected["launch_state"], "rejected");
+        assert_eq!(rejected["job_id"], "abcd1234");
+        assert_eq!(rejected["result_id"], "r1");
+        assert!(rejected["stderr"].as_str().unwrap().contains("no tmux"));
+
+        let unknown = job_row(&handle(crate::jobs::LaunchState::Unknown), &outcome(true));
+        assert_eq!(unknown["launched"], false);
+        assert_eq!(unknown["launch_state"], "unknown");
+        assert_eq!(unknown["completion_unknown"], true);
+    }
 
     #[test]
     fn small_operation_payloads_are_returned_as_is() {

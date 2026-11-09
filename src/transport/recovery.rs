@@ -113,7 +113,7 @@ impl ConnectionRecovery {
     }
 
     pub fn notify(&self, key: &str) {
-        let _ = self.with_state(key, |_| ());
+        self.with_state(key, |_| ());
         self.changed.notify_waiters();
     }
 
@@ -126,9 +126,25 @@ impl ConnectionRecovery {
     pub async fn enter(self: &Arc<Self>, key: &str, timeout: f64) -> BridgeResult<Lease<'_>> {
         let deadline = Instant::now() + Duration::from_secs_f64(timeout.max(0.0));
         loop {
-            let phase = self.with_state(key, |state| state.phase);
-            if phase == Phase::Idle {
-                break;
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(BridgeError::invalid("SSH runner is closing"));
+            }
+            // One lock for "is this target idle?" and "reserve it": a replacement that
+            // starts draining can no longer be overtaken by a new operation.
+            let admitted = self.with_state(key, |state| {
+                if state.phase == Phase::Idle {
+                    state.active += 1;
+                    true
+                } else {
+                    false
+                }
+            });
+            if admitted {
+                return Ok(Lease {
+                    recovery: self,
+                    key: key.to_string(),
+                    released: false,
+                });
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -141,15 +157,6 @@ impl ConnectionRecovery {
             }
             let _ = tokio::time::timeout(remaining, self.changed.notified()).await;
         }
-        if self.closing.load(Ordering::SeqCst) {
-            return Err(BridgeError::invalid("SSH runner is closing"));
-        }
-        self.with_state(key, |state| state.active += 1);
-        Ok(Lease {
-            recovery: self,
-            key: key.to_string(),
-            released: false,
-        })
     }
 
     /// Ask for a replacement connection, coalescing with other callers.
@@ -343,6 +350,54 @@ impl ConnectionRecovery {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    /// A running operation keeps its lease across the remote exchange, so a recovery
+    /// requested by *another* channel on the same connection must wait for it.
+    #[tokio::test]
+    async fn a_replacement_waits_until_the_active_operation_finishes() {
+        use std::sync::atomic::AtomicU64;
+        let recovery = ConnectionRecovery::new(0.0);
+        recovery.set_generation("k", 1);
+        let lease = recovery.enter("k", 1.0).await.unwrap();
+
+        let replaced = Arc::new(AtomicU64::new(0));
+        let counter = replaced.clone();
+        let spawned = recovery
+            .request(
+                "k",
+                1,
+                Box::new(move || {
+                    let counter = counter.clone();
+                    Box::pin(async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+                Arc::new(|| false),
+                false,
+                2.0,
+            )
+            .await;
+        // `request` returns once the replacement task is scheduled.
+        assert!(
+            spawned.get("status").is_some(),
+            "unexpected request answer: {spawned}"
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            replaced.load(Ordering::SeqCst),
+            0,
+            "replacement ran while a lease was still held"
+        );
+
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            replaced.load(Ordering::SeqCst),
+            1,
+            "replacement did not run after the lease was released"
+        );
+    }
 
     #[tokio::test]
     async fn leases_block_then_release() {

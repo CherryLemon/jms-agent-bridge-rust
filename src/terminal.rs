@@ -108,6 +108,34 @@ impl StreamSource {
             }
         }
     }
+
+    /// Await the next chunk, or report closure immediately for a closed stream.
+    ///
+    /// A closed receiver returns `Ready(None)` straight away, so polling it again would
+    /// spin: every wait site must ask this first and stop watching closed streams.
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+/// Wait for one chunk from whichever stream is still open.
+///
+/// Returns `false` only when *every* stream is closed; callers keep their own view of
+/// which stream ended so a single closed stream is not mistaken for a dead shell.
+async fn wait_any_chunk(out: &mut StreamSource, err: &mut StreamSource) -> bool {
+    if out.is_closed() && err.is_closed() {
+        return false;
+    }
+    if out.is_closed() {
+        return err.fill().await;
+    }
+    if err.is_closed() {
+        return out.fill().await;
+    }
+    tokio::select! {
+        alive = out.fill() => alive,
+        alive = err.fill() => alive,
+    }
 }
 
 struct Streams {
@@ -188,18 +216,13 @@ impl TerminalShell {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             let Streams { out, err } = &mut *streams;
-            let filled = tokio::time::timeout(remaining, async {
-                tokio::select! {
-                    _ = out.fill() => true,
-                    _ = err.fill() => true,
-                }
-            })
-            .await
-            .map_err(|_| {
-                BridgeError::ssh(
-                    "remote shell did not acknowledge readiness in time; script was not sent",
-                )
-            })?;
+            let filled = tokio::time::timeout(remaining, wait_any_chunk(out, err))
+                .await
+                .map_err(|_| {
+                    BridgeError::ssh(
+                        "remote shell did not acknowledge readiness in time; script was not sent",
+                    )
+                })?;
             if !filled {
                 self.lost.store(true, Ordering::SeqCst);
                 return Err(BridgeError::ssh(
@@ -314,20 +337,28 @@ impl TerminalShell {
                     "terminal command timed out; completion is unknown",
                 ));
             }
+            // A stream that ended without its end marker makes completion impossible:
+            // waiting for the other one would keep this command "running" until the
+            // multi-hour deadline for no reason.
+            if completion_impossible(
+                streams.out.is_closed(),
+                out_state.end_marker.is_some(),
+                streams.err.is_closed(),
+                err_state.end_marker.is_some(),
+            ) {
+                self.lost.store(true, Ordering::SeqCst);
+                return Err(BridgeError::ssh(
+                    "terminal stream closed before the completion marker; completion is unknown",
+                ));
+            }
             let Streams { out, err } = &mut *streams;
-            let filled = tokio::time::timeout(remaining, async {
-                tokio::select! {
-                    _ = out.fill() => true,
-                    _ = err.fill() => true,
-                }
-            })
-            .await;
+            let filled = tokio::time::timeout(remaining, wait_any_chunk(out, err)).await;
             match filled {
                 Ok(true) => continue,
                 Ok(false) => {
                     self.lost.store(true, Ordering::SeqCst);
                     return Err(BridgeError::ssh(
-                        "terminal shell closed before completion marker",
+                        "terminal shell closed before the completion marker; completion is unknown",
                     ));
                 }
                 Err(_) => {
@@ -356,11 +387,35 @@ completion is unknown"
     }
 }
 
+/// What a closed terminal records for its current command.
+///
+/// `None` means "leave the stored result alone": a command that already reached a
+/// terminal state keeps it.
+fn close_final_state(state: CmdState) -> Option<(&'static str, bool, bool, &'static str)> {
+    match state {
+        // Never transmitted: nothing ran, and saying so is exact.
+        CmdState::Queued => Some(("not_started", false, false, "not_started")),
+        // Aborted in flight: the bytes may have reached the remote side.
+        CmdState::Running => Some(("unknown", true, true, "closed_by_caller")),
+        CmdState::NotStarted | CmdState::Completed | CmdState::Unknown => None,
+    }
+}
+
+/// Whether the completion markers can no longer both arrive.
+///
+/// Completion needs an end marker on *both* streams, so a stream that closed without
+/// one ends the command as unknown instead of letting it look "running" forever.
+fn completion_impossible(out_closed: bool, out_end: bool, err_closed: bool, err_end: bool) -> bool {
+    (out_closed && !out_end) || (err_closed && !err_end)
+}
+
 #[derive(Default)]
 struct CaptureState {
     active: bool,
     started: bool,
     done: bool,
+    /// The end marker was seen on this stream (carrying the exit code).
+    end_marker: Option<i32>,
 }
 
 /// One stream's marker scan, mirroring the isolated execution's buffer rules.
@@ -418,6 +473,7 @@ fn capture_stream(
             buffer.clear();
             buffer.extend_from_slice(&rest);
             state.done = true;
+            state.end_marker = Some(code);
             Ok(Some(code))
         }
         None => {
@@ -434,6 +490,9 @@ struct Binding {
     shell: Arc<TerminalShell>,
     command: Option<Arc<AsyncMutex<Command>>>,
     closed: bool,
+    /// Keeps the connection from being replaced while this terminal is open, so an
+    /// idle shell does not lose its cwd/environment to another target's reconnect.
+    _protection: crate::execution::TerminalProtection,
 }
 
 pub struct Interactive {
@@ -627,10 +686,19 @@ impl Interactive {
                 SlotWait::Full(full) => BridgeError::invalid(full.message()),
                 SlotWait::Timeout(timeout) => BridgeError::invalid(timeout.message()),
             })?;
+        // Register the protection before the shell exists: the connection must not be
+        // replaced between opening the channel and the binding becoming visible.
+        let protection = self.runner.protect_terminal(&key);
         let shell = TerminalShell::open(&self.runner, &host, &command).await;
         drop(slot);
         drop(lease);
-        let shell = shell?;
+        let shell = match shell {
+            Ok(shell) => shell,
+            Err(error) => {
+                drop(protection);
+                return Err(error);
+            }
+        };
         let mut session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         {
             let bindings = self.bindings.lock().await;
@@ -645,6 +713,7 @@ impl Interactive {
             shell: Arc::new(shell),
             command: None,
             closed: false,
+            _protection: protection,
         }));
         self.bindings
             .lock()
@@ -731,10 +800,12 @@ impl Interactive {
             binding_guard.command = Some(command.clone());
         }
         if let Some(progress) = self.progress(session) {
+            // The command is sent right after this point; without the mapping a crash
+            // would leave a result nobody can address.
             progress.record(
                 "execution_results",
                 json!({"host": host.name, "result_id": result_id}),
-            );
+            )?;
         }
         self.save().await?;
         // The worker owns the shell for the duration of the command; the caller only
@@ -980,16 +1051,29 @@ impl Interactive {
                     task.abort();
                 }
             }
-            if guard.state == CmdState::Queued {
-                guard.state = CmdState::NotStarted;
+            // Closing is an explicit state transition: a queued command never ran, a
+            // running one has no completion evidence, and a finished one keeps its
+            // verdict. Without this the saved result would stay `running` forever.
+            let final_state = close_final_state(guard.state);
+            if let Some((state, executed, unknown, failure_stage)) = final_state {
+                guard.state = if state == "not_started" {
+                    CmdState::NotStarted
+                } else {
+                    CmdState::Unknown
+                };
                 let result_id = guard.result_id.clone();
                 drop(guard);
                 let mut values = Map::new();
                 values.insert("ok".into(), Value::Bool(false));
-                values.insert("executed".into(), Value::Bool(false));
-                values.insert("execution_state".into(), Value::from("not_started"));
-                values.insert("completion_unknown".into(), Value::Bool(false));
-                let _ = self.store.finish(&result_id, values);
+                values.insert("executed".into(), Value::Bool(executed));
+                values.insert("execution_state".into(), Value::from(state));
+                values.insert("completion_unknown".into(), Value::Bool(unknown));
+                values.insert("failure_stage".into(), Value::from(failure_stage));
+                values.insert(
+                    "error".into(),
+                    Value::from("terminal closed by the caller before the command finished"),
+                );
+                self.store.finish(&result_id, values)?;
             }
         }
         shell.close().await;
@@ -1208,6 +1292,79 @@ pub fn command_rejection(meta: &Map<String, Value>) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_stream_without_its_marker_ends_the_command() {
+        // START then Close: neither stream ever produced an end marker.
+        assert!(completion_impossible(true, false, true, false));
+        // One END then Close: the other stream will never report.
+        assert!(completion_impossible(true, true, true, false));
+        // A stream that ended *with* its marker is not the problem: keep waiting for
+        // the stream that is still open.
+        assert!(!completion_impossible(false, false, true, true));
+        assert!(!completion_impossible(true, true, false, false));
+        // Both markers arrived: completion is decided by the codes, not by closure.
+        assert!(!completion_impossible(true, true, true, true));
+        // Still open on both sides: keep waiting.
+        assert!(!completion_impossible(false, false, false, false));
+    }
+
+    #[tokio::test]
+    async fn waiting_on_closed_streams_returns_immediately() {
+        let (out_tx, out_rx) = mpsc::channel(4);
+        let (err_tx, err_rx) = mpsc::channel(4);
+        let mut out = StreamSource {
+            receiver: out_rx,
+            buffer: Vec::new(),
+            closed: false,
+        };
+        let mut err = StreamSource {
+            receiver: err_rx,
+            buffer: Vec::new(),
+            closed: false,
+        };
+        out_tx.send(Bytes::from_static(b"hello")).await.unwrap();
+        drop(out_tx);
+        drop(err_tx);
+        // No call may hang or spin: every wait returns, and the buffered chunk is
+        // delivered exactly once before both streams report closed.
+        let mut rounds = 0;
+        loop {
+            let alive =
+                tokio::time::timeout(Duration::from_secs(1), wait_any_chunk(&mut out, &mut err))
+                    .await
+                    .expect("a wait on closed streams must not block");
+            rounds += 1;
+            if !alive && out.is_closed() && err.is_closed() {
+                break;
+            }
+            assert!(
+                rounds < 6,
+                "waits must terminate once both streams are closed"
+            );
+        }
+        assert_eq!(out.buffer, b"hello");
+        // With both flags set the function returns without touching a receiver at all.
+        assert!(!wait_any_chunk(&mut out, &mut err).await);
+    }
+
+    #[test]
+    fn closing_a_terminal_records_the_right_command_state() {
+        // A queued command never left the machine.
+        assert_eq!(
+            close_final_state(CmdState::Queued),
+            Some(("not_started", false, false, "not_started"))
+        );
+        // A running command was already sent, so its completion is unknown.
+        assert_eq!(
+            close_final_state(CmdState::Running),
+            Some(("unknown", true, true, "closed_by_caller"))
+        );
+        // Finished work keeps its verdict.
+        assert_eq!(close_final_state(CmdState::Completed), None);
+        assert_eq!(close_final_state(CmdState::Unknown), None);
+        assert_eq!(close_final_state(CmdState::NotStarted), None);
+    }
 
     #[test]
     fn completion_needs_both_streams_and_matching_statuses() {

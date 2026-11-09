@@ -18,13 +18,19 @@ use crate::storage::results::{atomic_json, now, sync_directory};
 
 /// Receives durable progress for one accepted request.
 pub trait ProgressSink: Send + Sync {
-    fn record(&self, field: &str, value: Value);
+    /// Persist one progress field.
+    ///
+    /// Callers that must not start remote work without a durable trail treat an error
+    /// as fatal; best-effort bookkeeping can ignore it.
+    fn record(&self, field: &str, value: Value) -> BridgeResult<()>;
 }
 
 pub struct NullProgress;
 
 impl ProgressSink for NullProgress {
-    fn record(&self, _field: &str, _value: Value) {}
+    fn record(&self, _field: &str, _value: Value) -> BridgeResult<()> {
+        Ok(())
+    }
 }
 
 pub struct RequestProgress {
@@ -39,10 +45,8 @@ impl RequestProgress {
 }
 
 impl ProgressSink for RequestProgress {
-    fn record(&self, field: &str, value: Value) {
-        if let Err(error) = self.journal.progress(&self.request_id, field, value) {
-            tracing::warn!(%error, field, "request progress could not be persisted");
-        }
+    fn record(&self, field: &str, value: Value) -> BridgeResult<()> {
+        self.journal.progress(&self.request_id, field, value)
     }
 }
 
@@ -467,7 +471,7 @@ mod tests {
         let arguments = serde_json::json!({"x": 1});
         let status = journal
             .execute("r3", "run", &arguments, |progress| async move {
-                progress.record(
+                let _ = progress.record(
                     "execution_results",
                     serde_json::json!({"host": "h1", "result_id": "a".repeat(32)}),
                 );

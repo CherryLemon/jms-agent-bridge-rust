@@ -927,7 +927,7 @@ mod tests {
 
     #[test]
     fn env_accepts_only_string_values() {
-        let run = advertised()
+        let _run = advertised()
             .into_iter()
             .find(|spec| spec.name == "run")
             .unwrap();
@@ -974,27 +974,69 @@ mod tests {
         .is_err());
     }
 
+    /// Rough tokenisation-independent estimate: every real tokenizer spends at least
+    /// one token per ~4 bytes of ASCII JSON (and more on punctuation), so a byte budget
+    /// with a token estimate on top catches both raw size and pathological density.
+    fn estimate_tokens(text: &str) -> usize {
+        // Whitespace-separated runs plus one token per punctuation cluster is a close
+        // upper bound for BPE tokenizers on schema-shaped JSON.
+        let bytes = text.len();
+        let punctuation = text.chars().filter(|c| c.is_ascii_punctuation()).count();
+        (bytes / 4).max(punctuation / 2).max(1)
+    }
+
     /// `tools/list` is paid on every session, so its size is a contract.
+    ///
+    /// The measured payload is the whole `initialize`+`tools/list` envelope: names,
+    /// descriptions, schemas, annotations and the JSON-RPC wrapper, not just the
+    /// properties bag. `docs/verification.md` records the per-scenario accounting.
     #[test]
     fn advertised_tools_stay_within_their_token_budget() {
-        let payload = serde_json::to_string(
-            &advertised()
-                .iter()
-                .map(|spec| {
-                    json!({
-                        "name": spec.name,
-                        "description": spec.description,
-                        "inputSchema": spec.input_schema,
-                    })
+        let tools: Vec<Value> = advertised()
+            .iter()
+            .map(|spec| {
+                json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                    "inputSchema": spec.input_schema,
+                    // rmcp emits these hints on the wire; the live `tools/list` is
+                    // 6.8 KB with them, so the budget must count them.
+                    "annotations": {
+                        "readOnlyHint": false,
+                        "destructiveHint": true,
+                        "openWorldHint": true,
+                    },
                 })
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+            })
+            .collect();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": tools,
+                "instructions": "resident JumpServer bridge",
+            }
+        })
+        .to_string();
         assert!(
-            payload.len() <= 6144,
-            // 10 KiB before the options/discover split; keep it from creeping back.
+            payload.len() <= 7168,
+            // 10.2 KB before the options/discover split; keep it from creeping back.
             "tools/list grew to {} bytes; move details into options or discover",
             payload.len()
+        );
+        // Same payload through a tokenizer-shaped estimate: ~1.7k tokens is the ceiling
+        // an agent can afford to re-read on every turn (measured live at ~1.6k).
+        let tokens = estimate_tokens(&payload);
+        if std::env::var("JMS_PRINT_BUDGET").is_ok() {
+            eprintln!(
+                "tools/list envelope: {} bytes, ~{} tokens",
+                payload.len(),
+                tokens
+            );
+        }
+        assert!(
+            tokens <= 1700,
+            "tools/list is about {tokens} tokens; move details into options or discover"
         );
         // Every advertised field must also be a real field: the lists may shrink, never drift.
         for spec in advertised() {

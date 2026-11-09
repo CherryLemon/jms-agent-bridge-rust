@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.3.2
+
+Lifecycle and state-transition pass. Every item below changes what the caller can
+observe, and each has a regression test.
+
+### Jobs
+* A tracked `job_id` no longer implies a started job: the response carries
+  `launch_state` (`acknowledged`/`rejected`/`unknown`), `launched` is true only for
+  an acknowledgement, and rejected/unknown rows keep `stderr`, `result_id`,
+  `execution_state` and `completion_unknown` so a failure cannot look like success.
+
+### Connections
+* The recovery lease now covers the whole remote exchange (submit, prime, capture,
+  rsync transfer) instead of being dropped before the first byte, and an idle
+  interactive terminal registers as a protection. A startup failure on a new
+  channel can no longer replace a connection that other work still uses.
+* Admission and the active counter are taken under one lock, so no new operation
+  can enter once a replacement starts draining.
+
+### Queue
+* The execution slot travels through the grant channel as an RAII permit: a grant
+  that is delivered but never claimed (cancelled task, dropped future) returns its
+  capacity when the message is dropped.
+
+### Terminal
+* A closed output stream without its completion marker now ends the command as
+  `unknown` immediately instead of polling a dead receiver until the deadline;
+  `prime()` uses the same rule.
+* Closing a terminal with a running command records the transition (`unknown`,
+  `completion_unknown: true`, `failure_stage: closed_by_caller`) before the binding
+  disappears; a queued command records `not_started`; finished work keeps its verdict.
+
+### Persistence
+* `ProgressSink::record` returns `BridgeResult<()>`; the writes that must exist
+  before remote work (result-id association, prepared job receipt) are now fatal,
+  so a failed persistence stops the operation instead of sending it untracked.
+* The transfer result id is announced before `rsync` starts, not after it returns.
+
+### Output contract
+* `call` responses with `request_id` go through the same 8 KiB staging as direct
+  calls; a staged summary always keeps `request_id`, `request_state`,
+  `execution_state`, `completion_unknown`, `duplicate` and `execution_replayed`.
+* The `fs` compact view no longer strips `staged`/`result_id`/`preview`/`note`.
+
+### Other
+* `session_list` reports the real state of each named shell instead of a hardcoded
+  `lost: true`.
+* Per-shell locking: the shells map is only held for lookup/insert, so two targets
+  no longer serialize their whole sessions.
+* The `tools/list` budget test measures the full envelope (annotations included):
+  6478 bytes, ~1.6k tokens, from 10.2 KB before the options/discover split.
+* Removed a leftover debug test that wrote into `/root`.
+
 ## 0.3.1
 
 Correctness pass after an external review of `0.3.0`: the item below changes

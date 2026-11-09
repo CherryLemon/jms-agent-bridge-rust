@@ -145,6 +145,42 @@ impl Attempt {
     }
 }
 
+/// Whether a live shell or terminal still depends on this connection.
+fn connection_protected(
+    shells: &Arc<AsyncMutex<HashMap<(String, String), Arc<AsyncMutex<ShellSession>>>>>,
+    terminals: &Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    key: &str,
+) -> bool {
+    let shell_live = match shells.try_lock() {
+        Ok(shells) => shells.keys().any(|(shell_key, _)| shell_key == key),
+        // Busy means an operation is using the map right now: assume it is live.
+        Err(_) => true,
+    };
+    if shell_live {
+        return true;
+    }
+    let protections = terminals.lock().expect("terminal protection lock");
+    protections.get(key).copied().unwrap_or(0) > 0
+}
+
+/// Keeps an interactive terminal counted as a protection until it is dropped.
+pub struct TerminalProtection {
+    registry: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    key: String,
+}
+
+impl Drop for TerminalProtection {
+    fn drop(&mut self) {
+        let mut protections = self.registry.lock().expect("terminal protection lock");
+        if let Some(count) = protections.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                protections.remove(&self.key);
+            }
+        }
+    }
+}
+
 pub struct Runner {
     pub cfg: Arc<BastionConfig>,
     pub settings: Arc<BridgeSettings>,
@@ -154,7 +190,11 @@ pub struct Runner {
     pub scheduler: Arc<ExecutionSlots>,
     pub queue_timeout: f64,
     pub rsync_binary: crate::transport::rsync::RsyncBinary,
-    shells: Arc<AsyncMutex<HashMap<(String, String), ShellSession>>>,
+    /// One slot per named shell. The map lock is only held for lookup/insert; each shell
+    /// has its own lock so two targets never block on each other.
+    shells: Arc<AsyncMutex<HashMap<(String, String), Arc<AsyncMutex<ShellSession>>>>>,
+    /// Live interactive terminals per connection key: they keep the connection alive.
+    terminal_protections: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     session_gates: Mutex<HashMap<(String, String), Arc<AsyncMutex<()>>>>,
     known_sessions: Mutex<HashSet<(String, String)>>,
     registry: std::path::PathBuf,
@@ -209,6 +249,7 @@ impl Runner {
             queue_timeout,
             rsync_binary: crate::transport::rsync::RsyncBinary::default(),
             shells: Arc::new(AsyncMutex::new(HashMap::new())),
+            terminal_protections: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_gates: Mutex::new(HashMap::new()),
             known_sessions: Mutex::new(known),
             registry,
@@ -282,15 +323,52 @@ impl Runner {
         status
     }
 
-    pub fn sessions(&self) -> Vec<Value> {
+    /// Register one interactive terminal as a reason not to replace this connection.
+    pub fn protect_terminal(&self, key: &str) -> TerminalProtection {
+        {
+            let mut protections = self
+                .terminal_protections
+                .lock()
+                .expect("terminal protection lock");
+            *protections.entry(key.to_string()).or_insert(0) += 1;
+        }
+        TerminalProtection {
+            registry: self.terminal_protections.clone(),
+            key: key.to_string(),
+        }
+    }
+
+    /// Every registered named shell with its *live* state.
+    ///
+    /// A registry entry only says the id was used before; whether the shell is still
+    /// there is decided by the live map, so `lost` is not assumed.
+    pub async fn sessions(&self) -> Vec<Value> {
         let known = self.known_sessions.lock().expect("session lock").clone();
-        let mut rows: Vec<Value> = known
-            .iter()
-            .map(|(target, session_id)| {
-                let asset_id = target.split('\u{1f}').last().unwrap_or("");
-                json!({"asset_id": asset_id, "session_id": session_id, "lost": true})
-            })
-            .collect();
+        let live: Vec<((String, String), Arc<AsyncMutex<ShellSession>>)> = {
+            let shells = self.shells.lock().await;
+            shells
+                .iter()
+                .map(|(key, slot)| (key.clone(), slot.clone()))
+                .collect()
+        };
+        let mut rows: Vec<Value> = Vec::new();
+        for (target, session_id) in known.iter() {
+            let asset_id = target.split('\u{1f}').last().unwrap_or("").to_string();
+            let mut state = "lost";
+            for ((key, live_session), slot) in &live {
+                if key != target || live_session != session_id {
+                    continue;
+                }
+                let shell = slot.lock().await;
+                state = if shell.is_closing() { "lost" } else { "active" };
+            }
+            rows.push(json!({
+                "asset_id": asset_id,
+                "session_id": session_id,
+                "state": state,
+                "lost": state == "lost",
+            }));
+        }
         rows.sort_by_key(|row| row.to_string());
         rows
     }
@@ -381,17 +459,13 @@ impl Runner {
             let key = host.connection_key()?;
             let pool = self.pool.clone();
             let host_for_replace = host.clone();
-            // A connection that still carries named shells must not be replaced
-            // underneath them: those sessions would be lost without a trace.
+            // A connection that still carries named shells or interactive terminals must
+            // not be replaced underneath them: those sessions would be lost silently.
             let shells = self.shells.clone();
+            let terminals = self.terminal_protections.clone();
             let protect_key = key.clone();
             let protected = std::sync::Arc::new(move || {
-                match shells.try_lock() {
-                    Ok(map) => map.keys().any(|(shell_key, _)| shell_key == &protect_key),
-                    // Busy means an operation is using the map right now: assume the
-                    // shells are live rather than tearing the connection down.
-                    Err(_) => true,
-                }
+                connection_protected(&shells, &terminals, &protect_key)
             });
             let recovery = self
                 .recovery
@@ -469,10 +543,12 @@ impl Runner {
         metadata.insert("lane".into(), Value::from(spec.lane.as_str()));
         let result_id = self.store.create(metadata)?;
         if let Some(progress) = progress {
+            // Nothing may be transmitted until the caller can find this result after a
+            // crash: a rejected write stops the run instead of losing the trail.
             progress.record(
                 "execution_results",
                 json!({"host": host.name, "result_id": result_id}),
-            );
+            )?;
         }
         let out_path = self.store.path(&result_id, "stdout")?;
         let err_path = self.store.path(&result_id, "stderr")?;
@@ -569,9 +645,15 @@ impl Runner {
             spec.session_id.clone().unwrap_or_default(),
         );
         let session_state = if spec.session_id.is_some() {
-            let shells = self.shells.lock().await;
-            match shells.get(&session_key) {
-                Some(shell) => Some(if shell.is_closing() { "lost" } else { "active" }),
+            let entry = {
+                let shells = self.shells.lock().await;
+                shells.get(&session_key).cloned()
+            };
+            match entry {
+                Some(shell) => {
+                    let shell = shell.lock().await;
+                    Some(if shell.is_closing() { "lost" } else { "active" })
+                }
                 None => Some(
                     if self
                         .known_sessions
@@ -800,7 +882,9 @@ impl Runner {
                 }
             }
         };
-        drop(lease);
+        // The lease stays held across the whole remote exchange: a replacement triggered
+        // by another channel on this connection must wait until this one is finished.
+        let _lease = lease;
         let deadline = Duration::from_secs_f64(timeout);
         let mut attempt = if let Some(session_id) = &spec.session_id {
             self.run_on_session(
@@ -980,11 +1064,19 @@ printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
         let session_key = (key.to_string(), session_id.to_string());
         if spec.internal_session {
             // A private worker whose shell died is replaced silently; user sessions are not.
-            let mut shells = self.shells.lock().await;
-            if let Some(shell) = shells.get(&session_key) {
-                if shell.is_closing() {
-                    shells.remove(&session_key);
+            let stale = {
+                let shells = self.shells.lock().await;
+                match shells.get(&session_key).cloned() {
+                    Some(shell) => {
+                        let guard = shell.lock().await;
+                        guard.is_closing()
+                    }
+                    None => false,
                 }
+            };
+            if stale {
+                let mut shells = self.shells.lock().await;
+                shells.remove(&session_key);
             }
         }
         // A session that was already registered but has no live shell lost its state
@@ -995,42 +1087,56 @@ printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
             .lock()
             .expect("session lock")
             .contains(&session_key);
-        let mut shells = self.shells.lock().await;
-        let missing = !shells.contains_key(&session_key);
-        if missing {
-            if !spec.internal_session && resumed {
-                return Attempt::not_started(
+        // Look the shell up under the map lock, then work with its own lock: opening and
+        // priming a shell must never block other targets' sessions.
+        let existing = {
+            let shells = self.shells.lock().await;
+            shells.get(&session_key).cloned()
+        };
+        let shell_slot = match existing {
+            Some(shell) => shell,
+            None => {
+                if !spec.internal_session && resumed {
+                    return Attempt::not_started(
                     Some(
                         "session state was lost after service restart; use a new session_id or call session_close to reset it"
                             .to_string(),
                     ),
                     "session",
                 );
-            }
-            let channel_started = Instant::now();
-            let (shell, _reconnected) = match self.pool.open_process(host, command).await {
-                Ok(value) => value,
-                Err(error) => {
-                    timings.channel_seconds += channel_started.elapsed().as_secs_f64();
-                    return Attempt::not_started(Some(error.message()), "channel");
                 }
-            };
-            let mut session_shell = ShellSession::new(shell);
-            session_shell.launch = Some(command.to_string());
-            shells.insert(session_key.clone(), session_shell);
-            if !spec.internal_session {
-                self.known_sessions
-                    .lock()
-                    .expect("session lock")
-                    .insert(session_key.clone());
-                if let Err(error) = self.save_sessions() {
-                    shells.remove(&session_key);
-                    return Attempt::not_started(Some(error.message()), "session_registry");
+                let channel_started = Instant::now();
+                let (shell, _reconnected) = match self.pool.open_process(host, command).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        timings.channel_seconds += channel_started.elapsed().as_secs_f64();
+                        return Attempt::not_started(Some(error.message()), "channel");
+                    }
+                };
+                let mut session_shell = ShellSession::new(shell);
+                session_shell.launch = Some(command.to_string());
+                let slot = Arc::new(AsyncMutex::new(session_shell));
+                {
+                    let mut shells = self.shells.lock().await;
+                    shells.insert(session_key.clone(), slot.clone());
                 }
+                if !spec.internal_session {
+                    self.known_sessions
+                        .lock()
+                        .expect("session lock")
+                        .insert(session_key.clone());
+                    if let Err(error) = self.save_sessions() {
+                        let mut shells = self.shells.lock().await;
+                        shells.remove(&session_key);
+                        return Attempt::not_started(Some(error.message()), "session_registry");
+                    }
+                }
+                timings.channel_seconds += channel_started.elapsed().as_secs_f64();
+                slot
             }
-            timings.channel_seconds += channel_started.elapsed().as_secs_f64();
-        }
-        let shell = shells.get_mut(&session_key).expect("session present");
+        };
+        let mut shell_guard = shell_slot.lock().await;
+        let shell = &mut *shell_guard;
         // A shell keeps the container/image/docker arguments it was opened with: a
         // later call cannot silently run somewhere else than its metadata claims.
         if let Some(launch) = &shell.launch {
@@ -1046,7 +1152,11 @@ close it or use a new session_id"
             }
         }
         if shell.is_closing() {
-            shells.remove(&session_key);
+            drop(shell_guard);
+            {
+                let mut shells = self.shells.lock().await;
+                shells.remove(&session_key);
+            }
             return Attempt::not_started(
                 Some(
                     "session state was lost; inspect prior result, then use a new session_id"
@@ -1064,7 +1174,11 @@ close it or use a new session_id"
                 let _ = shell.save_startup_output(out_path, err_path);
                 shell.lost = true;
                 shell.close().await;
-                shells.remove(&session_key);
+                drop(shell_guard);
+                {
+                    let mut shells = self.shells.lock().await;
+                    shells.remove(&session_key);
+                }
                 timings.channel_seconds += prime_started.elapsed().as_secs_f64();
                 return Attempt::not_started(Some(error.message()), "shell_startup");
             }
@@ -1107,8 +1221,11 @@ close it or use a new session_id"
                 // loss instead of silently rebuilding a fresh shell behind the same id.
                 shell.lost = true;
                 shell.close().await;
-                shells.remove(&session_key);
-                drop(shells);
+                drop(shell_guard);
+                {
+                    let mut shells = self.shells.lock().await;
+                    shells.remove(&session_key);
+                }
                 Attempt {
                     code: 124,
                     executed: Some(true),
@@ -1130,8 +1247,11 @@ closed and must not be reused. Inspect before rerunning."
             Err(error) => {
                 shell.lost = true;
                 shell.close().await;
-                shells.remove(&session_key);
-                drop(shells);
+                drop(shell_guard);
+                {
+                    let mut shells = self.shells.lock().await;
+                    shells.remove(&session_key);
+                }
                 Attempt {
                     code: 255,
                     executed: None,
@@ -1162,6 +1282,7 @@ closed and must not be reused. Inspect before rerunning."
         timeout: f64,
         container: Option<&str>,
         overwrite: bool,
+        progress: Option<&dyn ProgressSink>,
     ) -> BridgeResult<ExecOutcome> {
         let direction = match direction {
             "push" => crate::transport::rsync::Direction::Push,
@@ -1173,9 +1294,10 @@ closed and must not be reused. Inspect before rerunning."
             }
         };
         let key = host.connection_key()?;
-        let lease = self.recovery.enter(&key, self.queue_timeout).await?;
+        // The lease covers the transfer itself, not just the local preparation: a
+        // reconnect triggered elsewhere must not kill a running rsync.
+        let _lease = self.recovery.enter(&key, self.queue_timeout).await?;
         let binary = self.rsync_binary.resolve().await?;
-        drop(lease);
         let mut metadata = Map::new();
         metadata.insert("kind".into(), Value::from("rsync"));
         metadata.insert("host".into(), Value::from(host.name.clone()));
@@ -1187,6 +1309,14 @@ closed and must not be reused. Inspect before rerunning."
             metadata.insert("container".into(), Value::from(container));
         }
         let result_id = self.store.create(metadata)?;
+        if let Some(progress) = progress {
+            // Announce before a single byte moves: a transfer that is killed halfway
+            // must still be addressable from the original request id.
+            progress.record(
+                "execution_results",
+                json!({"host": host.name, "result_id": result_id, "kind": "transfer"}),
+            )?;
+        }
         let out_path = self.store.path(&result_id, "stdout")?;
         let err_path = self.store.path(&result_id, "stderr")?;
         let started = Instant::now();
@@ -1265,11 +1395,14 @@ closed and must not be reused. Inspect before rerunning."
                 }
             }
         }
-        let mut shells = self.shells.lock().await;
-        if let Some(mut shell) = shells.remove(&session_key) {
+        let slot = {
+            let mut shells = self.shells.lock().await;
+            shells.remove(&session_key)
+        };
+        if let Some(slot) = slot {
+            let mut shell = slot.lock().await;
             shell.close().await;
         }
-        drop(shells);
         let existed = self
             .known_sessions
             .lock()
@@ -1379,11 +1512,14 @@ closed and must not be reused. Inspect before rerunning."
     pub async fn close(&self) {
         self.closing.store(true, Ordering::SeqCst);
         self.recovery.close();
-        let mut shells = self.shells.lock().await;
-        for (_key, shell) in shells.iter_mut() {
+        let slots: Vec<_> = {
+            let mut shells = self.shells.lock().await;
+            shells.drain().map(|(_key, slot)| slot).collect()
+        };
+        for slot in slots {
+            let mut shell = slot.lock().await;
             shell.close().await;
         }
-        shells.clear();
         self.pool.close().await;
     }
 }
@@ -1480,6 +1616,32 @@ pub fn age_seconds(meta: &Map<String, Value>) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// An idle interactive terminal keeps its connection: it holds the cwd and env of a
+    /// bound shell, so a reconnect triggered elsewhere must not replace it.
+    #[test]
+    fn an_open_terminal_protects_its_connection() {
+        let shells: Arc<AsyncMutex<HashMap<(String, String), Arc<AsyncMutex<ShellSession>>>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        let terminals: Arc<std::sync::Mutex<HashMap<String, usize>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        assert!(!connection_protected(&shells, &terminals, "key-1"));
+
+        let guard = {
+            let mut registry = terminals.lock().expect("lock");
+            *registry.entry("key-1".to_string()).or_insert(0) += 1;
+            TerminalProtection {
+                registry: terminals.clone(),
+                key: "key-1".to_string(),
+            }
+        };
+        assert!(connection_protected(&shells, &terminals, "key-1"));
+        // A different connection is unaffected.
+        assert!(!connection_protected(&shells, &terminals, "key-2"));
+
+        drop(guard);
+        assert!(!connection_protected(&shells, &terminals, "key-1"));
+    }
+
     use super::*;
 
     #[test]

@@ -537,12 +537,13 @@ impl Filesystem {
                     timeout,
                     options.container.as_deref(),
                     options.overwrite,
+                    progress,
                 )
                 .await?;
             if let Some(progress) = progress {
-                // Record the saved transfer before it can be reported, so a crash
-                // still leaves the caller a result id to reconcile.
-                progress.record(
+                // The result id was recorded before the transfer started; this adds the
+                // action now that the outcome is known.
+                let _ = progress.record(
                     "execution_results",
                     serde_json::json!({
                         "host": host.name,

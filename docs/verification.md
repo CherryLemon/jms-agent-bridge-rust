@@ -9,13 +9,24 @@ credentials are deliberately not recorded here.
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 123 passed |
+| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 131 passed |
 | Inventory refresh against a mock bastion (transient vs. explicit detail errors, account ambiguity) | `cargo test --test catalog_refresh` | 2 passed |
 | Offline contracts (tool list, schema validation, guard, receipts, saved-result reads, discovery) | `cargo test --test mcp_offline` | 1 passed |
 | Real `serve --stdio` subprocess: every stdout line parses as JSON-RPC while logging is at `info` | `cargo test --test mcp_stdio` | 1 passed |
 | Exec-channel plumbing against a live bastion | `cargo test --test ssh_pipe -- --ignored` | passed (manual) |
 
-Regression tests added for the defects found in review: marker/exit-status
+Regression tests for the second review round (state and lifecycle):
+`job_rows_distinguish_acknowledged_rejected_and_unknown` (launcher refusal is
+never `launched`), `staged_summary_keeps_the_short_state_fields`,
+`a_staged_payload_keeps_its_read_instructions`,
+`granted_but_unclaimed_slot_is_returned` (permit dropped with its message),
+`a_replacement_waits_until_the_active_operation_finishes` (lease held across the
+remote exchange), `an_open_terminal_protects_its_connection`,
+`a_closed_stream_without_its_marker_ends_the_command`,
+`waiting_on_closed_streams_returns_immediately` and
+`closing_a_terminal_records_the_right_command_state`.
+
+Regression tests added for the defects found in the first review round: marker/exit-status
 ordering (`start_then_close_without_status_is_unknown`,
 `exit_status_arriving_after_eof_is_kept`,
 `an_exit_status_without_the_start_marker_is_not_success`,
@@ -55,12 +66,19 @@ the tool-schema budget (`advertised_tools_stay_within_their_token_budget`,
 | 19 | `session_close` on a `terminal(action="open")` handle | closed through the unified registry (`state:"closed"`) |
 | 20 | persistent shell after the isolated-run rework (`cd /tmp`, `export KEEP=42`) | second call still shows `42` and `/tmp` |
 | 21 | `jms_submit_job` with a job that finishes in under a second | `launched:true` and its log/exit code available immediately (no waiting for the process to die) |
+| 22 | `jms_submit_job` response fields | `launch_state:"acknowledged"`, `launched:true`, `launcher:"tmux"`, plus `result_id` for the launcher transcript |
+| 23 | `session_list` after `run(session_id=...)` | that handle reports `state:"active"`, `lost:false` (the earlier build always said `lost:true`) |
+| 24 | `terminal open` → `exec sleep 40` → `close`, then `result_metadata` | result is `execution_state:"unknown"`, `completion_unknown:true`, `failure_stage:"closed_by_caller"` instead of staying `running` |
+| 25 | `call jms_submit_job` with `request_id` on two targets | `request_state:"complete"` with per-target `launch_state`; the receipt path shares the call budget |
+| 26 | measured `tools/list` from the running service | 7 tools, 6822 bytes on the wire (~1.6k tokens by the envelope estimate) |
+| 27 | `discover(operation=...)` sizes | `run` 2799 B, `fs` 3673 B, `terminal` 2261 B, `jms_submit_job` 635 B |
 
 ## Deliberately not exercised here
 
 | Area | Why | How to check |
 | --- | --- | --- |
 | Docker `container`/`image` execution | No Docker daemon on the probed assets | `run` with `container` on a host that has Docker |
+| Launcher rejection paths (`no tmux and no setsid`, tmux refusing a session) | Both launchers exist on every probed asset | covered by the mapping test; nothing is claimed as `launched` without an acknowledgement |
 | Connection replacement with live named shells | Needs a deliberately broken pooled connection while a shell is open | the recovery path now refuses to replace a connection that still carries shells (`protected` reflects them); unit test covers the tracker, not a real disconnect |
 | `session_id` loss across a normal (non-kill) restart | Requires restarting the resident service holding live shells | restart `serve`, then reuse the same `session_id`: expect `not_started` with "session state was lost" |
 | Result expiry sweep (7 days) | Would need a week of wall clock | covered by unit tests with injected timestamps |

@@ -57,6 +57,18 @@ permissive. They are listed here because they change what a copied config does:
 | Assets with several permitted accounts | resolved by name | stay unresolved until `bridge.preferred_account` names one; `discover(topic="assets")` explains why |
 | SSH authentication | may include interactive steps | must complete with a key or password; anything else fails fast with an authentication error |
 
+## Contract details worth knowing when switching
+
+| Field | Meaning |
+| --- | --- |
+| `launch_state` | `acknowledged` (the launcher confirmed the job), `rejected` (the launcher answered that nothing started), `unknown` (transmitted, verdict lost). Only `acknowledged` sets `launched: true`. |
+| `job_id` | Returned for every outcome, including `rejected`, so a lost reply can always be reconciled. |
+| staging | A `call` response above 8 KiB is saved and summarised with `staged: true`, `result_id` and `note`; the summary always keeps `request_id`, `request_state`, `execution_state` and `completion_unknown`. |
+| terminal close | Closing a terminal with a command in flight records `unknown`/`completion_unknown: true`; a queued command records `not_started`. |
+
+Persistence is a precondition, not a side effect: if the result id or the prepared
+job receipt cannot be written, the operation stops before anything is sent.
+
 ## Not supported
 
 * SSH agent authentication is not implemented: provide `bastion.ssh_key` (with

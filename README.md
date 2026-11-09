@@ -132,13 +132,20 @@ business summary and a `result_id` that `read_result(stream="result")` reads bac
 * `execution_state`: `completed` (start and finish markers seen), `not_started`
   (proven unsent: login, queue or validation refused it), or `unknown` (the bytes
   may have reached the remote side, but no completion evidence exists). An
-  `unknown` result is never replayed automatically.
+  `unknown` result is never replayed automatically. Closing a terminal or hitting
+  a timeout with a command in flight moves it to `unknown`; it never stays
+  `running` after the handle is gone.
+* `launch_state` (jobs): `acknowledged`, `rejected` or `unknown`. Only an
+  acknowledgement sets `launched: true`; the `job_id` is reported in every case so
+  a lost reply can be reconciled.
 * `request_id` (`^[A-Za-z0-9_.:-]{1,128}$`) records a receipt before the first
   side effect. A duplicate call returns the same receipt with
   `execution_replayed: false` plus the stored result; it does not run again.
   Recover a lost reply with `call(operation="request_status")` or
   `meta(ref="request:<id>")`.
 * `queue_full` is an unsent per-target refusal: nothing ran, so retrying is safe.
+* A durable write is a precondition: if the result id or the prepared job receipt
+  cannot be persisted, the operation stops before anything reaches the remote side.
 
 ## State
 

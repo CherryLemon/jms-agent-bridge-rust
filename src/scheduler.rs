@@ -83,7 +83,9 @@ struct Waiter {
     id: u64,
     lane: Lane,
     granted: bool,
-    notify: oneshot::Sender<()>,
+    /// The grant itself carries the release responsibility: if the message is never
+    /// received (cancelled task, dropped future) the permit's `Drop` returns the slot.
+    notify: oneshot::Sender<SlotGuard>,
 }
 
 struct Inner {
@@ -188,7 +190,7 @@ impl ExecutionSlots {
         }
     }
 
-    fn wake(&self, inner: &mut Inner) {
+    fn wake(self: &Arc<Self>, inner: &mut Inner) {
         if inner.waiters.is_empty() {
             return;
         }
@@ -206,10 +208,14 @@ impl ExecutionSlots {
             inner.active[lane.index()] += 1;
             inner.peak_active = inner.peak_active.max(inner.active[0] + inner.active[1]);
             waiter.granted = true;
-            if waiter.notify.send(()).is_err() {
-                // The waiter disappeared between the grant and its delivery: give the
-                // slot straight back instead of leaking capacity for the process life.
-                inner.active[lane.index()] = inner.active[lane.index()].saturating_sub(1);
+            let permit = SlotGuard {
+                slots: Arc::clone(self),
+                lane,
+            };
+            if waiter.notify.send(permit).is_err() {
+                // The waiter vanished between the grant and its delivery. The permit was
+                // dropped with the failed send, so its `Drop` already queued the release;
+                // counting it here keeps the intent visible in status.
                 inner.granted_but_cancelled += 1;
             }
         }
@@ -260,19 +266,17 @@ impl ExecutionSlots {
         }
         let result = tokio::time::timeout(timeout, rx).await;
         timings.queue_seconds += started.elapsed().as_secs_f64();
-        if let Ok(Ok(())) = result {
-            return Ok(SlotGuard {
-                slots: self.clone(),
-                lane,
-            });
+        if let Ok(Ok(permit)) = result {
+            return Ok(permit);
         }
-        // Deadline expired (or the grant sender vanished): retract our waiter. A
-        // grant that raced the deadline still counts, so release it explicitly.
-        let mut inner = self.inner.lock().await;
-        if let Some(position) = inner.waiters.iter().position(|w| w.id == id) {
-            let waiter = inner.waiters.remove(position).expect("index in range");
-            if waiter.granted {
-                inner.active[lane.index()] = inner.active[lane.index()].saturating_sub(1);
+        // Deadline expired (or the grant sender vanished). A grant that raced the
+        // deadline is released by the permit's `Drop` when the receiver is dropped;
+        // here we only retract a waiter that was never granted.
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(position) = inner.waiters.iter().position(|w| w.id == id) {
+                let waiter = inner.waiters.remove(position).expect("index in range");
+                drop(waiter);
                 self.wake(&mut inner);
             }
         }
@@ -394,6 +398,47 @@ mod tests {
             next.err()
         );
         drop(next);
+    }
+
+    /// A grant that is delivered but never claimed must not consume capacity: the
+    /// permit is dropped with the receiver, which returns the slot.
+    #[tokio::test]
+    async fn granted_but_unclaimed_slot_is_returned() {
+        use futures::FutureExt;
+        let slots = ExecutionSlots::new(1, 0, 4, 0).unwrap();
+        let mut t = timings();
+        let guard = slots
+            .acquire(Lane::General, Duration::from_secs(1), &mut t)
+            .await
+            .expect("first slot");
+
+        let mut waiter = Box::pin({
+            let slots = slots.clone();
+            async move {
+                let mut t = timings();
+                slots
+                    .acquire(Lane::General, Duration::from_secs(30), &mut t)
+                    .await
+            }
+        });
+        // Poll once so the waiter registers, then leave it pending.
+        assert!(waiter.as_mut().now_or_never().is_none());
+
+        drop(guard); // A releases: B is granted and the permit is queued for it
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Drop the pending future without polling it again: the queued permit goes with it.
+        drop(waiter);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut t2 = timings();
+        let next = tokio::time::timeout(
+            Duration::from_secs(1),
+            slots.acquire(Lane::General, Duration::from_secs(1), &mut t2),
+        )
+        .await
+        .expect("capacity must come back when a grant is never claimed");
+        assert!(next.is_ok(), "slot should be granted: {:?}", next.err());
     }
 
     #[tokio::test]

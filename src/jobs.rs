@@ -167,19 +167,54 @@ pub fn launch_script(
     .join("\n")
 }
 
-#[derive(Debug, Clone)]
+/// Whether the detached launcher actually confirmed the job.
+///
+/// A tracked job id is not the same thing as a started job: the id is kept even when
+/// the launcher was refused or its answer was lost, so the caller can reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchState {
+    /// The runner wrote its pid/status: the job is really running (or already done).
+    Acknowledged,
+    /// The launcher answered that it did not start anything (nothing ran).
+    Rejected,
+    /// The launcher was transmitted but its verdict is missing.
+    Unknown,
+}
+
+impl LaunchState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LaunchState::Acknowledged => "acknowledged",
+            LaunchState::Rejected => "rejected",
+            LaunchState::Unknown => "unknown",
+        }
+    }
+}
+
 pub struct JobHandle {
     pub job_id: String,
     pub host: String,
     pub session: String,
     pub launcher: String,
+    pub state: LaunchState,
 }
 
 impl JobHandle {
     pub fn to_json(&self) -> Value {
         json!({"job_id": self.job_id, "host": self.host,
-               "session": self.session, "launcher": self.launcher})
+               "session": self.session, "launcher": self.launcher,
+               "launch_state": self.state.as_str()})
     }
+}
+
+/// The launcher answered that it could not start anything.
+///
+/// The script exits 3 (no tmux and no setsid), 4 (tmux refused the session) or 5
+/// (the job never wrote its pid/status); all three mean "nothing is running".
+fn launcher_refused(outcome: &ExecOutcome) -> bool {
+    matches!(outcome.exit_code, 3 | 4 | 5)
+        && !outcome.stdout.contains("LAUNCHER=")
+        && outcome.meta.get("executed") == Some(&Value::Bool(true))
 }
 
 pub struct Jobs {
@@ -197,7 +232,7 @@ impl Jobs {
         host: &Host,
         command: &str,
         progress: Option<&dyn ProgressSink>,
-    ) -> (Option<JobHandle>, ExecOutcome) {
+    ) -> BridgeResult<(JobHandle, ExecOutcome)> {
         let job_id = new_job_id();
         let session = format!("jms-{job_id}");
         let launch = launch_script(
@@ -216,7 +251,7 @@ impl Jobs {
         receipt.insert("submission_state".into(), Value::from("prepared"));
         // This write must succeed before any remote bytes may be transmitted.
         if let Some(progress) = progress {
-            progress.record("submission_receipts", Value::Object(receipt.clone()));
+            progress.record("submission_receipts", Value::Object(receipt.clone()))?;
         }
         let outcome = match self
             .runner
@@ -262,24 +297,29 @@ impl Jobs {
             receipt.insert(key, value);
         }
         if let Some(progress) = progress {
-            progress.record("submission_receipts", Value::Object(receipt));
+            let _ = progress.record("submission_receipts", Value::Object(receipt));
         }
-        let transmitted = outcome.meta.get("executed") == Some(&Value::Bool(true))
-            || outcome.meta.get("execution_state").and_then(Value::as_str) == Some("unknown");
-        if acknowledged || transmitted {
-            // A transmitted launcher keeps its id even when the ack is missing: the
-            // remote side may be running, and a fresh id could duplicate its side effects.
-            return (
-                Some(JobHandle {
-                    job_id,
-                    host: host.name.clone(),
-                    session,
-                    launcher,
-                }),
-                outcome,
-            );
-        }
-        (None, outcome)
+        let executed = outcome.meta.get("executed") == Some(&Value::Bool(true));
+        // `launched` may only be claimed from the launcher's own acknowledgement. The id
+        // is still returned for reconciliation in every other case.
+        let state = if acknowledged {
+            LaunchState::Acknowledged
+        } else if !executed || launcher_refused(&outcome) {
+            // Nothing was transmitted, or the launcher answered "I did not start it".
+            LaunchState::Rejected
+        } else {
+            LaunchState::Unknown
+        };
+        Ok((
+            JobHandle {
+                job_id,
+                host: host.name.clone(),
+                session,
+                launcher,
+                state,
+            },
+            outcome,
+        ))
     }
 
     pub async fn status(&self, host: &Host, job_id: &str) -> BridgeResult<Value> {
@@ -604,20 +644,6 @@ mod tests {
         assert_eq!(code.trim(), "3");
         let log = std::fs::read_to_string(root.join("stdout.log")).unwrap_or_default();
         assert!(log.contains("quick"), "job output missing: {log:?}");
-    }
-
-    #[test]
-    fn dump_launcher_script() {
-        let script = crate::jobs::launch_script(
-            "/root/jms_mcp_rust/.tmp/launch/root",
-            "jms-abc12345",
-            "abc12345",
-            "echo quick; exit 3",
-            None,
-            None,
-        );
-        std::fs::create_dir_all("/root/jms_mcp_rust/.tmp/launch").unwrap();
-        std::fs::write("/root/jms_mcp_rust/.tmp/launch/launch.sh", script).unwrap();
     }
 
     #[test]
