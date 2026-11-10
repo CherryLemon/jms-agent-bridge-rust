@@ -385,6 +385,38 @@ pub fn load_config(explicit: Option<&Path>) -> BridgeResult<BastionConfig> {
     })
 }
 
+/// A bridge integer that must stay inside `[low, high]`.
+fn bounded(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    default: usize,
+    low: usize,
+    high: usize,
+) -> BridgeResult<usize> {
+    let value = match table.get(key) {
+        None => return Ok(default),
+        Some(toml::Value::Integer(number)) => {
+            if *number < 0 {
+                return Err(BridgeError::config(format!(
+                    "bridge.{key} must be between {low} and {high}, got {number}"
+                )));
+            }
+            *number as u64
+        }
+        Some(_) => {
+            return Err(BridgeError::config(format!(
+                "bridge.{key} must be an integer"
+            )))
+        }
+    };
+    if value < low as u64 || value > high as u64 {
+        return Err(BridgeError::config(format!(
+            "bridge.{key} must be between {low} and {high}, got {value}"
+        )));
+    }
+    Ok(value as usize)
+}
+
 fn positive_int(value: &str, what: &str) -> BridgeResult<usize> {
     let parsed = value
         .parse::<i64>()
@@ -437,18 +469,12 @@ pub fn load_settings(explicit: Option<&Path>) -> BridgeResult<BridgeSettings> {
         }
     }
     let queue_limit = nonnegative(&bridge, "queue_limit", 64)?;
-    let ssh_window_size = nonnegative(&bridge, "ssh_window_size", 2_097_152)? as u32;
-    if !(32_768..=64 * 1_048_576).contains(&ssh_window_size) {
-        return Err(BridgeError::config(format!(
-            "bridge.ssh_window_size must be between 32768 and 67108864, got {ssh_window_size}"
-        )));
-    }
-    let ssh_max_packet_size = nonnegative(&bridge, "ssh_max_packet_size", 32_768)? as u32;
-    if !(4_096..=1_048_576).contains(&ssh_max_packet_size) {
-        return Err(BridgeError::config(format!(
-            "bridge.ssh_max_packet_size must be between 4096 and 1048576, got {ssh_max_packet_size}"
-        )));
-    }
+    // Validate the parsed integer *before* narrowing to u32: a too-large value would
+    // otherwise wrap around and be accepted as a valid one.
+    let ssh_window_size =
+        bounded(&bridge, "ssh_window_size", 2_097_152, 32_768, 67_108_864)? as u32;
+    let ssh_max_packet_size =
+        bounded(&bridge, "ssh_max_packet_size", 32_768, 4_096, 1_048_576)? as u32;
     let rsync_compress = match bridge.get("rsync_compress") {
         None => true,
         Some(toml::Value::Boolean(value)) => *value,
@@ -796,5 +822,17 @@ mod tests {
         let (_guard, bad) =
             write("[bastion]\nurl = \"https://x\"\n[bridge]\nssh_window_size = 1024\n");
         assert!(bad.is_err(), "an unusably small window must be rejected");
+
+        // 4297064448 is 2097152 + 2^32: narrowing before checking would silently accept
+        // it as the default, so the range check has to see the parsed value.
+        let (_guard, wrapped) =
+            write("[bastion]\nurl = \"https://x\"\n[bridge]\nssh_window_size = 4297064448\n");
+        assert!(
+            wrapped.is_err(),
+            "a value that only fits after truncation must be rejected"
+        );
+        let (_guard, huge) =
+            write("[bastion]\nurl = \"https://x\"\n[bridge]\nssh_max_packet_size = 5000000\n");
+        assert!(huge.is_err(), "an oversized packet limit must be rejected");
     }
 }

@@ -458,6 +458,30 @@ impl ResultStore {
         Ok(meta)
     }
 
+    /// Annotate only while the result is still running.
+    ///
+    /// Live progress updates must never race the final verdict: once `finish()` wrote
+    /// `status: complete`, a late tick would otherwise resurrect a stale percentage.
+    pub fn annotate_if_running(
+        &self,
+        result_id: &str,
+        values: Map<String, Value>,
+    ) -> BridgeResult<Map<String, Value>> {
+        let _guard = self.io.lock().expect("result store lock");
+        let mut meta = self.metadata(result_id)?;
+        if meta.get("status").and_then(Value::as_str) != Some("running") {
+            return Ok(meta);
+        }
+        for (key, value) in values {
+            meta.insert(key, value);
+        }
+        atomic_json(
+            &self.directory(result_id)?.join("meta.json"),
+            &Value::Object(meta.clone()),
+        )?;
+        Ok(meta)
+    }
+
     pub fn save_json(&self, value: &Value, metadata: Map<String, Value>) -> BridgeResult<String> {
         self.save_serialized(value, &serde_json::to_vec(value)?, metadata)
     }
@@ -940,6 +964,35 @@ mod tests {
     fn write_streams(store: &ResultStore, result_id: &str, stdout: &[u8], stderr: &[u8]) {
         fs::write(store.path(result_id, "stdout").unwrap(), stdout).unwrap();
         fs::write(store.path(result_id, "stderr").unwrap(), stderr).unwrap();
+    }
+
+    /// A live progress tick must never resurrect a result that already finished.
+    #[test]
+    fn annotations_stop_at_the_final_verdict() {
+        let (_tmp, store) = store();
+        let result_id = store.create(Map::new()).unwrap();
+        let mut tick = Map::new();
+        tick.insert("bytes_done".into(), json!(40));
+        store.annotate_if_running(&result_id, tick.clone()).unwrap();
+        let running = store.metadata(&result_id).unwrap();
+        assert_eq!(
+            running["bytes_done"], 40,
+            "a running result accepts progress"
+        );
+
+        store
+            .finish(
+                &result_id,
+                Map::from_iter([("bytes_done".into(), json!(10))]),
+            )
+            .unwrap();
+        let mut stale = Map::new();
+        stale.insert("bytes_done".into(), json!(999));
+        stale.insert("progress_pct".into(), json!(100.0));
+        let after = store.annotate_if_running(&result_id, stale).unwrap();
+        assert_eq!(after["bytes_done"], 10, "the final value is kept");
+        assert_eq!(after["status"], "complete");
+        assert!(after.get("progress_pct").is_none(), "no stale percentage");
     }
 
     #[test]

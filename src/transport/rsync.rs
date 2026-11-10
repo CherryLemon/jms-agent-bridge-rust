@@ -148,6 +148,11 @@ impl RsyncBinary {
                 binary.display()
             ))
         })?;
+        // `--info=progress2` exists from 3.1.0; a 3.0.x daemon passes the `-s --version`
+        // check but would reject the flag at transfer time.
+        let (major_supported, minor) = parse_version(&combined).unwrap_or((0, 0));
+        let supports_info = major_supported > 3 || (major_supported == 3 && minor >= 1);
+        let _ = INFO_SUPPORTED.set(supports_info);
         if major < 3 {
             return Err(BridgeError::config(format!(
                 "Local rsync at {} is older than 3.0 and lacks --protect-args (-s). {INSTALL_HINT} Transfer not started.",
@@ -216,6 +221,28 @@ fn unsupported_protect_args(text: &str) -> bool {
     false
 }
 
+/// `(major, minor)` from rsync's banner, e.g. `rsync  version 3.2.7  protocol version 31`.
+fn parse_version(text: &str) -> Option<(u64, u64)> {
+    for line in text.lines() {
+        let lowered = line.trim().to_lowercase();
+        let rest = lowered
+            .strip_prefix("rsync  version ")
+            .or_else(|| lowered.strip_prefix("rsync version "))?;
+        let number: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let mut parts = number.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        return Some((major, minor));
+    }
+    None
+}
+
 fn parse_major_version(text: &str) -> Option<u64> {
     for line in text.lines() {
         let trimmed = line.trim();
@@ -245,9 +272,17 @@ pub struct TransferOutcome {
 /// Live byte progress of one transfer, filled in from rsync's `--info=progress2`.
 #[derive(Default)]
 pub struct TransferProgress {
-    bytes_done: std::sync::atomic::AtomicU64,
-    total_bytes: std::sync::atomic::AtomicU64,
+    /// Logical file bytes, from rsync's own `--info=progress2` accounting.
+    logical_done: std::sync::atomic::AtomicU64,
+    logical_total: std::sync::atomic::AtomicU64,
+    logical_known: AtomicBool,
+    /// Bytes that crossed the relay: throughput diagnostics, never a percentage.
+    protocol_bytes: std::sync::atomic::AtomicU64,
+    /// Size known before the transfer (local file size or a remote `stat`).
+    expected_total: std::sync::atomic::AtomicU64,
     started: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Set once the outcome is decided, so a late update cannot rewrite the verdict.
+    finished: AtomicBool,
 }
 
 impl TransferProgress {
@@ -259,27 +294,62 @@ impl TransferProgress {
         }
     }
 
-    /// Count bytes that actually crossed the relay, so progress never depends on rsync
-    /// emitting a status line.
+    /// Protocol bytes: throughput and backpressure diagnostics, never a percentage.
+    ///
+    /// A pump can still be draining when the outcome is decided, so late counts are
+    /// dropped: the snapshot that was reported must stay stable.
     pub fn add_bytes(&self, count: usize) {
-        self.bytes_done.fetch_add(count as u64, Ordering::Relaxed);
+        if self.finished.load(Ordering::SeqCst) {
+            return;
+        }
+        self.protocol_bytes
+            .fetch_add(count as u64, Ordering::Relaxed);
     }
 
+    pub fn protocol_bytes(&self) -> u64 {
+        self.protocol_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Size known before the transfer (local file size, or a remote `stat`).
     pub fn set_total(&self, total: u64) {
         if total > 0 {
-            self.total_bytes.store(total, Ordering::Relaxed);
+            self.expected_total.store(total, Ordering::Relaxed);
         }
     }
 
-    pub fn bytes_done(&self) -> u64 {
-        self.bytes_done.load(Ordering::Relaxed)
+    /// Freeze the counters so a late update cannot rewrite a decided verdict.
+    pub fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
     }
 
+    /// Whether rsync itself reported file progress.
+    pub fn logical(&self) -> bool {
+        self.logical_known.load(Ordering::Relaxed)
+    }
+
+    /// Logical file bytes: rsync's accounting when available, else the protocol count.
+    pub fn bytes_done(&self) -> u64 {
+        if self.logical() {
+            self.logical_done.load(Ordering::Relaxed)
+        } else {
+            self.protocol_bytes()
+        }
+    }
+
+    /// The known size wins over rsync's percentage-derived estimate, which covers the
+    /// whole transfer (all files) rather than this one file.
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes.load(Ordering::Relaxed)
+        let expected = self.expected_total.load(Ordering::Relaxed);
+        if expected > 0 {
+            return expected;
+        }
+        self.logical_total.load(Ordering::Relaxed)
     }
 
     /// A snapshot for a status response: bytes, total, percentage and rate.
+    ///
+    /// `finished` decides whether a full percentage means "done": the same numbers on a
+    /// failed or timed-out transfer are reported as a partial amount, not as 100%.
     pub fn snapshot(&self) -> Map<String, Value> {
         let done = self.bytes_done();
         let total = self.total_bytes();
@@ -294,31 +364,44 @@ impl TransferProgress {
         out.insert("bytes_done".into(), Value::from(done));
         if total > 0 {
             out.insert("total_bytes".into(), Value::from(total));
-            out.insert(
-                "progress_pct".into(),
-                json!(((done as f64 / total as f64) * 100.0).min(100.0).round()),
-            );
+            let pct = ((done as f64 / total as f64) * 100.0).min(100.0).round();
+            out.insert("progress_pct".into(), json!(pct));
         }
+        if self.logical() {
+            out.insert("progress_source".into(), Value::from("rsync"));
+        }
+        out.insert("protocol_bytes".into(), Value::from(self.protocol_bytes()));
         if elapsed > 0.0 {
             let rate = done as f64 / elapsed;
             out.insert("rate_bps".into(), json!(rate.round()));
-            if total > done {
-                out.insert(
-                    "eta_seconds".into(),
-                    json!(((total - done) as f64 / rate.max(1.0)).round()),
-                );
-            }
+        }
+        // An ETA only makes sense while the transfer is still running; a finished
+        // transfer clears it explicitly, because metadata updates are merges.
+        let finished = self.finished.load(Ordering::SeqCst);
+        if !finished && total > done && elapsed > 0.0 {
+            let rate = done as f64 / elapsed;
+            out.insert(
+                "eta_seconds".into(),
+                json!(((total - done) as f64 / rate.max(1.0)).round()),
+            );
+        } else if finished {
+            out.insert("eta_seconds".into(), Value::Null);
         }
         out
     }
 
     /// Parse one `--info=progress2` status line.
     ///
-    /// The human-readable form is `  1,234,567  45%  12.34MB/s  0:00:05`, so the bytes
-    /// and the percentage are enough to derive the total.
+    /// rsync prints `  1,234,567  45%  12.34MB/s  0:00:05` on its own stdout; the byte
+    /// count and the percentage are enough to derive the total.
     pub(crate) fn observe(&self, line: &str) {
+        if self.finished.load(Ordering::SeqCst) {
+            return;
+        }
         let mut tokens = line.split_whitespace();
         let Some(first) = tokens.next() else { return };
+        // Progress tokens are plain numbers with thousands separators; anything with a
+        // letter (a filename, `to-chk=0/1`, a rate) is not the byte count.
         let digits: String = first.chars().filter(|c| c.is_ascii_digit()).collect();
         if first.chars().any(|c| c.is_ascii_alphabetic()) || digits.is_empty() {
             return;
@@ -326,16 +409,19 @@ impl TransferProgress {
         let Ok(done) = digits.parse::<u64>() else {
             return;
         };
-        if done == 0 {
+        let percent = tokens
+            .next()
+            .and_then(|token| token.strip_suffix('%'))
+            .and_then(|token| token.parse::<f64>().ok());
+        if done == 0 && percent.is_none() {
             return;
         }
-        self.bytes_done.store(done, Ordering::Relaxed);
-        if let Some(percent) = tokens.next().and_then(|token| token.strip_suffix('%')) {
-            if let Ok(percent) = percent.parse::<f64>() {
-                if percent > 0.0 {
-                    let total = (done as f64 * 100.0 / percent).round() as u64;
-                    self.total_bytes.store(total.max(done), Ordering::Relaxed);
-                }
+        self.logical_known.store(true, Ordering::Relaxed);
+        self.logical_done.store(done, Ordering::Relaxed);
+        if let Some(percent) = percent {
+            if percent > 0.0 {
+                let total = (done as f64 * 100.0 / percent).round() as u64;
+                self.logical_total.store(total.max(done), Ordering::Relaxed);
             }
         }
     }
@@ -344,24 +430,53 @@ impl TransferProgress {
 /// Where an interrupted transfer keeps its data so a retry can resume.
 pub(crate) const PARTIAL_DIR: &str = ".jms-partial";
 
-/// Ask rsync to shut down, then force it.
+/// Longest a transfer may go without a single byte moving.
+pub(crate) const IDLE_LIMIT_SECS: f64 = 600.0;
+
+/// Whether the local rsync understands `--info=progress2` (3.1.0 and later).
+static INFO_SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The archive flags. `-s` stays: without it rsync escapes remote paths for a shell it
+/// is not talking to, and the relay would receive the escapes literally.
+fn base_flags(compress: bool) -> &'static str {
+    if compress {
+        "-azs"
+    } else {
+        "-as"
+    }
+}
+
+/// Quote one path for rsync's own parsing of the `-e` remote-shell string.
 ///
-/// rsync saves the partial file in its own cleanup, so a SIGKILL straight away loses the
-/// work; SIGTERM first gives it the chance to keep what it has.
-fn terminate(child: &mut std::process::Child) {
-    match child.try_wait() {
-        Ok(Some(_)) => return,
-        Ok(None) => {}
-        Err(_) => return,
+/// `-e` is re-split by rsync, so a temp directory containing a space would otherwise
+/// become two words.
+fn quote_remote_shell(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+'))
+    {
+        return text.into_owned();
+    }
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// `terminate` without holding a Tokio worker for up to 15 s.
+async fn terminate_off_thread(child: &mut std::process::Child) {
+    // `Child` cannot move into a blocking closure while we also need it afterwards, so
+    // the wait is done here with a non-blocking poll and async sleeps instead.
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
     }
     unsafe {
         libc::kill(child.id() as i32, libc::SIGTERM);
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return,
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
             Err(_) => break,
         }
     }
@@ -382,15 +497,28 @@ struct TransferOwner {
 }
 
 impl TransferOwner {
-    /// Stop the accept loop and wait briefly for it to notice.
+    /// Stop the accept loop, and make sure it really is gone.
+    ///
+    /// A handshake that is already logging in does not observe the stop flag, so a
+    /// timed-out wait must abort the task: dropping the handle would only detach it and
+    /// let it create a channel or a pump after the transfer was declared finished.
     async fn quiesce(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(accept) = self.accept.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), accept).await;
+        if let Some(mut accept) = self.accept.take() {
+            if tokio::time::timeout(Duration::from_secs(2), &mut accept)
+                .await
+                .is_err()
+            {
+                accept.abort();
+                let _ = accept.await;
+            }
         }
     }
 
     /// Abort the forwarding pumps and wait bounded for them to finish.
+    ///
+    /// Aborting a task that holds a channel writer does not send SSH Close, so the
+    /// channel is closed explicitly by `serve_stream`'s owner before this runs.
     async fn reap_pumps(&self) {
         let handles: Vec<_> = self.pumps.lock().expect("pump lock").drain(..).collect();
         for handle in handles {
@@ -532,16 +660,16 @@ pub async fn transfer(
     // `-z` trades CPU for bytes; the flag is configurable because incompressible data
     // pays the CPU cost without the benefit.
     //
-    // No `-s`: the remote command is executed by the relay with `exec "$@"`, not through
-    // a remote shell, so argument protection buys nothing - and rsync implements it by
-    // copying this binary to a `.ps__*` file next to it, which costs 25 MB per transfer
-    // and fails when that copy is reaped too early.
-    command.arg(if compress { "-az" } else { "-a" });
+    // `-s` is required: without it rsync shell-escapes the remote paths it hands to the
+    // remote shell, and the relay passes its argv verbatim to `exec "$@"`, so a path with
+    // a space would arrive with a literal backslash. The wrapper below keeps `-e` a
+    // single token, which is what the `.ps__*` helper was standing in for.
+    command.arg(base_flags(compress));
     // The relay writes to stdout synchronously. Without this rsync starts a custom
     // remote-shell with a *non-blocking* stdout, and a full pipe surfaces as
     // EAGAIN mid-transfer - which truncates large downloads while small ones pass.
     command.arg("--blocking-io");
-    command.arg("-e").arg(&relay.wrapper);
+    command.arg("-e").arg(quote_remote_shell(&relay.wrapper));
     // Resumable partials: rsync keeps an interrupted file in this directory, separate
     // from the destination name, so a retry can reuse it while `--ignore-existing`
     // still protects an already complete file.
@@ -551,7 +679,9 @@ pub async fn transfer(
     }
     command.arg("--itemize-changes");
     // A status line rsync rewrites in place; `TransferProgress` parses it.
-    command.arg("--info=progress2");
+    if INFO_SUPPORTED.get().copied().unwrap_or(true) {
+        command.arg("--info=progress2");
+    }
     if delete {
         command.arg("--delete");
     }
@@ -654,13 +784,50 @@ pub async fn transfer(
             handles.push(watcher);
         }
     }
+    // Idle watchdog: `--blocking-io` means a stalled peer blocks inside a syscall, so the
+    // writer cannot enforce its own deadline. The owner watches the byte counters and
+    // ends the transfer when nothing moves.
+    let idle_limit = Duration::from_secs_f64(timeout.max(1.0).min(IDLE_LIMIT_SECS));
+    let stalled = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let progress = progress.clone();
+        let stalled = stalled.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut seen = progress.protocol_bytes();
+            let mut quiet = 0u32;
+            while !stop.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let now = progress.protocol_bytes();
+                if now != seen {
+                    seen = now;
+                    quiet = 0;
+                    continue;
+                }
+                quiet += 1;
+                if u64::from(quiet) >= idle_limit.as_secs().max(1) {
+                    stalled.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        })
+    };
+    if let Ok(mut handles) = pumps.lock() {
+        handles.push(watchdog);
+    }
     let waited = tokio::time::timeout(Duration::from_secs_f64(timeout.max(0.5)), async {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => return Ok::<_, std::io::Error>(status.code().unwrap_or(255)),
-                Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+                Ok(None) => {}
                 Err(error) => return Err(error),
             }
+            if stalled.load(Ordering::SeqCst) {
+                // Report the stall the same way a timeout is reported: the transfer was
+                // cut short, and the remote side may already have part of the file.
+                return Ok::<_, std::io::Error>(124);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await;
@@ -674,7 +841,7 @@ pub async fn transfer(
     owner.quiesce().await;
     owner.reap_pumps().await;
     if let Some(error) = kill_reason {
-        terminate(&mut child);
+        terminate_off_thread(&mut child).await;
         return Err(BridgeError::storage(error));
     }
     let outcome = match waited {
@@ -686,7 +853,7 @@ pub async fn transfer(
         },
         _ => {
             // Timeout: let rsync keep its partial before forcing it out.
-            terminate(&mut child);
+            terminate_off_thread(&mut child).await;
             TransferOutcome {
                 exit_code: 124,
                 sent: sent.load(Ordering::SeqCst),
@@ -1118,6 +1285,83 @@ pub(crate) fn write_all_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Paths with spaces must reach the relay unescaped: `-s` keeps rsync from shell
+    /// quoting them, so the flag belongs in the fixed argument list.
+    #[test]
+    fn protect_args_is_always_requested() {
+        assert_eq!(base_flags(true), "-azs");
+        assert_eq!(base_flags(false), "-as");
+    }
+
+    /// The `-e` value is re-split by rsync, so a temp path with a space stays one word.
+    #[test]
+    fn the_relay_wrapper_is_quoted_for_rsync() {
+        assert_eq!(
+            quote_remote_shell(Path::new("/tmp/plain/relay")),
+            "/tmp/plain/relay"
+        );
+        assert_eq!(
+            quote_remote_shell(Path::new("/tmp/a b/relay")),
+            "'/tmp/a b/relay'"
+        );
+    }
+
+    /// A failed transfer must not look finished: the total stays, the percentage is
+    /// partial, and no ETA is offered once the outcome is decided.
+    #[test]
+    fn a_failed_transfer_reports_a_partial_percentage() {
+        let progress = TransferProgress::default();
+        progress.start();
+        progress.set_total(1_000);
+        progress.add_bytes(400); // protocol bytes, no rsync line yet
+        let live = progress.snapshot();
+        assert_eq!(live["bytes_done"], 400);
+        assert_eq!(live["total_bytes"], 1_000);
+        assert_eq!(live["progress_pct"], 40.0);
+        assert!(live.get("eta_seconds").is_some());
+
+        progress.finish(); // the transfer ended - unsuccessfully
+        let final_state = progress.snapshot();
+        assert_eq!(final_state["bytes_done"], 400, "the amount actually moved");
+        assert_eq!(final_state["total_bytes"], 1_000, "the real total is kept");
+        assert_eq!(final_state["progress_pct"], 40.0, "not 100%");
+        assert_eq!(
+            final_state["eta_seconds"],
+            Value::Null,
+            "a finished transfer clears the ETA it reported while running"
+        );
+    }
+
+    /// rsync's own accounting wins over protocol bytes: compression and resume make the
+    /// protocol count a poor proxy for file progress.
+    #[test]
+    fn logical_progress_wins_over_protocol_bytes() {
+        let progress = TransferProgress::default();
+        progress.set_total(10_000);
+        progress.add_bytes(120); // compressed/partial protocol traffic
+        progress.observe("   5,000  50%  12.34MB/s  0:00:05");
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot["bytes_done"], 5_000);
+        assert_eq!(snapshot["total_bytes"], 10_000, "the known size wins");
+        assert_eq!(snapshot["progress_pct"], 50.0);
+        assert_eq!(snapshot["progress_source"], "rsync");
+        assert_eq!(snapshot["protocol_bytes"], 120);
+    }
+
+    /// Once the outcome is decided, a late rsync line must not rewrite it.
+    #[test]
+    fn updates_after_finish_are_ignored() {
+        let progress = TransferProgress::default();
+        progress.set_total(1_000);
+        progress.add_bytes(300);
+        progress.finish();
+        progress.observe("     900  90%  1MB/s  0:00:01");
+        progress.add_bytes(700);
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot["bytes_done"], 300);
+        assert_eq!(snapshot["progress_pct"], 30.0);
+    }
 
     /// A slow but progressing transfer must never trip the idle limit.
     #[test]

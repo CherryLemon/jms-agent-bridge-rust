@@ -94,11 +94,20 @@ fn a_full_stdout_pipe_does_not_truncate_the_relay() {
     assert!(text.contains("asset.example"), "request was {text}");
 
     let pid = child.id();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_for_watchdog = done.clone();
     let watchdog = std::thread::spawn(move || {
         // Hard deadline: if the relay ever deadlocks, fail with a clear signal instead of
         // hanging the suite. `slow_consumer` cannot check its deadline while blocked in
-        // `read`, so the kill has to come from outside.
-        std::thread::sleep(Duration::from_secs(90));
+        // `read`, so the kill has to come from outside. The flag ends the thread early so
+        // a passing test does not leave a sleeper that signals a recycled PID.
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while Instant::now() < deadline {
+            if done_for_watchdog.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
         }
@@ -123,7 +132,8 @@ fn a_full_stdout_pipe_does_not_truncate_the_relay() {
     let sent_ok = writer.join().expect("writer thread");
     let status = child.wait().expect("relay exits");
     // The transfer finished long before the watchdog would fire.
-    let _ = watchdog;
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = watchdog.join();
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);

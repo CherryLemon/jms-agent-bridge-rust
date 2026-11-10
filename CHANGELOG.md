@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.4.0
+
+Review round after 0.3.9: path handling, progress semantics and teardown edges.
+
+### Fixed
+* **Remote paths keep their spaces.** `-s` (`--protect-args`) is back in the archive
+  flags. Without it rsync shell-escapes the paths it hands to the remote shell, and the
+  relay passes argv straight to `exec "$@"`, so `/tmp/a b.bin` arrived as
+  `/tmp/a\ b.bin` - a download missed the file and an upload could land under the
+  escaped name. Verified end to end with `/tmp/a b.bin` (name and content identical both
+  ways).
+* **A failed or timed-out transfer no longer reports 100%.** The final snapshot only
+  resets the total after a successful run; a cut-short transfer keeps the real total and
+  its partial amount (live: 230 MB of 1 GiB reported as 21%, exit 124,
+  `completion_unknown: true`). `eta_seconds` is cleared when the outcome is decided,
+  because metadata updates merge.
+* **Progress separates file bytes from protocol bytes.** `--info=progress2` numbers drive
+  `bytes_done`/`progress_pct` (`progress_source: "rsync"`); relay traffic is reported as
+  `protocol_bytes` for throughput and backpressure only. They differ as soon as
+  compression, resume or a directory is involved.
+* **The progress projection carries the verdict** (`ok`, `exit_code`,
+  `completion_unknown`, `execution_state`), so a partial percentage is not mistaken for
+  success.
+* **A late progress tick cannot overwrite a verdict.** `annotate_if_running` refuses once
+  the result is finished, and the reporter is aborted and awaited before the final
+  metadata is written.
+* **The reporter is no longer leaked** when the transfer receipt fails to persist: it is
+  spawned only after the receipt is durable.
+* **Teardown keeps its handles.** `quiesce()` aborts and awaits the accept task when it
+  does not stop in time, instead of detaching it; a handshake that ignored the stop flag
+  can no longer create a channel after the transfer was declared finished.
+* **Idle deadline for blocking I/O.** `--blocking-io` means a stalled peer blocks inside
+  the syscall, so the owner now watches the byte counters and ends the transfer after
+  600 s without progress, reported the same way as a timeout.
+* **`terminate` no longer parks a runtime worker** for up to 15 s: it polls the child
+  with async sleeps.
+* **The `-e` wrapper path is quoted for rsync**, which re-splits that value - a `TMPDIR`
+  with a space no longer breaks every transfer.
+* **`--info=progress2` is only passed to rsync 3.1+**; a 3.0.x binary passes the
+  `-s --version` check but rejects the flag.
+* **Config ranges are checked before narrowing to `u32`**, so a value that would only
+  fit after truncation (e.g. `4297064448`) is rejected instead of silently accepted.
+* **The relay test watchdog is joinable**: a passing run ends the thread instead of
+  leaving a 90 s sleeper that could signal a recycled PID.
+
+
 ## 0.3.9
 
 Transfers report their own progress, and the transfer path is tunable.

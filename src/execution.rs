@@ -1488,29 +1488,6 @@ closed and must not be reused. Inspect before rerunning."
             // Known size: progress and ETA are available from the first byte.
             progress_handle.set_total(total);
         }
-        // Publish live byte counts while the transfer runs, so a caller can watch
-        // progress through `meta` instead of waiting for the final verdict.
-        let progress_watch = {
-            let store = self.store.clone();
-            let id = result_id.clone();
-            let handle = progress_handle.clone();
-            tokio::spawn(async move {
-                let mut last = 0u64;
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    let snapshot = handle.snapshot();
-                    let done = handle.bytes_done();
-                    if done == 0 || done == last {
-                        continue;
-                    }
-                    last = done;
-                    if let Err(error) = store.annotate(&id, snapshot) {
-                        tracing::debug!(error = error.message(), "progress annotate failed");
-                        return;
-                    }
-                }
-            })
-        };
         let sent_flag = Arc::new(AtomicBool::new(false));
         let mut lease = crate::storage::results::ResultLease::new(
             self.store.clone(),
@@ -1536,6 +1513,30 @@ closed and must not be reused. Inspect before rerunning."
                 return Err(error);
             }
         }
+        // Publish live byte counts while the transfer runs, so a caller can watch
+        // progress through `meta` instead of waiting for the final verdict.
+        let progress_watch = {
+            let store = self.store.clone();
+            let id = result_id.clone();
+            let handle = progress_handle.clone();
+            tokio::spawn(async move {
+                let mut last = 0u64;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let snapshot = handle.snapshot();
+                    let done = handle.bytes_done();
+                    if done == 0 || done == last {
+                        continue;
+                    }
+                    last = done;
+                    // Never overwrite a finished result with a stale tick.
+                    if let Err(error) = store.annotate_if_running(&id, snapshot) {
+                        tracing::debug!(error = error.message(), "progress annotate failed");
+                        return;
+                    }
+                }
+            })
+        };
         let out_path = self.store.path(&result_id, "stdout")?;
         let err_path = self.store.path(&result_id, "stderr")?;
         let started = Instant::now();
@@ -1602,8 +1603,13 @@ closed and must not be reused. Inspect before rerunning."
             json!(round(started.elapsed().as_secs_f64(), 3)),
         );
         values.insert("session_state".into(), Value::Null);
+        // Stop the reporter and wait for it before writing the final metadata: a late
+        // annotation must not race the verdict.
         progress_watch.abort();
-        progress_handle.set_total(progress_handle.bytes_done());
+        let _ = progress_watch.await;
+        progress_handle.finish();
+        // Only a completed transfer may report a full percentage; a failure keeps the
+        // original total so `bytes_done` reads as "this much of the file arrived".
         for (key, value) in progress_handle.snapshot() {
             values.insert(key, value);
         }
