@@ -346,6 +346,11 @@ impl SshPool {
             .unwrap_or(0)
     }
 
+    /// Transfer knobs that come from the service settings.
+    pub fn rsync_compress(&self) -> bool {
+        self.settings.rsync_compress
+    }
+
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::SeqCst)
     }
@@ -453,6 +458,10 @@ impl SshPool {
             keepalive_max: 3,
             inactivity_timeout: None,
             nodelay: true,
+            // Flow control is the difference between waiting for the gateway and
+            // streaming: both are configurable for that reason.
+            window_size: self.settings.ssh_window_size,
+            maximum_packet_size: self.settings.ssh_max_packet_size,
             ..Default::default()
         });
         // Resolve before the handshake so an unverifiable connection is refused

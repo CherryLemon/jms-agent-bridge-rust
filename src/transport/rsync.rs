@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex as AsyncMutex;
@@ -47,6 +47,14 @@ impl Direction {
 /// One private socket per transfer; removed even when the transfer fails.
 pub struct RsyncRelay {
     pub socket: PathBuf,
+    /// A single-word remote-shell command.
+    ///
+    /// rsync needs the whole `-e` command as one token here. A multi-word command makes
+    /// rsync materialise a helper file next to this binary (`<dir>/.ps__<hash>`), which
+    /// it then reaps - a reaped helper turns every later transfer into
+    /// "Failed to exec ... (deleted)". A wrapper script in the private temp directory
+    /// avoids that path entirely and costs one small file instead of a 25 MB copy.
+    pub wrapper: PathBuf,
     directory: PathBuf,
 }
 
@@ -61,7 +69,12 @@ impl RsyncRelay {
             let _ = std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700));
         }
         let socket = directory.join("stream.sock");
-        Ok(Self { socket, directory })
+        let wrapper = directory.join("relay");
+        Ok(Self {
+            socket,
+            wrapper,
+            directory,
+        })
     }
 }
 
@@ -229,6 +242,105 @@ pub struct TransferOutcome {
 
 /// Run one rsync transfer through the pooled connection.
 #[allow(clippy::too_many_arguments)]
+/// Live byte progress of one transfer, filled in from rsync's `--info=progress2`.
+#[derive(Default)]
+pub struct TransferProgress {
+    bytes_done: std::sync::atomic::AtomicU64,
+    total_bytes: std::sync::atomic::AtomicU64,
+    started: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl TransferProgress {
+    pub fn start(&self) {
+        if let Ok(mut slot) = self.started.lock() {
+            if slot.is_none() {
+                *slot = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Count bytes that actually crossed the relay, so progress never depends on rsync
+    /// emitting a status line.
+    pub fn add_bytes(&self, count: usize) {
+        self.bytes_done.fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub fn set_total(&self, total: u64) {
+        if total > 0 {
+            self.total_bytes.store(total, Ordering::Relaxed);
+        }
+    }
+
+    pub fn bytes_done(&self) -> u64 {
+        self.bytes_done.load(Ordering::Relaxed)
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// A snapshot for a status response: bytes, total, percentage and rate.
+    pub fn snapshot(&self) -> Map<String, Value> {
+        let done = self.bytes_done();
+        let total = self.total_bytes();
+        let elapsed = self
+            .started
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .map(|started| started.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let mut out = Map::new();
+        out.insert("bytes_done".into(), Value::from(done));
+        if total > 0 {
+            out.insert("total_bytes".into(), Value::from(total));
+            out.insert(
+                "progress_pct".into(),
+                json!(((done as f64 / total as f64) * 100.0).min(100.0).round()),
+            );
+        }
+        if elapsed > 0.0 {
+            let rate = done as f64 / elapsed;
+            out.insert("rate_bps".into(), json!(rate.round()));
+            if total > done {
+                out.insert(
+                    "eta_seconds".into(),
+                    json!(((total - done) as f64 / rate.max(1.0)).round()),
+                );
+            }
+        }
+        out
+    }
+
+    /// Parse one `--info=progress2` status line.
+    ///
+    /// The human-readable form is `  1,234,567  45%  12.34MB/s  0:00:05`, so the bytes
+    /// and the percentage are enough to derive the total.
+    pub(crate) fn observe(&self, line: &str) {
+        let mut tokens = line.split_whitespace();
+        let Some(first) = tokens.next() else { return };
+        let digits: String = first.chars().filter(|c| c.is_ascii_digit()).collect();
+        if first.chars().any(|c| c.is_ascii_alphabetic()) || digits.is_empty() {
+            return;
+        }
+        let Ok(done) = digits.parse::<u64>() else {
+            return;
+        };
+        if done == 0 {
+            return;
+        }
+        self.bytes_done.store(done, Ordering::Relaxed);
+        if let Some(percent) = tokens.next().and_then(|token| token.strip_suffix('%')) {
+            if let Ok(percent) = percent.parse::<f64>() {
+                if percent > 0.0 {
+                    let total = (done as f64 * 100.0 / percent).round() as u64;
+                    self.total_bytes.store(total.max(done), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
 /// Where an interrupted transfer keeps its data so a retry can resume.
 pub(crate) const PARTIAL_DIR: &str = ".jms-partial";
 
@@ -317,6 +429,8 @@ pub async fn transfer(
     out_path: &Path,
     err_path: &Path,
     evidence: Arc<std::sync::atomic::AtomicBool>,
+    compress: bool,
+    progress: Arc<TransferProgress>,
 ) -> BridgeResult<TransferOutcome> {
     if let Some(container) = container {
         if container.is_empty()
@@ -348,6 +462,7 @@ pub async fn transfer(
         .ok_or_else(|| BridgeError::config("target needs a permitted REST asset ID"))?;
     // The caller's evidence flag: what the result guard reads if this future goes away.
     let sent = evidence;
+    progress.start();
     let stop = Arc::new(AtomicBool::new(false));
     let pumps: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -360,6 +475,7 @@ pub async fn transfer(
         let stop = stop.clone();
         let err_path = err_path.to_path_buf();
         let pumps = pumps.clone();
+        let progress = progress.clone();
         tokio::spawn(async move {
             while !stop.load(Ordering::SeqCst) {
                 let accept =
@@ -377,6 +493,7 @@ pub async fn transfer(
                     &sent,
                     &pumps,
                     &stop,
+                    &progress,
                 )
                 .await
                 {
@@ -398,22 +515,33 @@ pub async fn transfer(
         accept: Some(accept),
         pumps: pumps.clone(),
     };
+    // The wrapper keeps the remote-shell command a single token (see `RsyncRelay`).
+    let binary_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("jms-bridge"));
+    let wrapper_body = format!(
+        "#!/bin/sh\nexec {} rsync-relay {} \"$@\"\n",
+        crate::fsprobe::shlex_quote(&binary_path.to_string_lossy()),
+        crate::fsprobe::shlex_quote(&relay.socket.to_string_lossy())
+    );
+    std::fs::write(&relay.wrapper, wrapper_body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&relay.wrapper, std::fs::Permissions::from_mode(0o700))?;
+    }
     let mut command = std::process::Command::new(binary);
-    command.arg("-azs");
+    // `-z` trades CPU for bytes; the flag is configurable because incompressible data
+    // pays the CPU cost without the benefit.
+    //
+    // No `-s`: the remote command is executed by the relay with `exec "$@"`, not through
+    // a remote shell, so argument protection buys nothing - and rsync implements it by
+    // copying this binary to a `.ps__*` file next to it, which costs 25 MB per transfer
+    // and fails when that copy is reaped too early.
+    command.arg(if compress { "-az" } else { "-a" });
     // The relay writes to stdout synchronously. Without this rsync starts a custom
     // remote-shell with a *non-blocking* stdout, and a full pipe surfaces as
     // EAGAIN mid-transfer - which truncates large downloads while small ones pass.
     command.arg("--blocking-io");
-    let relay_cmd = format!(
-        "{} rsync-relay {}",
-        crate::fsprobe::shlex_quote(
-            &std::env::current_exe()
-                .unwrap_or_else(|_| PathBuf::from("jms-bridge"))
-                .to_string_lossy()
-        ),
-        crate::fsprobe::shlex_quote(&relay.socket.to_string_lossy())
-    );
-    command.arg("-e").arg(relay_cmd);
+    command.arg("-e").arg(&relay.wrapper);
     // Resumable partials: rsync keeps an interrupted file in this directory, separate
     // from the destination name, so a retry can reuse it while `--ignore-existing`
     // still protects an already complete file.
@@ -422,6 +550,8 @@ pub async fn transfer(
         command.arg("--ignore-existing");
     }
     command.arg("--itemize-changes");
+    // A status line rsync rewrites in place; `TransferProgress` parses it.
+    command.arg("--info=progress2");
     if delete {
         command.arg("--delete");
     }
@@ -439,15 +569,54 @@ pub async fn transfer(
         }
     }
     let out = std::fs::File::create(out_path)?;
+    // stderr is piped so the `--info=progress2` lines can be parsed while the transfer
+    // runs; the same bytes are appended to the result's stderr file, so nothing is lost.
     let err = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(err_path)?;
-    command.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+    command.stdout(Stdio::from(out)).stderr(Stdio::piped());
     command.stdin(Stdio::null());
     let mut child = command
         .spawn()
         .map_err(|error| BridgeError::config(format!("cannot start local rsync: {error}")))?;
+    if let Some(stderr) = child.stderr.take() {
+        // A blocking pipe read belongs on the blocking pool: the child is a std process.
+        let progress_for_log = progress.clone();
+        let watcher = tokio::task::spawn_blocking(move || {
+            let mut err = err;
+            let mut stderr = stderr;
+            let mut line: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let _ = err.write_all(&chunk[..count]);
+                        let _ = err.flush();
+                        for byte in &chunk[..count] {
+                            if *byte == b'\r' || *byte == b'\n' {
+                                if !line.is_empty() {
+                                    progress_for_log.observe(&String::from_utf8_lossy(&line));
+                                    line.clear();
+                                }
+                            } else if line.len() < 4096 {
+                                line.push(*byte);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            if !line.is_empty() {
+                progress_for_log.observe(&String::from_utf8_lossy(&line));
+            }
+        });
+        if let Ok(mut handles) = pumps.lock() {
+            handles.push(watcher);
+        }
+    }
     let waited = tokio::time::timeout(Duration::from_secs_f64(timeout.max(0.5)), async {
         loop {
             match child.try_wait() {
@@ -503,6 +672,7 @@ async fn serve_stream(
     sent: &Arc<AtomicBool>,
     pumps: &Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     stop_flag: &Arc<AtomicBool>,
+    progress: &Arc<TransferProgress>,
 ) -> BridgeResult<()> {
     let mut line = Vec::new();
     let mut buffer = [0u8; 1];
@@ -604,6 +774,8 @@ async fn serve_stream(
     // stops.
     let (socket_read, socket_write) = stream.into_split();
     let uplink_stop = stop_flag.clone();
+    let progress_up = progress.clone();
+    let progress_down = progress.clone();
     let uplink = tokio::spawn(async move {
         let mut socket_read = socket_read;
         let channel_writer = writer;
@@ -623,6 +795,7 @@ async fn serve_stream(
                         tracing::debug!(error = error.message(), "rsync socket->channel failed");
                         return;
                     }
+                    progress_up.add_bytes(count);
                 }
                 Err(error) => {
                     tracing::debug!(%error, "rsync socket read failed");
@@ -638,9 +811,11 @@ async fn serve_stream(
         while channel_open {
             match reader.recv().await {
                 Some(ShellEvent::Data(data)) => {
+                    let count = data.len();
                     if socket_write.write_all(&data).await.is_err() {
                         return;
                     }
+                    progress_down.add_bytes(count);
                 }
                 Some(ShellEvent::ExtData(data)) => {
                     if let Ok(mut file) = std::fs::OpenOptions::new()

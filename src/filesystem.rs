@@ -493,6 +493,29 @@ impl Filesystem {
         }
     }
 
+    /// Size of one remote file, or `None` when it cannot be determined cheaply.
+    async fn remote_size(
+        &self,
+        host: &Host,
+        remote: &str,
+        container: Option<&str>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
+    ) -> Option<u64> {
+        let script = format!(
+            "stat -c %s -- {} 2>/dev/null || true",
+            crate::fsprobe::shlex_quote(remote)
+        );
+        let meta = self
+            .workers
+            .execute(host, &script, 15.0, container, progress)
+            .await
+            .ok()?;
+        let result_id = meta.get("result_id")?.as_str()?.to_string();
+        let path = self.store.path(&result_id, "stdout").ok()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        text.trim().parse::<u64>().ok().filter(|size| *size > 0)
+    }
+
     pub async fn execute(
         &self,
         arguments: Map<String, Value>,
@@ -527,6 +550,14 @@ impl Filesystem {
             let local = options.local_path.clone().unwrap_or_default();
             let remote = options.path.clone();
             let timeout = options.timeout.unwrap_or(900) as f64;
+            // A known size makes progress and ETA available from the first byte: the
+            // local file for an upload, one `stat` for a download.
+            let expected_total = if action == "upload" {
+                std::fs::metadata(&local).ok().map(|meta| meta.len())
+            } else {
+                self.remote_size(&host, &remote, options.container.as_deref(), progress)
+                    .await
+            };
             let outcome = self
                 .runner
                 .rsync(
@@ -540,6 +571,7 @@ impl Filesystem {
                     options.container.as_deref(),
                     options.overwrite,
                     progress,
+                    expected_total,
                 )
                 .await?;
             if let Some(progress) = progress {
@@ -580,6 +612,17 @@ impl Filesystem {
             row.insert("action".into(), Value::from(action));
             row.insert("local_path".into(), Value::from(local));
             row.insert("path".into(), Value::from(remote));
+            // The transfer's own byte accounting, so a completed call still says how much
+            // moved and how fast.
+            let mut progress_row = Map::new();
+            for key in ["bytes_done", "total_bytes", "progress_pct", "rate_bps"] {
+                if let Some(value) = meta.get(key) {
+                    progress_row.insert(key.to_string(), value.clone());
+                }
+            }
+            if !progress_row.is_empty() {
+                row.insert("progress".into(), Value::Object(progress_row));
+            }
             row.insert("overwrite".into(), Value::Bool(options.overwrite));
             row.insert(
                 "existing_files".into(),

@@ -1456,6 +1456,7 @@ closed and must not be reused. Inspect before rerunning."
         container: Option<&str>,
         overwrite: bool,
         progress: Option<&dyn ProgressSink>,
+        expected_total: Option<u64>,
     ) -> BridgeResult<ExecOutcome> {
         let direction = match direction {
             "push" => crate::transport::rsync::Direction::Push,
@@ -1482,6 +1483,34 @@ closed and must not be reused. Inspect before rerunning."
             metadata.insert("container".into(), Value::from(container));
         }
         let result_id = self.store.create(metadata)?;
+        let progress_handle = Arc::new(crate::transport::rsync::TransferProgress::default());
+        if let Some(total) = expected_total {
+            // Known size: progress and ETA are available from the first byte.
+            progress_handle.set_total(total);
+        }
+        // Publish live byte counts while the transfer runs, so a caller can watch
+        // progress through `meta` instead of waiting for the final verdict.
+        let progress_watch = {
+            let store = self.store.clone();
+            let id = result_id.clone();
+            let handle = progress_handle.clone();
+            tokio::spawn(async move {
+                let mut last = 0u64;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let snapshot = handle.snapshot();
+                    let done = handle.bytes_done();
+                    if done == 0 || done == last {
+                        continue;
+                    }
+                    last = done;
+                    if let Err(error) = store.annotate(&id, snapshot) {
+                        tracing::debug!(error = error.message(), "progress annotate failed");
+                        return;
+                    }
+                }
+            })
+        };
         let sent_flag = Arc::new(AtomicBool::new(false));
         let mut lease = crate::storage::results::ResultLease::new(
             self.store.clone(),
@@ -1510,6 +1539,7 @@ closed and must not be reused. Inspect before rerunning."
         let out_path = self.store.path(&result_id, "stdout")?;
         let err_path = self.store.path(&result_id, "stderr")?;
         let started = Instant::now();
+        let progress_handle_for_transfer = progress_handle.clone();
         let transfer = crate::transport::rsync::transfer(
             &self.pool,
             &binary,
@@ -1525,6 +1555,8 @@ closed and must not be reused. Inspect before rerunning."
             &out_path,
             &err_path,
             sent_flag.clone(),
+            self.pool.rsync_compress(),
+            progress_handle_for_transfer,
         )
         .await;
         let mut values = Map::new();
@@ -1570,6 +1602,11 @@ closed and must not be reused. Inspect before rerunning."
             json!(round(started.elapsed().as_secs_f64(), 3)),
         );
         values.insert("session_state".into(), Value::Null);
+        progress_watch.abort();
+        progress_handle.set_total(progress_handle.bytes_done());
+        for (key, value) in progress_handle.snapshot() {
+            values.insert(key, value);
+        }
         let meta = lease.complete(values)?;
         Ok(self.outcome_from_meta(host, meta, true))
     }

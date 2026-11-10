@@ -1209,7 +1209,7 @@ require allow_dangerous=true",
             .unwrap_or("summary");
         if !matches!(
             section,
-            "summary" | "all" | "timing" | "transport" | "request" | "policy"
+            "summary" | "all" | "timing" | "transport" | "progress" | "request" | "policy"
         ) {
             return Err(BridgeError::invalid("unknown metadata section"));
         }
@@ -1290,6 +1290,21 @@ require allow_dangerous=true",
                 "elapsed_seconds",
                 "timing",
                 "connection_timing",
+            ],
+            "progress" => &[
+                "result_id",
+                "kind",
+                "operation",
+                "host",
+                "status",
+                "bytes_done",
+                "total_bytes",
+                "progress_pct",
+                "rate_bps",
+                "eta_seconds",
+                "created_at",
+                "finished_at",
+                "expires_at",
             ],
             "transport" => &[
                 "result_id",

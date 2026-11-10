@@ -290,6 +290,8 @@ fn compact_inner(
             // A staged response must stay readable as such: without these keys the
             // caller sees only a result id and no hint that the payload moved to disk.
             "staged",
+            // Byte accounting of a transfer, so a completed call reports how much moved.
+            "progress",
             "operation",
             "bytes",
             "preview",

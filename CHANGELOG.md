@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.9
+
+Transfers report their own progress, and the transfer path is tunable.
+
+### Progress
+* `fs upload`/`fs download` now count the bytes that actually cross the relay and
+  return them as `progress: {bytes_done, total_bytes, progress_pct, rate_bps}`.
+* While a transfer runs, `meta(ref="result:<id>", section="progress")` reports live
+  numbers, renewed about once a second. The result id is available from
+  `request_status(<request_id>)` (the row shows `result_status: running`), so a caller
+  can watch a long transfer without holding the original call open.
+* `total_bytes` comes from the local file for an upload and from one `stat` for a
+  download, so the percentage and ETA are known from the first byte; when the size
+  cannot be determined the fields are simply omitted.
+* rsync's `--info=progress2` output is now captured (stderr is piped and the same bytes
+  are still appended to the result's stderr file), which feeds the same counters.
+
+### Robustness
+* The remote shell is a single-token wrapper script in the transfer's private temp
+  directory. A multi-word `-e` command made rsync materialise a helper next to this
+  binary (`<dir>/.ps__<hash>`) that it later reaps; once reaped, every following
+  transfer failed with "Failed to exec ... (deleted)" (rsync exit 14). The wrapper also
+  removes a 25 MB copy per transfer.
+* `-s` (protect-args) is gone for the same reason: the remote command is executed by the
+  relay with `exec "$@"`, never through a remote shell, so it protected nothing.
+
+### Tuning
+* `bridge.ssh_window_size` (default 2 MiB) and `bridge.ssh_max_packet_size` (32 KiB)
+  are handed to russh, and `bridge.rsync_compress` (default true) switches `rsync -z`.
+  These are the two knobs the throughput work needs; both are validated on load.
+
+
 ## 0.3.8
 
 Independent pumps, resumable transfers, and a shutdown rsync can survive.

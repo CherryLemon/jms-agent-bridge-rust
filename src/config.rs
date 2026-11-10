@@ -93,6 +93,13 @@ pub struct BridgeSettings {
     pub inspection_reserved: usize,
     pub queue_timeout: f64,
     pub queue_limit: usize,
+    /// SSH channel receive window handed to russh; large windows keep more data in
+    /// flight over a high-latency gateway.
+    pub ssh_window_size: u32,
+    /// Largest SSH packet the client accepts.
+    pub ssh_max_packet_size: u32,
+    /// rsync `-z`: compression is a CPU/traffic trade, so it is configurable.
+    pub rsync_compress: bool,
     pub inspection_queue_limit: usize,
     pub result_ttl_seconds: f64,
     pub result_cleanup_interval_seconds: f64,
@@ -113,6 +120,9 @@ impl Default for BridgeSettings {
             inspection_reserved: 0,
             queue_timeout: 60.0,
             queue_limit: 64,
+            ssh_window_size: 2_097_152,
+            ssh_max_packet_size: 32_768,
+            rsync_compress: true,
             inspection_queue_limit: 16,
             result_ttl_seconds: 604_800.0,
             result_cleanup_interval_seconds: 3600.0,
@@ -427,6 +437,27 @@ pub fn load_settings(explicit: Option<&Path>) -> BridgeResult<BridgeSettings> {
         }
     }
     let queue_limit = nonnegative(&bridge, "queue_limit", 64)?;
+    let ssh_window_size = nonnegative(&bridge, "ssh_window_size", 2_097_152)? as u32;
+    if !(32_768..=64 * 1_048_576).contains(&ssh_window_size) {
+        return Err(BridgeError::config(format!(
+            "bridge.ssh_window_size must be between 32768 and 67108864, got {ssh_window_size}"
+        )));
+    }
+    let ssh_max_packet_size = nonnegative(&bridge, "ssh_max_packet_size", 32_768)? as u32;
+    if !(4_096..=1_048_576).contains(&ssh_max_packet_size) {
+        return Err(BridgeError::config(format!(
+            "bridge.ssh_max_packet_size must be between 4096 and 1048576, got {ssh_max_packet_size}"
+        )));
+    }
+    let rsync_compress = match bridge.get("rsync_compress") {
+        None => true,
+        Some(toml::Value::Boolean(value)) => *value,
+        Some(_) => {
+            return Err(BridgeError::config(
+                "bridge.rsync_compress must be true or false",
+            ))
+        }
+    };
     let inspection_queue_limit = nonnegative(&bridge, "inspection_queue_limit", 16)?;
     let queue_timeout = positive_float(&bridge, "queue_timeout", 60.0)?;
     let result_ttl_seconds = positive_float(&bridge, "result_ttl_seconds", 604_800.0)?;
@@ -482,6 +513,9 @@ pub fn load_settings(explicit: Option<&Path>) -> BridgeResult<BridgeSettings> {
         inspection_reserved,
         queue_timeout,
         queue_limit,
+        ssh_window_size,
+        ssh_max_packet_size,
+        rsync_compress,
         inspection_queue_limit,
         result_ttl_seconds,
         result_cleanup_interval_seconds,
@@ -734,5 +768,33 @@ mod tests {
         assert_eq!(settings.gateway_host(&cfg).unwrap(), "bastion.example");
         settings.ssh_host = Some("10.0.0.5".into());
         assert_eq!(settings.gateway_host(&cfg).unwrap(), "10.0.0.5");
+    }
+
+    #[test]
+    fn transfer_tuning_defaults_and_overrides() {
+        let write = |body: &str| {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("config.toml");
+            std::fs::write(&path, body).unwrap();
+            let result = load_settings(Some(&path));
+            (directory, result)
+        };
+
+        let (_guard, settings) = write("[bastion]\nurl = \"https://x\"\n");
+        let settings = settings.unwrap();
+        assert_eq!(settings.ssh_window_size, 2_097_152);
+        assert_eq!(settings.ssh_max_packet_size, 32_768);
+        assert!(settings.rsync_compress);
+
+        let (_guard, tuned) = write(
+            "[bastion]\nurl = \"https://x\"\n[bridge]\nssh_window_size = 8388608\nrsync_compress = false\n",
+        );
+        let tuned = tuned.unwrap();
+        assert_eq!(tuned.ssh_window_size, 8_388_608);
+        assert!(!tuned.rsync_compress);
+
+        let (_guard, bad) =
+            write("[bastion]\nurl = \"https://x\"\n[bridge]\nssh_window_size = 1024\n");
+        assert!(bad.is_err(), "an unusably small window must be rejected");
     }
 }

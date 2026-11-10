@@ -30,6 +30,9 @@ Root cause: rsync gives a custom remote-shell a non-blocking stdout unless
 | 47 | 256 MiB download interrupted at 3 s (`timeout: 3`) | exit 124, no final file, `.jms-partial/` kept |
 | 48 | Retry of 47 with `overwrite=false` | 5.0 s (11.9 s from scratch), SHA-256 match, partial cleaned |
 | 49 | `overwrite=false` onto an existing complete file | file preserved verbatim, transfer reports ok |
+| 50 | 1 GiB upload / download | 12.8 s (80.3 MB/s) / 12 s, SHA-256 match both ways |
+| 51 | live progress during a 1 GiB download | 39 samples via `meta(section="progress")`, 2%→100%, total from the pre-stat |
+| 52 | `fs download` response with progress | `{bytes_done, total_bytes, progress_pct, rate_bps}` present |
 
 Regression tests for the fifth review round (evidence monotonicity, result ownership):
 `a_late_annotation_failure_keeps_the_completed_verdict`,

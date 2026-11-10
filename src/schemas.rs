@@ -267,7 +267,10 @@ responses: read_result(stream='result').",
                     "ref": {"type": "string", "default": "service",
                             "description": "service, result:<result_id>, or request:<request_id>."},
                     "section": {"type": "string",
-                                "enum": ["summary", "all", "timing", "transport", "request", "policy"],
+                                "enum": [
+                                    "summary", "all", "timing", "transport", "progress",
+                                    "request", "policy",
+                                ],
                                 "default": "summary"},
                 },
             }),
@@ -350,20 +353,26 @@ original ID after reply loss; reusing it never replays.",
         },
         "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false},
     }));
-    map.insert("result_metadata".to_string(), json!({
-        "name": "result_metadata",
-        "description": "Read saved metadata without running a command.",
-        "inputSchema": {
-            "type": "object", "additionalProperties": false,
-            "required": ["ref"],
-            "properties": {
-                "ref": {"type": "string"},
-                "section": {"type": "string",
-                            "enum": ["summary", "all", "timing", "transport", "request", "policy"]},
+    map.insert(
+        "result_metadata".to_string(),
+        json!({
+            "name": "result_metadata",
+            "description": "Read saved metadata without running a command.",
+            "inputSchema": {
+                "type": "object", "additionalProperties": false,
+                "required": ["ref"],
+                "properties": {
+                    "ref": {"type": "string"},
+                    "section": {"type": "string",
+                                "enum": [
+                                    "summary", "all", "timing", "transport", "progress",
+                                    "request", "policy",
+                                ]},
+                },
             },
-        },
-        "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false},
-    }));
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false},
+        }),
+    );
     map.insert("script_guard_check".to_string(), json!({
         "name": "script_guard_check",
         "description": "Read-only diagnosis of the exact script guard; never executes supplied text.",
