@@ -86,7 +86,20 @@ impl Drop for RsyncRelay {
 
 /// Resolve and validate the local rsync once per resident process.
 pub struct RsyncBinary {
-    validated: AsyncMutex<Option<(PathBuf, u64, u64, u64)>>,
+    validated: AsyncMutex<Option<ResolvedRsync>>,
+}
+
+/// A validated local rsync, together with the capabilities probed for *this* binary.
+///
+/// Capabilities live beside the identity so an rsync replaced under a running service is
+/// re-probed: a global cache would keep the first binary's answer forever.
+#[derive(Clone, Debug)]
+pub struct ResolvedRsync {
+    pub path: PathBuf,
+    pub supports_info: bool,
+    device: u64,
+    inode: u64,
+    size: u64,
 }
 
 impl Default for RsyncBinary {
@@ -98,7 +111,7 @@ impl Default for RsyncBinary {
 }
 
 impl RsyncBinary {
-    pub async fn resolve(&self) -> BridgeResult<PathBuf> {
+    pub async fn resolve(&self) -> BridgeResult<ResolvedRsync> {
         let mut guard = self.validated.lock().await;
         let binary = find_on_path("rsync").ok_or_else(|| {
             BridgeError::config(format!(
@@ -107,9 +120,9 @@ impl RsyncBinary {
         })?;
         let binary = std::fs::canonicalize(&binary).unwrap_or(binary);
         let identity = identity_of(&binary)?;
-        if let Some((cached, device, inode, size)) = guard.as_ref() {
-            if *cached == binary && (*device, *inode, *size) == identity {
-                return Ok(binary);
+        if let Some(cached) = guard.as_ref() {
+            if cached.path == binary && (cached.device, cached.inode, cached.size) == identity {
+                return Ok(cached.clone());
             }
         }
         let output = std::process::Command::new(&binary)
@@ -152,7 +165,6 @@ impl RsyncBinary {
         // check but would reject the flag at transfer time.
         let (major_supported, minor) = parse_version(&combined).unwrap_or((0, 0));
         let supports_info = major_supported > 3 || (major_supported == 3 && minor >= 1);
-        let _ = INFO_SUPPORTED.set(supports_info);
         if major < 3 {
             return Err(BridgeError::config(format!(
                 "Local rsync at {} is older than 3.0 and lacks --protect-args (-s). {INSTALL_HINT} Transfer not started.",
@@ -164,8 +176,15 @@ impl RsyncBinary {
                 "Local rsync changed during its capability check; retry before transferring. Transfer not started.",
             ));
         }
-        *guard = Some((binary.clone(), identity.0, identity.1, identity.2));
-        Ok(binary)
+        let resolved = ResolvedRsync {
+            path: binary.clone(),
+            supports_info,
+            device: identity.0,
+            inode: identity.1,
+            size: identity.2,
+        };
+        *guard = Some(resolved.clone());
+        Ok(resolved)
     }
 }
 
@@ -350,6 +369,10 @@ impl TransferProgress {
     ///
     /// `finished` decides whether a full percentage means "done": the same numbers on a
     /// failed or timed-out transfer are reported as a partial amount, not as 100%.
+    ///
+    /// Without an rsync progress sample the logical amount is *unknown*: protocol bytes
+    /// include file lists, checksums and compression, so using them as a numerator would
+    /// invent a percentage. Only the protocol counters are reported in that case.
     pub fn snapshot(&self) -> Map<String, Value> {
         let done = self.bytes_done();
         let total = self.total_bytes();
@@ -361,23 +384,43 @@ impl TransferProgress {
             .map(|started| started.elapsed().as_secs_f64())
             .unwrap_or(0.0);
         let mut out = Map::new();
-        out.insert("bytes_done".into(), Value::from(done));
+        let logical = self.logical();
+        if logical {
+            out.insert("bytes_done".into(), Value::from(done));
+        }
         if total > 0 {
             out.insert("total_bytes".into(), Value::from(total));
+        }
+        if logical && total > 0 {
             let pct = ((done as f64 / total as f64) * 100.0).min(100.0).round();
             out.insert("progress_pct".into(), json!(pct));
         }
-        if self.logical() {
+        if logical {
             out.insert("progress_source".into(), Value::from("rsync"));
         }
-        out.insert("protocol_bytes".into(), Value::from(self.protocol_bytes()));
+        let protocol = self.protocol_bytes();
+        out.insert("protocol_bytes".into(), Value::from(protocol));
         if elapsed > 0.0 {
-            let rate = done as f64 / elapsed;
-            out.insert("rate_bps".into(), json!(rate.round()));
+            // Rate and ETA describe the same quantity as the percentage, so they only
+            // exist once the logical amount does; protocol throughput is reported alone.
+            if logical {
+                let rate = done as f64 / elapsed;
+                out.insert("rate_bps".into(), json!(rate.round()));
+            }
+            out.insert(
+                "protocol_rate_bps".into(),
+                json!((protocol as f64 / elapsed).round()),
+            );
         }
         // An ETA only makes sense while the transfer is still running; a finished
         // transfer clears it explicitly, because metadata updates are merges.
         let finished = self.finished.load(Ordering::SeqCst);
+        if !logical {
+            if finished {
+                out.insert("eta_seconds".into(), Value::Null);
+            }
+            return out;
+        }
         if !finished && total > done && elapsed > 0.0 {
             let rate = done as f64 / elapsed;
             out.insert(
@@ -433,9 +476,6 @@ pub(crate) const PARTIAL_DIR: &str = ".jms-partial";
 /// Longest a transfer may go without a single byte moving.
 pub(crate) const IDLE_LIMIT_SECS: f64 = 600.0;
 
-/// Whether the local rsync understands `--info=progress2` (3.1.0 and later).
-static INFO_SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
 /// The archive flags. `-s` stays: without it rsync escapes remote paths for a shell it
 /// is not talking to, and the relay would receive the escapes literally.
 fn base_flags(compress: bool) -> &'static str {
@@ -459,7 +499,113 @@ fn quote_remote_shell(path: &Path) -> String {
     {
         return text.into_owned();
     }
-    format!("'{}'", text.replace('\'', r"'\''"))
+    // rsync parses `-e` itself: inside quotes a doubled quote is one quote, and a
+    // backslash is literal. Shell-style `'\''` would leave a trailing backslash in the
+    // path (and a lone quote in the middle makes rsync reject the whole command).
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// Flag a transfer that moved no bytes for `limit`.
+///
+/// `--blocking-io` means a stalled peer blocks inside the syscall, so this is the only
+/// place that can notice a stall: it watches the byte counters instead of the writers.
+async fn watch_idle(
+    progress: &Arc<TransferProgress>,
+    stalled: &Arc<AtomicBool>,
+    stop: &Arc<AtomicBool>,
+    limit: Duration,
+) {
+    let mut seen = progress.protocol_bytes();
+    let mut quiet = 0u32;
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = progress.protocol_bytes();
+        if now != seen {
+            seen = now;
+            quiet = 0;
+            continue;
+        }
+        quiet += 1;
+        if u64::from(quiet) >= limit.as_secs().max(1) {
+            stalled.store(true, Ordering::SeqCst);
+            return;
+        }
+    }
+}
+
+/// Ordered teardown shared by the transfer and its regression tests.
+///
+/// Stop accepting new work, end a child that did not exit on its own, close this
+/// transfer's channel (which also releases a pump stuck in a write), then reap the pumps.
+async fn teardown(owner: &mut TransferOwner, child: &mut std::process::Child, happened: &WaitEnd) {
+    owner.quiesce().await;
+    if !matches!(happened, WaitEnd::Exited(_)) {
+        terminate_off_thread(child).await;
+    }
+    owner.close_channel().await;
+    owner.reap_pumps().await;
+}
+
+/// Wait for the local rsync, and say exactly why the wait ended.
+///
+/// Only an observed exit is `Exited`: a stall or an expired deadline must not be confused
+/// with the child's own exit code, or the teardown would skip termination and report a
+/// completed transfer.
+async fn wait_for_child(
+    child: &mut std::process::Child,
+    stalled: &AtomicBool,
+    timeout: Duration,
+) -> WaitEnd {
+    let waited = tokio::time::timeout(timeout, async {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return WaitEnd::Exited(status.code().unwrap_or(255)),
+                Ok(None) => {}
+                Err(error) => return WaitEnd::WaitError(error),
+            }
+            if stalled.load(Ordering::SeqCst) {
+                return WaitEnd::IdleTimeout;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    match waited {
+        Ok(end) => end,
+        Err(_) => WaitEnd::TotalTimeout,
+    }
+}
+
+/// The verdict a caller sees, derived from why the wait ended.
+fn outcome_of(end: &WaitEnd, sent: bool) -> Option<TransferOutcome> {
+    match end {
+        WaitEnd::Exited(code) => Some(TransferOutcome {
+            exit_code: *code,
+            sent,
+            completed: true,
+            timed_out: false,
+        }),
+        WaitEnd::IdleTimeout | WaitEnd::TotalTimeout => Some(TransferOutcome {
+            exit_code: 124,
+            sent,
+            completed: false,
+            timed_out: true,
+        }),
+        WaitEnd::WaitError(_) => None,
+    }
+}
+
+/// Why the transfer wait ended.
+#[derive(Debug)]
+enum WaitEnd {
+    /// The child really exited on its own.
+    Exited(i32),
+    /// Neither direction moved a byte for the idle limit.
+    IdleTimeout,
+    /// The overall transfer timeout expired.
+    TotalTimeout,
+    /// Waiting for the child failed locally.
+    WaitError(std::io::Error),
 }
 
 /// `terminate` without holding a Tokio worker for up to 15 s.
@@ -494,6 +640,35 @@ struct TransferOwner {
     stop: Arc<AtomicBool>,
     accept: Option<tokio::task::JoinHandle<()>>,
     pumps: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// The SSH channel of this transfer, recorded as soon as it exists.
+    /// (`ChannelHandle` keeps this testable without a live SSH session.)
+    ///
+    /// Aborting a task that holds the writer never sends SSH Close, and a channel opened
+    /// for a handshake that then fails (or a transfer that is cancelled) would otherwise
+    /// be released only when the peer decides to. The owner keeps its own closable handle
+    /// so every exit path ends with an explicit, bounded Close.
+    channel: Arc<std::sync::Mutex<Option<ChannelHandle>>>,
+}
+
+/// The closable end of a transfer channel.
+#[derive(Clone)]
+enum ChannelHandle {
+    Real(Arc<crate::transport::ssh::ChannelWriter>),
+    /// Counts Close calls so the teardown can be tested without an SSH peer.
+    #[cfg(test)]
+    Fake(Arc<std::sync::atomic::AtomicUsize>),
+}
+
+impl ChannelHandle {
+    async fn close(&self) {
+        match self {
+            Self::Real(writer) => writer.close().await,
+            #[cfg(test)]
+            Self::Fake(calls) => {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 impl TransferOwner {
@@ -515,10 +690,18 @@ impl TransferOwner {
         }
     }
 
+    /// Close the transfer's SSH channel, if one was opened, within a bound.
+    async fn close_channel(&self) {
+        let handle = self.channel.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(writer) = handle {
+            let _ = tokio::time::timeout(Duration::from_secs(5), writer.close()).await;
+        }
+    }
+
     /// Abort the forwarding pumps and wait bounded for them to finish.
     ///
-    /// Aborting a task that holds a channel writer does not send SSH Close, so the
-    /// channel is closed explicitly by `serve_stream`'s owner before this runs.
+    /// Aborting a task that holds a channel writer does not send SSH Close, so
+    /// `close_channel` runs first.
     async fn reap_pumps(&self) {
         let handles: Vec<_> = self.pumps.lock().expect("pump lock").drain(..).collect();
         for handle in handles {
@@ -545,6 +728,7 @@ impl Drop for TransferOwner {
 pub async fn transfer(
     pool: &Arc<SshPool>,
     binary: &Path,
+    supports_info: bool,
     host: &Host,
     local: &str,
     remote: &str,
@@ -558,6 +742,7 @@ pub async fn transfer(
     err_path: &Path,
     evidence: Arc<std::sync::atomic::AtomicBool>,
     compress: bool,
+    idle_seconds: u64,
     progress: Arc<TransferProgress>,
 ) -> BridgeResult<TransferOutcome> {
     if let Some(container) = container {
@@ -594,7 +779,10 @@ pub async fn transfer(
     let stop = Arc::new(AtomicBool::new(false));
     let pumps: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    let channel_slot: Arc<std::sync::Mutex<Option<ChannelHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
     let accept = {
+        let channel_slot = channel_slot.clone();
         let pool = pool.clone();
         let host = host.clone();
         let asset_id = asset_id.clone();
@@ -622,6 +810,7 @@ pub async fn transfer(
                     &pumps,
                     &stop,
                     &progress,
+                    &channel_slot,
                 )
                 .await
                 {
@@ -642,6 +831,7 @@ pub async fn transfer(
         stop: stop.clone(),
         accept: Some(accept),
         pumps: pumps.clone(),
+        channel: channel_slot.clone(),
     };
     // The wrapper keeps the remote-shell command a single token (see `RsyncRelay`).
     let binary_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("jms-bridge"));
@@ -679,7 +869,7 @@ pub async fn transfer(
     }
     command.arg("--itemize-changes");
     // A status line rsync rewrites in place; `TransferProgress` parses it.
-    if INFO_SUPPORTED.get().copied().unwrap_or(true) {
+    if supports_info {
         command.arg("--info=progress2");
     }
     if delete {
@@ -787,86 +977,43 @@ pub async fn transfer(
     // Idle watchdog: `--blocking-io` means a stalled peer blocks inside a syscall, so the
     // writer cannot enforce its own deadline. The owner watches the byte counters and
     // ends the transfer when nothing moves.
-    let idle_limit = Duration::from_secs_f64(timeout.max(1.0).min(IDLE_LIMIT_SECS));
+    let idle_limit =
+        Duration::from_secs(idle_seconds.max(1)).min(Duration::from_secs_f64(timeout.max(1.0)));
     let stalled = Arc::new(AtomicBool::new(false));
     let watchdog = {
         let progress = progress.clone();
         let stalled = stalled.clone();
         let stop = stop.clone();
         tokio::spawn(async move {
-            let mut seen = progress.protocol_bytes();
-            let mut quiet = 0u32;
-            while !stop.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let now = progress.protocol_bytes();
-                if now != seen {
-                    seen = now;
-                    quiet = 0;
-                    continue;
-                }
-                quiet += 1;
-                if u64::from(quiet) >= idle_limit.as_secs().max(1) {
-                    stalled.store(true, Ordering::SeqCst);
-                    return;
-                }
-            }
+            watch_idle(&progress, &stalled, &stop, idle_limit).await;
         })
     };
     if let Ok(mut handles) = pumps.lock() {
         handles.push(watchdog);
     }
-    let waited = tokio::time::timeout(Duration::from_secs_f64(timeout.max(0.5)), async {
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Ok::<_, std::io::Error>(status.code().unwrap_or(255)),
-                Ok(None) => {}
-                Err(error) => return Err(error),
-            }
-            if stalled.load(Ordering::SeqCst) {
-                // Report the stall the same way a timeout is reported: the transfer was
-                // cut short, and the remote side may already have part of the file.
-                return Ok::<_, std::io::Error>(124);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+    // Why the wait ended is tracked explicitly. A stalled transfer used to be reported as
+    // `Ok(124)`, which the teardown below read as "the child exited with 124" - it then
+    // skipped termination and recorded a completed transfer.
+    let happened = wait_for_child(
+        &mut child,
+        &stalled,
+        Duration::from_secs_f64(timeout.max(0.5)),
+    )
     .await;
-    let kill_reason = match &waited {
-        Ok(Err(error)) => Some(format!("rsync failed: {error}")),
-        Err(_) => None,
-        Ok(Ok(_)) => None,
+    let kill_reason = match &happened {
+        WaitEnd::WaitError(error) => Some(format!("rsync failed: {error}")),
+        _ => None,
     };
     // Ordered teardown: stop accepting new work, end the child, then reap the pumps and
     // only then read the evidence. Terminating before reaping matters: the stderr and
     // stdout watchers are blocking reads that cannot be aborted early, and they finish
     // exactly when the child's pipes close.
-    owner.quiesce().await;
-    let unfinished = kill_reason.is_some() || !matches!(waited, Ok(Ok(_)));
-    if unfinished {
-        terminate_off_thread(&mut child).await;
-    }
-    owner.reap_pumps().await;
+    teardown(&mut owner, &mut child, &happened).await;
     if let Some(error) = kill_reason {
         return Err(BridgeError::storage(error));
     }
-    let outcome = match waited {
-        Ok(Ok(code)) => TransferOutcome {
-            exit_code: code,
-            sent: sent.load(Ordering::SeqCst),
-            completed: true,
-            timed_out: false,
-        },
-        _ => {
-            // Timeout: the child was already stopped above, after it had the chance to
-            // keep its partial.
-            TransferOutcome {
-                exit_code: 124,
-                sent: sent.load(Ordering::SeqCst),
-                completed: false,
-                timed_out: true,
-            }
-        }
-    };
+    let sent_evidence = sent.load(Ordering::SeqCst);
+    let outcome = outcome_of(&happened, sent_evidence).expect("wait errors return above");
     drop(owner);
     Ok(outcome)
 }
@@ -882,6 +1029,7 @@ async fn serve_stream(
     pumps: &Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     stop_flag: &Arc<AtomicBool>,
     progress: &Arc<TransferProgress>,
+    channel_slot: &Arc<std::sync::Mutex<Option<ChannelHandle>>>,
 ) -> BridgeResult<()> {
     let mut line = Vec::new();
     let mut buffer = [0u8; 1];
@@ -948,6 +1096,12 @@ async fn serve_stream(
     let connection = pool.connection(host).await?;
     let channel = connection.open_shell(&remote_command).await?;
     let (writer, mut reader) = channel.split();
+    let writer = Arc::new(writer);
+    // Recorded before the handshake completes: if READY fails or the transfer is
+    // cancelled, the owner still has the handle it needs to send SSH Close.
+    if let Ok(mut slot) = channel_slot.lock() {
+        *slot = Some(ChannelHandle::Real(writer.clone()));
+    }
     let ready_started = Instant::now();
     let mut ready: Vec<u8> = Vec::new();
     while take_ready(&ready).is_none() {
@@ -1012,8 +1166,9 @@ async fn serve_stream(
                 }
             }
         };
-        // Aborting a task that holds the writer never sends SSH Close, so the channel
-        // is closed explicitly whenever this direction stops on its own.
+        // A hard error in this direction ends the transfer, so the channel is closed now
+        // rather than waiting for the owner; a clean socket EOF keeps the half-close and
+        // lets the download direction finish.
         if forwarded {
             channel_writer.close().await;
         }
@@ -1296,6 +1451,170 @@ pub(crate) fn write_all_blocking(
 mod tests {
     use super::*;
 
+    /// The idle ticker flags a quiet transfer and leaves a moving one alone.
+    #[tokio::test]
+    async fn the_idle_watchdog_flags_a_quiet_transfer_only() {
+        let progress = Arc::new(TransferProgress::default());
+        progress.start();
+        let stalled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        watch_idle(&progress, &stalled, &stop, Duration::from_secs(1)).await;
+        assert!(
+            stalled.load(Ordering::SeqCst),
+            "two seconds of silence with a one-second limit must trip"
+        );
+
+        let progress = Arc::new(TransferProgress::default());
+        progress.start();
+        let stalled = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let feeder = progress.clone();
+        let mover = tokio::spawn(async move {
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                feeder.add_bytes(1024);
+            }
+        });
+        let watcher = {
+            let progress = progress.clone();
+            let stalled = stalled.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                watch_idle(&progress, &stalled, &stop, Duration::from_secs(2)).await
+            })
+        };
+        mover.await.expect("feeder finishes");
+        // Bytes moved on every tick, so the watcher must still be waiting, not flagged.
+        assert!(
+            !stalled.load(Ordering::SeqCst),
+            "a transfer that keeps moving must not trip the idle limit"
+        );
+        stop.store(true, Ordering::SeqCst);
+        watcher.await.expect("watcher exits when stopped");
+    }
+
+    /// A stalled transfer must be terminated and its channel closed - exactly the two
+    /// things the old `Ok(124)` path skipped.
+    #[tokio::test]
+    async fn teardown_terminates_a_stalled_child_and_closes_the_channel() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut owner = TransferOwner {
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: None,
+            pumps: Arc::new(std::sync::Mutex::new(Vec::new())),
+            channel: Arc::new(std::sync::Mutex::new(Some(ChannelHandle::Fake(
+                calls.clone(),
+            )))),
+        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep starts");
+        teardown(&mut owner, &mut child, &WaitEnd::IdleTimeout).await;
+
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "a stalled child must be reaped, not left running"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the channel is closed once"
+        );
+        assert!(
+            owner.channel.lock().expect("slot").is_none(),
+            "the handle is consumed so a second teardown is a no-op"
+        );
+        let _ = child.wait();
+    }
+
+    /// A child that exited on its own is not signalled, but the channel is still closed.
+    #[tokio::test]
+    async fn teardown_leaves_an_exited_child_alone_and_closes_the_channel() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut owner = TransferOwner {
+            stop: Arc::new(AtomicBool::new(false)),
+            accept: None,
+            pumps: Arc::new(std::sync::Mutex::new(Vec::new())),
+            channel: Arc::new(std::sync::Mutex::new(Some(ChannelHandle::Fake(
+                calls.clone(),
+            )))),
+        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep starts");
+        // Pretend the wait already observed an exit: teardown must not signal the child.
+        teardown(&mut owner, &mut child, &WaitEnd::Exited(0)).await;
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "an already-exited child is not signalled"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        child.kill().expect("the test cleans up");
+        let _ = child.wait();
+    }
+
+    /// A stall is not an exit. The old code returned `Ok(124)` from the wait, and the
+    /// teardown then treated it as "the child exited with 124" - no termination, and a
+    /// completed transfer. The child here never exits, so only the stall can end the wait.
+    #[tokio::test]
+    async fn a_stalled_transfer_is_an_idle_timeout_not_an_exit() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep starts");
+        let stalled = AtomicBool::new(true);
+        let ended = wait_for_child(&mut child, &stalled, Duration::from_secs(5)).await;
+        assert!(
+            matches!(ended, WaitEnd::IdleTimeout),
+            "a stall must be reported as an idle timeout, got {ended:?}"
+        );
+        let outcome = outcome_of(&ended, true).expect("idle timeout has a verdict");
+        assert_eq!(outcome.exit_code, 124);
+        assert!(!outcome.completed, "a cut-short transfer is not completed");
+        assert!(outcome.timed_out);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A real exit keeps its own code and is the only path that reports completion.
+    #[tokio::test]
+    async fn a_real_exit_keeps_its_code() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 3")
+            .spawn()
+            .expect("sh starts");
+        let stalled = AtomicBool::new(false);
+        let ended = wait_for_child(&mut child, &stalled, Duration::from_secs(10)).await;
+        let _ = child.wait();
+        assert!(matches!(ended, WaitEnd::Exited(3)), "got {ended:?}");
+        let outcome = outcome_of(&ended, true).expect("an exit has a verdict");
+        assert_eq!(outcome.exit_code, 3);
+        assert!(outcome.completed);
+        assert!(!outcome.timed_out);
+    }
+
+    /// An expired deadline is a timeout even when the child is still alive.
+    #[tokio::test]
+    async fn an_expired_deadline_is_a_timeout() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep starts");
+        let stalled = AtomicBool::new(false);
+        let ended = wait_for_child(&mut child, &stalled, Duration::from_millis(300)).await;
+        assert!(matches!(ended, WaitEnd::TotalTimeout), "got {ended:?}");
+        let outcome = outcome_of(&ended, false).expect("a timeout has a verdict");
+        assert_eq!(outcome.exit_code, 124);
+        assert!(!outcome.completed);
+        assert!(outcome.timed_out);
+        assert!(!outcome.sent, "nothing was sent, so nothing is unknown");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     /// Paths with spaces must reach the relay unescaped: `-s` keeps rsync from shell
     /// quoting them, so the flag belongs in the fixed argument list.
     #[test]
@@ -1304,17 +1623,67 @@ mod tests {
         assert_eq!(base_flags(false), "-as");
     }
 
-    /// The `-e` value is re-split by rsync, so a temp path with a space stays one word.
+    /// rsync splits `-e` with its own parser: inside quotes a doubled quote is one quote
+    /// and a backslash is literal. These are the paths a POSIX shell quoting would break.
     #[test]
     fn the_relay_wrapper_is_quoted_for_rsync() {
-        assert_eq!(
-            quote_remote_shell(Path::new("/tmp/plain/relay")),
-            "/tmp/plain/relay"
-        );
-        assert_eq!(
-            quote_remote_shell(Path::new("/tmp/a b/relay")),
-            "'/tmp/a b/relay'"
-        );
+        for path in [
+            "/tmp/plain/relay",
+            "/tmp/a b/relay",
+            "/tmp/a'b/relay",
+            "/tmp/a'b'c/relay",
+            r"/tmp/a\b/relay",
+        ] {
+            let quoted = quote_remote_shell(Path::new(path));
+            assert_eq!(
+                rsync_split_words(&quoted),
+                vec![path.to_string()],
+                "{path} must survive rsync's own `-e` parsing, got {quoted}"
+            );
+        }
+    }
+
+    /// A minimal port of rsync's `-e` word splitter (main.c): quotes group, a doubled
+    /// quote inside quotes is one quote, and a backslash is an ordinary character.
+    fn rsync_split_words(text: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        let mut started = false;
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                ' ' | '\t' => {
+                    if started {
+                        words.push(current.clone());
+                        current.clear();
+                        started = false;
+                    }
+                }
+                '\'' | '"' => {
+                    let quote = c;
+                    started = true;
+                    while let Some(inner) = chars.next() {
+                        if inner == quote {
+                            if chars.peek() == Some(&quote) {
+                                chars.next();
+                                current.push(quote);
+                                continue;
+                            }
+                            break;
+                        }
+                        current.push(inner);
+                    }
+                }
+                _ => {
+                    started = true;
+                    current.push(c);
+                }
+            }
+        }
+        if started {
+            words.push(current);
+        }
+        words
     }
 
     /// A failed transfer must not look finished: the total stays, the percentage is
@@ -1324,7 +1693,8 @@ mod tests {
         let progress = TransferProgress::default();
         progress.start();
         progress.set_total(1_000);
-        progress.add_bytes(400); // protocol bytes, no rsync line yet
+        progress.add_bytes(400);
+        progress.observe("     400  40%  1MB/s  0:00:01");
         let live = progress.snapshot();
         assert_eq!(live["bytes_done"], 400);
         assert_eq!(live["total_bytes"], 1_000);
@@ -1340,6 +1710,33 @@ mod tests {
             final_state["eta_seconds"],
             Value::Null,
             "a finished transfer clears the ETA it reported while running"
+        );
+    }
+
+    /// Protocol bytes are not file bytes: without an rsync sample the logical amount is
+    /// unknown, so no percentage, rate or ETA may be invented from the protocol traffic.
+    #[test]
+    fn protocol_bytes_alone_do_not_produce_a_percentage() {
+        let progress = TransferProgress::default();
+        progress.start();
+        progress.set_total(1_000);
+        progress.add_bytes(400);
+        let live = progress.snapshot();
+        assert_eq!(live["protocol_bytes"], 400);
+        assert_eq!(
+            live["total_bytes"], 1_000,
+            "the known size is still reported"
+        );
+        assert!(
+            live.get("bytes_done").is_none(),
+            "logical bytes are unknown: {live:?}"
+        );
+        assert!(live.get("progress_pct").is_none(), "no invented percentage");
+        assert!(live.get("eta_seconds").is_none(), "no invented ETA");
+        assert!(live.get("rate_bps").is_none(), "no invented file rate");
+        assert!(
+            live.get("protocol_rate_bps").is_some(),
+            "protocol rate is fine"
         );
     }
 
@@ -1364,7 +1761,7 @@ mod tests {
     fn updates_after_finish_are_ignored() {
         let progress = TransferProgress::default();
         progress.set_total(1_000);
-        progress.add_bytes(300);
+        progress.observe("     300  30%  1MB/s  0:00:01");
         progress.finish();
         progress.observe("     900  90%  1MB/s  0:00:01");
         progress.add_bytes(700);

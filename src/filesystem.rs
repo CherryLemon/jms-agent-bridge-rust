@@ -556,7 +556,13 @@ impl Filesystem {
             // A known size makes progress and ETA available from the first byte: the
             // local file for an upload, one `stat` for a download.
             let expected_total = if action == "upload" {
-                std::fs::metadata(&local).ok().map(|meta| meta.len())
+                // A directory's own length is not what will be transferred, so only a
+                // regular file may provide the denominator; directories use rsync's own
+                // accounting instead.
+                std::fs::metadata(&local)
+                    .ok()
+                    .filter(|meta| meta.is_file())
+                    .map(|meta| meta.len())
             } else {
                 self.remote_size(&host, &remote, options.container.as_deref(), progress)
                     .await

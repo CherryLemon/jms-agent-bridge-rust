@@ -38,6 +38,9 @@ Root cause: rsync gives a custom remote-shell a non-blocking stdout unless
 | 55 | 1 GiB download cut by `timeout: 2` | `ok=false`, exit 124, `completion_unknown=true`, 21% of the real total, `eta_seconds: null` |
 | 56 | live progress from memory during a 1 GiB download | 24 samples, `protocol_bytes` diverges from `bytes_done`, final 100% + SHA match |
 | 57 | directory download (unit-level) | no `total_bytes` from a directory `stat`; rsync's own accounting is used |
+| 58 | idle stall mid-transfer (remote sender frozen, `rsync_idle_seconds = 8`) | returned after 12.6 s: exit 124, `completion_unknown=true`, `execution_state=unknown`, 12% of the real total, local rsync terminated |
+| 59 | teardown with an injected channel handle (unit) | stalled child reaped, channel closed exactly once, handle consumed |
+| 60 | `-e` quoting through a port of rsync's parser (unit) | spaces, quotes and backslashes all round-trip |
 
 Regression tests for the fifth review round (evidence monotonicity, result ownership):
 `a_late_annotation_failure_keeps_the_completed_verdict`,

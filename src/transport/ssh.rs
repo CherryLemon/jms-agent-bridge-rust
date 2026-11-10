@@ -347,6 +347,10 @@ impl SshPool {
     }
 
     /// Transfer knobs that come from the service settings.
+    pub fn rsync_idle_seconds(&self) -> u64 {
+        self.settings.rsync_idle_seconds
+    }
+
     pub fn rsync_compress(&self) -> bool {
         self.settings.rsync_compress
     }

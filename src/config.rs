@@ -98,6 +98,8 @@ pub struct BridgeSettings {
     pub ssh_window_size: u32,
     /// Largest SSH packet the client accepts.
     pub ssh_max_packet_size: u32,
+    /// Longest a transfer may go without a byte moving before it is cut short.
+    pub rsync_idle_seconds: u64,
     /// rsync `-z`: compression is a CPU/traffic trade, so it is configurable.
     pub rsync_compress: bool,
     pub inspection_queue_limit: usize,
@@ -122,6 +124,7 @@ impl Default for BridgeSettings {
             queue_limit: 64,
             ssh_window_size: 2_097_152,
             ssh_max_packet_size: 32_768,
+            rsync_idle_seconds: 600,
             rsync_compress: true,
             inspection_queue_limit: 16,
             result_ttl_seconds: 604_800.0,
@@ -475,6 +478,7 @@ pub fn load_settings(explicit: Option<&Path>) -> BridgeResult<BridgeSettings> {
         bounded(&bridge, "ssh_window_size", 2_097_152, 32_768, 67_108_864)? as u32;
     let ssh_max_packet_size =
         bounded(&bridge, "ssh_max_packet_size", 32_768, 4_096, 1_048_576)? as u32;
+    let rsync_idle_seconds = bounded(&bridge, "rsync_idle_seconds", 600, 5, 86_400)? as u64;
     let rsync_compress = match bridge.get("rsync_compress") {
         None => true,
         Some(toml::Value::Boolean(value)) => *value,
@@ -541,6 +545,7 @@ pub fn load_settings(explicit: Option<&Path>) -> BridgeResult<BridgeSettings> {
         queue_limit,
         ssh_window_size,
         ssh_max_packet_size,
+        rsync_idle_seconds,
         rsync_compress,
         inspection_queue_limit,
         result_ttl_seconds,
@@ -818,6 +823,16 @@ mod tests {
         let tuned = tuned.unwrap();
         assert_eq!(tuned.ssh_window_size, 8_388_608);
         assert!(!tuned.rsync_compress);
+        assert_eq!(settings.rsync_idle_seconds, 600, "default idle deadline");
+        let (_guard, idle) =
+            write("[bastion]\nurl = \"https://x\"\n[bridge]\nrsync_idle_seconds = 30\n");
+        assert_eq!(idle.unwrap().rsync_idle_seconds, 30);
+        let (_guard, too_small) =
+            write("[bastion]\nurl = \"https://x\"\n[bridge]\nrsync_idle_seconds = 1\n");
+        assert!(
+            too_small.is_err(),
+            "an unusably small idle limit is rejected"
+        );
 
         let (_guard, bad) =
             write("[bastion]\nurl = \"https://x\"\n[bridge]\nssh_window_size = 1024\n");

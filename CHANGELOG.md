@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.3
+
+Review round after 0.4.2: one real defect in the idle path, plus four narrower ones.
+
+### Fixed
+* **An idle stall is no longer mistaken for a clean exit.** The wait reports *why* it
+  ended (`Exited`, `IdleTimeout`, `TotalTimeout`, `WaitError`); only `Exited` counts as an
+  observed exit. Before, a stall returned `Ok(124)`, so the teardown skipped termination
+  and recorded `completed: true`, `completion_unknown: false`. Verified live by freezing
+  the remote sender during a 1 GiB download with `rsync_idle_seconds = 8`: the call
+  returned after 12.6 s with `exit_code 124`, `completion_unknown true`,
+  `execution_state unknown`, 12% of the real total, and the local rsync was terminated.
+* **The transfer owner closes the channel itself.** It records a closable handle as soon
+  as the SSH channel exists, so a failed READY wait, a cancelled pump or a hard link error
+  all end with one bounded Close - aborting a task never sends SSH Close. Closing happens
+  after the child is stopped and before the pumps are reaped, which also releases a pump
+  stuck in a write.
+* **An uploaded directory no longer reports 100% early.** The pre-transfer size comes from
+  `metadata()` only when it is a regular file, mirroring the download side.
+* **Without an rsync progress sample the logical amount is unknown.** `bytes_done`,
+  `progress_pct`, `rate_bps` and the ETA are omitted instead of being derived from
+  protocol traffic; `protocol_bytes` and `protocol_rate_bps` are reported separately. This
+  also corrects a test that had pinned the mixed semantics.
+* **`-e` quoting follows rsync's own parser.** Inside quotes a doubled quote is one quote
+  and a backslash is literal, so a `TMPDIR` containing a quote now works; the regression
+  checks the parsed argv, not the generated string.
+* **Capabilities are cached with the binary identity.** `resolve()` returns a
+  `ResolvedRsync { path, supports_info }`, so an rsync replaced while the service runs is
+  re-probed instead of keeping the first binary's answer.
+
+### Added
+* `bridge.rsync_idle_seconds` (default 600, 5..86400): the longest a transfer may go
+  without moving a byte before it is cut short.
+
+
 ## 0.4.2
 
 * The pre-transfer `stat` only applies to regular files. A directory's own inode size is

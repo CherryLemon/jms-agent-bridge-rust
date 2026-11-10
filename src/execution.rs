@@ -1471,7 +1471,9 @@ closed and must not be reused. Inspect before rerunning."
         // The lease covers the transfer itself, not just the local preparation: a
         // reconnect triggered elsewhere must not kill a running rsync.
         let _lease = self.recovery.enter(&key, self.queue_timeout).await?;
-        let binary = self.rsync_binary.resolve().await?;
+        let tool = self.rsync_binary.resolve().await?;
+        let binary = tool.path.clone();
+        let supports_info = tool.supports_info;
         let mut metadata = Map::new();
         metadata.insert("kind".into(), Value::from("rsync"));
         metadata.insert("host".into(), Value::from(host.name.clone()));
@@ -1552,6 +1554,7 @@ closed and must not be reused. Inspect before rerunning."
         let transfer = crate::transport::rsync::transfer(
             &self.pool,
             &binary,
+            supports_info,
             host,
             local,
             remote,
@@ -1565,6 +1568,7 @@ closed and must not be reused. Inspect before rerunning."
             &err_path,
             sent_flag.clone(),
             self.pool.rsync_compress(),
+            self.pool.rsync_idle_seconds(),
             progress_handle_for_transfer,
         )
         .await;
