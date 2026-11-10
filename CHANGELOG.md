@@ -14,8 +14,26 @@ Transfers report their own progress, and the transfer path is tunable.
 * `total_bytes` comes from the local file for an upload and from one `stat` for a
   download, so the percentage and ETA are known from the first byte; when the size
   cannot be determined the fields are simply omitted.
-* rsync's `--info=progress2` output is now captured (stderr is piped and the same bytes
-  are still appended to the result's stderr file), which feeds the same counters.
+* rsync's `--info=progress2` status lines are parsed as they arrive. They go to rsync's
+  **stdout** (not stderr), so both streams are piped through a writer that appends to the
+  result files and feeds the same counters.
+
+### Tuning notes (limited evidence)
+The knobs above were measured once against the shared gateway with a 1 GiB incompressible
+file, medians of three transfers per variant, and the run was stopped early because the
+gateway is a shared resource:
+
+| variant | upload | download |
+| --- | --- | --- |
+| default (compress, 2 MiB window) | 81.5 MB/s | 108.1 MB/s |
+| `rsync_compress = false` | 80.2 MB/s | 114.1 MB/s |
+| `ssh_window_size = 8 MiB` | 103.6 MB/s | 111.3 MB/s |
+| `ssh_window_size = 16 MiB` | 88.1 MB/s | 80.3 MB/s |
+
+Run-to-run spread on this link is large (one variant swung from 111 to 39 MB/s between
+passes, and one transfer died with a gateway-side broken pipe), so these numbers show
+*no regression* and are not a ranking. A fair comparison needs a quiet link, alternating
+variants, and per-direction CPU: only then should a default change.
 
 ### Robustness
 * The remote shell is a single-token wrapper script in the transfer's private temp

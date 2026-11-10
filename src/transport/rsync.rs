@@ -569,17 +569,54 @@ pub async fn transfer(
         }
     }
     let out = std::fs::File::create(out_path)?;
-    // stderr is piped so the `--info=progress2` lines can be parsed while the transfer
-    // runs; the same bytes are appended to the result's stderr file, so nothing is lost.
+    // Both streams are piped: rsync writes `--info=progress2` status lines to its stdout
+    // and real errors to stderr, and the counters should follow either. The same bytes
+    // are still written to the result's files, so nothing is lost.
     let err = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(err_path)?;
-    command.stdout(Stdio::from(out)).stderr(Stdio::piped());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command.stdin(Stdio::null());
     let mut child = command
         .spawn()
         .map_err(|error| BridgeError::config(format!("cannot start local rsync: {error}")))?;
+    if let Some(stdout) = child.stdout.take() {
+        let progress_for_log = progress.clone();
+        let watcher = tokio::task::spawn_blocking(move || {
+            let mut out = out;
+            let mut stdout = stdout;
+            let mut line: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let _ = out.write_all(&chunk[..count]);
+                        let _ = out.flush();
+                        for byte in &chunk[..count] {
+                            if *byte == b'\r' || *byte == b'\n' {
+                                if !line.is_empty() {
+                                    progress_for_log.observe(&String::from_utf8_lossy(&line));
+                                    line.clear();
+                                }
+                            } else if line.len() < 4096 {
+                                line.push(*byte);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            if !line.is_empty() {
+                progress_for_log.observe(&String::from_utf8_lossy(&line));
+            }
+        });
+        if let Ok(mut handles) = pumps.lock() {
+            handles.push(watcher);
+        }
+    }
     if let Some(stderr) = child.stderr.take() {
         // A blocking pipe read belongs on the blocking pool: the child is a std process.
         let progress_for_log = progress.clone();
