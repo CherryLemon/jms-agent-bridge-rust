@@ -315,6 +315,10 @@ pub async fn transfer(
     };
     let mut command = std::process::Command::new(binary);
     command.arg("-azs");
+    // The relay writes to stdout synchronously. Without this rsync starts a custom
+    // remote-shell with a *non-blocking* stdout, and a full pipe surfaces as
+    // EAGAIN mid-transfer - which truncates large downloads while small ones pass.
+    command.arg("--blocking-io");
     let relay_cmd = format!(
         "{} rsync-relay {}",
         crate::fsprobe::shlex_quote(
@@ -604,26 +608,84 @@ pub fn relay_main(argv: &[String]) -> i32 {
         }
         let _ = socket.shutdown(std::net::Shutdown::Write);
     });
-    let mut stdout = std::io::stdout();
+    // Write the protocol straight to fd 1: `std::io::stdout()` adds a line buffer whose
+    // flush can also surface WouldBlock, and a retry there would be ambiguous.
+    let mut stdout = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(1) };
     let mut incoming = reader_socket;
     let mut buffer = [0u8; 65536];
+    let mut forwarded: u64 = 0;
+    let mut failure: Option<String> = None;
     loop {
         match incoming.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
-                if stdout.write_all(&buffer[..count]).is_err() {
+                // rsync may hand this child a non-blocking stdout, so `write_all` can
+                // return WouldBlock after part of the chunk is already out. Wait for it
+                // to become writable again and continue with the remaining suffix; never
+                // re-send a prefix and never treat a write error as end of stream.
+                if let Err(error) = write_all_blocking(&mut stdout, &buffer[..count]) {
+                    failure = Some(format!(
+                        "relay stdout write failed after {forwarded} bytes: {error}"
+                    ));
                     break;
                 }
-                let _ = stdout.flush();
+                forwarded += count as u64;
             }
-            Err(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                failure = Some(format!(
+                    "relay socket read failed after {forwarded} bytes: {error}"
+                ));
+                break;
+            }
         }
+    }
+    let failed = failure.is_some();
+    if let Some(reason) = failure {
+        // stderr only: stdout carries the rsync binary protocol.
+        eprintln!("{reason}");
     }
     // Do not join the stdin pump: rsync keeps its child's stdin open until it exits,
     // and it only exits after this process does. The reference implementation lets the
     // daemon thread die with the process for the same reason.
     drop(sender);
-    0
+    // A truncated protocol stream must never look like a clean end of transfer.
+    if failed {
+        74
+    } else {
+        0
+    }
+}
+
+/// `write_all` that tolerates a non-blocking descriptor.
+///
+/// The bytes already accepted by the kernel are lost from the caller's point of view
+/// only if the whole chunk is retried, so this retries just the remaining suffix.
+fn write_all_blocking(writer: &mut impl std::io::Write, mut data: &[u8]) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while !data.is_empty() {
+        match writer.write(data) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "the peer accepted no bytes",
+                ))
+            }
+            Ok(count) => data = &data[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the downstream reader made no progress for 600s",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

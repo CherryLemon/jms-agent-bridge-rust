@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.3.6
+
+Large downloads work. The relay was being handed a non-blocking stdout and treated
+`EAGAIN` as end of stream, so every long transfer stopped after a few hundred KB and
+reported success.
+
+### Two-way transfer
+* rsync now starts the relay with `--blocking-io`, matching the synchronous writer in
+  `rsync-relay`. Without it rsync gives a custom remote-shell a non-blocking stdout, a
+  full pipe surfaces as `WouldBlock`, and the old relay returned 0 and exited - the
+  remote side then saw EOF and both rsyncs reported "connection unexpectedly closed".
+* The relay writes the protocol straight to fd 1 (no `stdout()` line buffer, whose
+  flush can also return `WouldBlock`), retries `Interrupted`, waits out `WouldBlock`
+  on the remaining suffix only - never re-sending a prefix - and gives up after 600 s
+  without progress.
+* A relay write or socket error is reported on stderr (never stdout, which carries the
+  rsync protocol) with the byte count and errno, and the relay exits 74 instead of 0,
+  so a truncated stream can never look like a clean transfer end.
+
+Measured on the test asset with a 256 MiB incompressible file: upload 9.4 s
+(28.7 MB/s), download 4.1 s (65.4 MB/s), size and SHA-256 verified; 64 MiB downloads
+in 1.3 s. Before the fix the same download failed at 0.74-1.6 MB with rsync exit 12.
+
+### Result lifecycle
+* `ResultLease::borrowed` is gone. It held no store, so `save_serialized` neither
+  finished nor abandoned its result: staged payloads stayed `status: running` with
+  `active_results` never released. `save_serialized` now writes the payload and closes
+  the result explicitly on both paths, and `write_staged` is the single place that
+  owns that transition.
+
+### Transport
+* `ssh_proxy_command` keeps its `Child` inside `ProcessStream`: the child used to be
+  dropped when the stream was built, and `kill_on_drop` killed the proxy immediately.
+  The proxy's stderr is drained at debug level so a full pipe cannot stall it.
+
+### Sessions
+* A named session that is rejected after a restart reports `session_state: "lost"`
+  instead of omitting the field.
+
+### Tests
+* New `tests/relay_backpressure.rs` drives the real relay binary with a *non-blocking*
+  stdout (via `pre_exec`, exactly as rsync does) and a slow consumer: 8 MiB must arrive
+  byte-exact with exit 0. It fails on the previous implementation.
+* Staging lifecycle: a successful `save_serialized` must end `status: complete` with
+  `finished_at`, byte sizes and no active entry; a payload write that fails after
+  `create()` must leave no active entry.
+
+
 ## 0.3.5
 
 Evidence can only become more certain, never less; every result that is created has an

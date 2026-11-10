@@ -818,6 +818,7 @@ async fn proxy_command_stream(
     gateway: &str,
     port: u16,
 ) -> BridgeResult<Box<dyn AsyncStream>> {
+    use tokio::io::AsyncReadExt as _;
     let mut child = tokio::process::Command::new(program)
         .args(expand_proxy_arguments(arguments, gateway, port))
         .stdin(std::process::Stdio::piped())
@@ -830,9 +831,29 @@ async fn proxy_command_stream(
         })?;
     let stdin = child.stdin.take().expect("proxy stdin");
     let stdout = child.stdout.take().expect("proxy stdout");
+    // Keep the stderr pipe drained: an unread pipe fills and blocks the proxy.
+    if let Some(mut stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let text = String::from_utf8_lossy(&chunk[..count]);
+                        tracing::debug!(proxy = %text.trim_end(), "ssh_proxy_command stderr");
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    // The child must live exactly as long as the transport: dropping it would kill the
+    // proxy and tear the tunnel down, which is what a bare `kill_on_drop` child does
+    // when it is dropped at the end of this function.
     Ok(Box::new(ProcessStream {
         reader: stdout,
         writer: stdin,
+        child: Some(child),
     }))
 }
 
@@ -851,6 +872,17 @@ fn expand_proxy_arguments(arguments: &[String], gateway: &str, port: u16) -> Vec
 struct ProcessStream {
     reader: tokio::process::ChildStdout,
     writer: tokio::process::ChildStdin,
+    /// Owns the proxy process; `kill_on_drop` on the child is the last-resort cleanup.
+    child: Option<tokio::process::Child>,
+}
+
+impl Drop for ProcessStream {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // Best effort: the transport is going away, so the proxy must too.
+            let _ = child.start_kill();
+        }
+    }
 }
 
 impl tokio::io::AsyncRead for ProcessStream {

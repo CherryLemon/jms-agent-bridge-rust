@@ -1265,13 +1265,16 @@ printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
             Some(shell) => shell,
             None => {
                 if !spec.internal_session && resumed {
-                    return Attempt::not_started(
-                    Some(
-                        "session state was lost after service restart; use a new session_id or call session_close to reset it"
-                            .to_string(),
-                    ),
-                    "session",
-                );
+                    let mut attempt = Attempt::not_started(
+                        Some(
+                            "session state was lost after service restart; use a new session_id or call session_close to reset it"
+                                .to_string(),
+                        ),
+                        "session",
+                    );
+                    // A registered id with no shell is exactly "lost", not "unknown".
+                    attempt.session_state = Some("lost");
+                    return attempt;
                 }
                 let channel_started = Instant::now();
                 let (shell, _reconnected) = match self.pool.open_process(host, command).await {

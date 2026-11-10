@@ -9,16 +9,21 @@ credentials are deliberately not recorded here.
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 152 passed |
+| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 154 passed |
+| Relay backpressure (real binary, non-blocking stdout, slow consumer, 8 MiB) | `cargo test --test relay_backpressure` | 2 passed |
 | Inventory refresh against a mock bastion (transient vs. explicit detail errors, account ambiguity) | `cargo test --test catalog_refresh` | 2 passed |
 | Offline contracts (tool list, schema validation, guard, receipts, saved-result reads, discovery) | `cargo test --test mcp_offline` | 1 passed |
 | Real `serve --stdio` subprocess: every stdout line parses as JSON-RPC while logging is at `info` | `cargo test --test mcp_stdio` | 1 passed |
 | Exec-channel plumbing against a live bastion | `cargo test --test ssh_pipe -- --ignored` | passed (manual) |
 
-Known failure, reproduced on 0.3.4 and 0.3.5: a 64 MiB download fails with rsync exit
-12 ("connection unexpectedly closed") after 0.7-1.6 MB while the same file uploads at
-25-41 MB/s. Tracked in CHANGELOG; not covered by the automated suites, which transfer a
-~1.9 KB file.
+Fixed in 0.3.6 (was: 64 MiB downloads failed with rsync exit 12 after 0.7-1.6 MB).
+Root cause: rsync gives a custom remote-shell a non-blocking stdout unless
+`--blocking-io` is passed, and the relay treated `EAGAIN` as end of stream and exited 0.
+
+| 40 | 256 MiB upload | 9.36 s, 28.7 MB/s, exit 0, SHA-256 match |
+| 41 | 256 MiB download | 4.11 s, 65.4 MB/s, exit 0, SHA-256 match |
+| 42 | 64 MiB download | 1.29 s, 52.1 MB/s, exit 0, SHA-256 match |
+| 43 | 8 MiB relay backpressure (non-blocking stdout) | full payload, exit 0, fails on the previous implementation |
 
 Regression tests for the fifth review round (evidence monotonicity, result ownership):
 `a_late_annotation_failure_keeps_the_completed_verdict`,
