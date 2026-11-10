@@ -145,6 +145,40 @@ impl Attempt {
     }
 }
 
+/// Write the session registry from the current in-memory set.
+///
+/// The save lock covers "take the snapshot" *and* "replace the file": two concurrent
+/// saves can otherwise finish in the opposite order and leave the older snapshot.
+fn persist_sessions(
+    registry: &std::path::Path,
+    known: &Mutex<std::collections::HashSet<(String, String)>>,
+    save: &Mutex<()>,
+) -> BridgeResult<()> {
+    persist_sessions_with(registry, known, save, || ())
+}
+
+fn persist_sessions_with<F: FnOnce()>(
+    registry: &std::path::Path,
+    known: &Mutex<std::collections::HashSet<(String, String)>>,
+    save: &Mutex<()>,
+    after_snapshot: F,
+) -> BridgeResult<()> {
+    let _save = save.lock().expect("registry save lock");
+    let rows: Vec<Value> = {
+        let known = known.lock().expect("session lock").clone();
+        after_snapshot();
+        known
+            .iter()
+            .map(|(target, session_id)| {
+                json!({"target": target.split('\u{1f}').collect::<Vec<_>>(), "session_id": session_id})
+            })
+            .collect()
+    };
+    let mut rows = rows;
+    rows.sort_by_key(|row| row.to_string());
+    crate::storage::results::atomic_json(registry, &Value::Array(rows))
+}
+
 /// Whether a live shell or terminal still depends on this connection.
 fn connection_protected(
     shells: &Arc<AsyncMutex<HashMap<(String, String), Arc<AsyncMutex<ShellSession>>>>>,
@@ -197,6 +231,9 @@ pub struct Runner {
     terminal_protections: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     session_gates: Mutex<HashMap<(String, String), Arc<AsyncMutex<()>>>>,
     known_sessions: Mutex<HashSet<(String, String)>>,
+    /// Serializes snapshot+write+rename: without it two sessions saved concurrently can
+    /// rename in the opposite order and leave the older snapshot on disk.
+    registry_lock: Mutex<()>,
     registry: std::path::PathBuf,
     closing: AtomicBool,
 }
@@ -252,21 +289,14 @@ impl Runner {
             terminal_protections: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_gates: Mutex::new(HashMap::new()),
             known_sessions: Mutex::new(known),
-            registry,
+            registry: registry.clone(),
+            registry_lock: Mutex::new(()),
             closing: AtomicBool::new(false),
         }))
     }
 
     fn save_sessions(&self) -> BridgeResult<()> {
-        let known = self.known_sessions.lock().expect("session lock").clone();
-        let mut rows: Vec<Value> = known
-            .iter()
-            .map(|(target, session_id)| {
-                json!({"target": target.split('\u{1f}').collect::<Vec<_>>(), "session_id": session_id})
-            })
-            .collect();
-        rows.sort_by_key(|row| row.to_string());
-        crate::storage::results::atomic_json(&self.registry, &Value::Array(rows))
+        persist_sessions(&self.registry, &self.known_sessions, &self.registry_lock)
     }
 
     /// The remote command for a shell: isolated `bash -s` or a named persistent shell.
@@ -1616,6 +1646,67 @@ pub fn age_seconds(meta: &Map<String, Value>) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// Two saves racing in the "wrong" order must not leave the older snapshot behind.
+    #[test]
+    fn a_concurrent_save_cannot_overwrite_a_newer_snapshot() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::{mpsc, Arc};
+
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("shell_sessions.json");
+        let known: Arc<Mutex<HashSet<(String, String)>>> = Arc::new(Mutex::new(HashSet::new()));
+        let save: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+
+        known
+            .lock()
+            .unwrap()
+            .insert(("key-a".to_string(), "session-a".to_string()));
+
+        // A snapshots the registry, then waits until B has finished writing.
+        let (snapshot_taken, snapshot_wait) = mpsc::channel::<()>();
+        let b_done = Arc::new(AtomicBool::new(false));
+        let known_a = known.clone();
+        let save_a = save.clone();
+        let registry_a = registry.clone();
+        let gate = b_done.clone();
+        let a = std::thread::spawn(move || {
+            persist_sessions_with(&registry_a, &known_a, &save_a, || {
+                snapshot_taken.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+                while !gate.load(AtomicOrdering::SeqCst) {
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            })
+        });
+
+        // Only now does B add its session and save: A's snapshot is provably older.
+        snapshot_wait.recv().unwrap();
+        known
+            .lock()
+            .unwrap()
+            .insert(("key-b".to_string(), "session-b".to_string()));
+        let written = persist_sessions(&registry, &known, &save);
+        b_done.store(true, AtomicOrdering::SeqCst);
+        written.unwrap();
+        a.join().unwrap().unwrap();
+
+        let text = std::fs::read_to_string(&registry).unwrap();
+        let rows: Value = serde_json::from_str(&text).unwrap();
+        let names: Vec<&str> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row.get("session_id").and_then(Value::as_str))
+            .collect();
+        assert!(
+            names.contains(&"session-a") && names.contains(&"session-b"),
+            "registry lost a session: {text}"
+        );
+    }
+
     /// An idle interactive terminal keeps its connection: it holds the cwd and env of a
     /// bound shell, so a reconnect triggered elsewhere must not replace it.
     #[test]

@@ -207,14 +207,63 @@ impl JobHandle {
     }
 }
 
-/// The launcher answered that it could not start anything.
+/// Stages that provably end before any remote byte of the job is written.
 ///
-/// The script exits 3 (no tmux and no setsid), 4 (tmux refused the session) or 5
-/// (the job never wrote its pid/status); all three mean "nothing is running".
-fn launcher_refused(outcome: &ExecOutcome) -> bool {
-    matches!(outcome.exit_code, 3 | 4 | 5)
-        && !outcome.stdout.contains("LAUNCHER=")
-        && outcome.meta.get("executed") == Some(&Value::Bool(true))
+/// `executed: false` only means "nothing ran" when the attempt never left the sender.
+const PRE_SEND_STAGES: [&str; 8] = [
+    "validation",
+    "connection",
+    "connection_recovery",
+    "execution_queue",
+    "session_queue",
+    "session",
+    "session_registry",
+    "channel",
+];
+
+/// Decide the launch state from the launcher's own evidence.
+///
+/// * acknowledged            -> the runner wrote its pid/status: the job runs.
+/// * unknown execution state -> the bytes may have arrived; never call that a refusal.
+/// * launcher exit 3/4       -> its two "I did not start anything" paths.
+/// * `executed: false` before sending -> nothing was transmitted.
+/// * everything else         -> unknown; exit 5 is a *wait* timeout, and the detached
+///   runner may still start the job after the launcher gave up, so it stays unknown.
+pub fn derive_launch_state(acknowledged: bool, meta: &Map<String, Value>) -> LaunchState {
+    if acknowledged {
+        return LaunchState::Acknowledged;
+    }
+    let unknown_evidence = meta
+        .get("completion_unknown")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || meta
+            .get("execution_state")
+            .and_then(Value::as_str)
+            .map(|state| state == "unknown")
+            .unwrap_or(false);
+    if unknown_evidence {
+        return LaunchState::Unknown;
+    }
+    let executed = meta.get("executed");
+    let stage = meta.get("failure_stage").and_then(Value::as_str);
+    if executed == Some(&Value::Bool(true)) {
+        // The launcher script itself ran: 3 (no tmux/setsid) and 4 (tmux refused) are
+        // its explicit refusals. Exit 5 is only "the runner was not observed yet".
+        return match meta.get("exit_code").and_then(Value::as_i64) {
+            Some(3) | Some(4) => LaunchState::Rejected,
+            _ => LaunchState::Unknown,
+        };
+    }
+    if executed == Some(&Value::Bool(false))
+        && stage
+            .map(|stage| PRE_SEND_STAGES.contains(&stage))
+            .unwrap_or(false)
+    {
+        return LaunchState::Rejected;
+    }
+    // No transmission evidence either way: be conservative rather than optimistic.
+    LaunchState::Unknown
 }
 
 pub struct Jobs {
@@ -264,33 +313,28 @@ impl Jobs {
             }
         };
         let acknowledged = outcome.ok() && outcome.stdout.contains("LAUNCHER=");
-        // Without the launcher line the job may still have started; the caller keeps the
-        // id and the uncertainty instead of being told the submission failed outright.
+        // The classification lives in one place so the receipt and the response cannot
+        // disagree; it is derived from the execution evidence, never from "we have an id".
+        let state = derive_launch_state(acknowledged, &outcome.meta);
         let launcher = launcher_of(&outcome.stdout);
         let metadata = &outcome.meta;
         receipt.insert("result_id".into(), Value::from(outcome.result_id.clone()));
         receipt.insert("launch_acknowledged".into(), Value::Bool(acknowledged));
+        receipt.insert("launch_state".into(), Value::from(state.as_str()));
+        receipt.insert(
+            "completion_unknown".into(),
+            Value::Bool(state == LaunchState::Unknown),
+        );
         receipt.insert(
             "submission_state".into(),
-            Value::from(if acknowledged {
-                "acknowledged".to_string()
-            } else {
-                metadata
+            Value::from(match state {
+                LaunchState::Acknowledged => "acknowledged".to_string(),
+                LaunchState::Rejected => "rejected".to_string(),
+                LaunchState::Unknown => metadata
                     .get("execution_state")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown")
-                    .to_string()
-            }),
-        );
-        receipt.insert(
-            "completion_unknown".into(),
-            Value::Bool(if acknowledged {
-                false
-            } else {
-                metadata
-                    .get("completion_unknown")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true)
+                    .to_string(),
             }),
         );
         for (key, value) in queue_rejection(metadata) {
@@ -299,17 +343,6 @@ impl Jobs {
         if let Some(progress) = progress {
             let _ = progress.record("submission_receipts", Value::Object(receipt));
         }
-        let executed = outcome.meta.get("executed") == Some(&Value::Bool(true));
-        // `launched` may only be claimed from the launcher's own acknowledgement. The id
-        // is still returned for reconciliation in every other case.
-        let state = if acknowledged {
-            LaunchState::Acknowledged
-        } else if !executed || launcher_refused(&outcome) {
-            // Nothing was transmitted, or the launcher answered "I did not start it".
-            LaunchState::Rejected
-        } else {
-            LaunchState::Unknown
-        };
         Ok((
             JobHandle {
                 job_id,
@@ -644,6 +677,75 @@ mod tests {
         assert_eq!(code.trim(), "3");
         let log = std::fs::read_to_string(root.join("stdout.log")).unwrap_or_default();
         assert!(log.contains("quick"), "job output missing: {log:?}");
+    }
+
+    fn evidence(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_transmitted_but_unconfirmed_launch_stays_unknown() {
+        // The execution layer reported "sent, no evidence": that is not a refusal.
+        let meta = evidence(json!({
+            "executed": false,
+            "execution_state": "unknown",
+            "completion_unknown": true,
+        }));
+        assert_eq!(derive_launch_state(false, &meta), LaunchState::Unknown);
+    }
+
+    #[test]
+    fn a_launcher_that_only_timed_out_waiting_stays_unknown() {
+        // Exit 5 means "no pid/status was seen yet"; the detached runner may still
+        // start the job, so calling it a refusal would invite a duplicate.
+        let meta = evidence(json!({
+            "executed": true,
+            "exit_code": 5,
+            "execution_state": "completed",
+            "completion_unknown": false,
+        }));
+        assert_eq!(derive_launch_state(false, &meta), LaunchState::Unknown);
+    }
+
+    #[test]
+    fn the_two_explicit_launcher_refusals_are_rejections() {
+        for code in [3, 4] {
+            let meta = evidence(json!({
+                "executed": true,
+                "exit_code": code,
+                "execution_state": "completed",
+                "completion_unknown": false,
+            }));
+            assert_eq!(
+                derive_launch_state(false, &meta),
+                LaunchState::Rejected,
+                "exit {code} must be a refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_before_sending_is_a_rejection() {
+        let meta = evidence(json!({
+            "executed": false,
+            "execution_state": "not_started",
+            "completion_unknown": false,
+            "failure_stage": "channel",
+        }));
+        assert_eq!(derive_launch_state(false, &meta), LaunchState::Rejected);
+        // Without a pre-send stage the same flags are not enough to claim a refusal.
+        let unclear = evidence(json!({
+            "executed": false,
+            "execution_state": "not_started",
+            "completion_unknown": false,
+        }));
+        assert_eq!(derive_launch_state(false, &unclear), LaunchState::Unknown);
+    }
+
+    #[test]
+    fn an_acknowledged_launcher_wins_over_any_other_flag() {
+        let meta = evidence(json!({"executed": true, "exit_code": 5}));
+        assert_eq!(derive_launch_state(true, &meta), LaunchState::Acknowledged);
     }
 
     #[test]

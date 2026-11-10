@@ -1509,6 +1509,73 @@ mod tests {
         assert!(out.to_string().len() < 4096);
     }
 
+    /// The full chain the review asked for: execution evidence -> classifier -> row.
+    #[test]
+    fn evidence_flows_through_the_classifier_into_the_row() {
+        let handle_for = |state| crate::jobs::JobHandle {
+            job_id: "abcd1234".into(),
+            host: "asset-1".into(),
+            session: "jms-abcd1234".into(),
+            launcher: "unknown".into(),
+            state,
+        };
+        let outcome_with = |meta: Value| crate::execution::ExecOutcome {
+            host: "asset-1".into(),
+            exit_code: meta.get("exit_code").and_then(Value::as_i64).unwrap_or(75),
+            stdout: String::new(),
+            stderr: "job did not start\n".into(),
+            timed_out: false,
+            result_id: "r1".into(),
+            preview: None,
+            rejection: Map::new(),
+            recovery: Map::new(),
+            meta: meta.as_object().cloned().unwrap_or_default(),
+        };
+
+        // Sent, no completion evidence: unknown, and the row must say so.
+        let sent = outcome_with(json!({
+            "executed": false,
+            "execution_state": "unknown",
+            "completion_unknown": true,
+        }));
+        let state = crate::jobs::derive_launch_state(false, &sent.meta);
+        let row = job_row(&handle_for(state), &sent);
+        assert_eq!(row["launch_state"], "unknown");
+        assert_eq!(row["launched"], false);
+        assert_eq!(row["completion_unknown"], true);
+        assert_eq!(row["job_id"], "abcd1234");
+
+        // Launcher exit 5 (waited, saw nothing): still unknown, never rejected.
+        let waited = outcome_with(json!({
+            "executed": true,
+            "exit_code": 5,
+            "execution_state": "completed",
+            "completion_unknown": false,
+        }));
+        let row = job_row(
+            &handle_for(crate::jobs::derive_launch_state(false, &waited.meta)),
+            &waited,
+        );
+        assert_eq!(row["launch_state"], "unknown");
+        assert_eq!(row["completion_unknown"], true);
+
+        // A pre-send failure is the only path that may claim "rejected".
+        let refused = outcome_with(json!({
+            "executed": false,
+            "execution_state": "not_started",
+            "completion_unknown": false,
+            "failure_stage": "channel",
+        }));
+        let row = job_row(
+            &handle_for(crate::jobs::derive_launch_state(false, &refused.meta)),
+            &refused,
+        );
+        assert_eq!(row["launch_state"], "rejected");
+        assert_eq!(row["launched"], false);
+        assert_eq!(row["completion_unknown"], false);
+        assert!(row["stderr"].as_str().unwrap().contains("did not start"));
+    }
+
     /// The full chain: a launcher that refused must never look like a running job.
     #[test]
     fn job_rows_distinguish_acknowledged_rejected_and_unknown() {

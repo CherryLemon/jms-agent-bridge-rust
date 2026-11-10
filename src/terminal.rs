@@ -83,8 +83,13 @@ impl Command {
         }
     }
 
-    fn is_running(&self) -> bool {
-        matches!(self.state, CmdState::Queued | CmdState::Running) && self.task.is_some()
+    /// A command occupies the terminal from the moment it is admitted.
+    ///
+    /// The worker handle is deliberately *not* part of this test: between admission and
+    /// the `task` assignment there is a window where the handle is still `None`, and
+    /// treating that as idle let two callers own the same terminal.
+    fn is_busy(&self) -> bool {
+        matches!(self.state, CmdState::Queued | CmdState::Running)
     }
 }
 
@@ -118,23 +123,43 @@ impl StreamSource {
     }
 }
 
+/// What one wait on the output streams observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEvent {
+    /// At least one chunk arrived (it is now in that stream's buffer).
+    Data,
+    /// One stream ended; the other may still have queued data or a marker to deliver.
+    StreamClosed,
+    /// Both streams ended: no further evidence can arrive.
+    AllClosed,
+}
+
 /// Wait for one chunk from whichever stream is still open.
 ///
-/// Returns `false` only when *every* stream is closed; callers keep their own view of
-/// which stream ended so a single closed stream is not mistaken for a dead shell.
-async fn wait_any_chunk(out: &mut StreamSource, err: &mut StreamSource) -> bool {
+/// A single ended stream is reported as an event, never as "the shell is dead": the
+/// other stream may still hold a queued completion marker. Closed streams are not
+/// polled again, so this cannot spin.
+async fn wait_any_chunk(out: &mut StreamSource, err: &mut StreamSource) -> StreamEvent {
     if out.is_closed() && err.is_closed() {
-        return false;
+        return StreamEvent::AllClosed;
     }
     if out.is_closed() {
-        return err.fill().await;
+        return if err.fill().await {
+            StreamEvent::Data
+        } else {
+            StreamEvent::StreamClosed
+        };
     }
     if err.is_closed() {
-        return out.fill().await;
+        return if out.fill().await {
+            StreamEvent::Data
+        } else {
+            StreamEvent::StreamClosed
+        };
     }
     tokio::select! {
-        alive = out.fill() => alive,
-        alive = err.fill() => alive,
+        got = out.fill() => if got { StreamEvent::Data } else { StreamEvent::StreamClosed },
+        got = err.fill() => if got { StreamEvent::Data } else { StreamEvent::StreamClosed },
     }
 }
 
@@ -216,14 +241,14 @@ impl TerminalShell {
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             let Streams { out, err } = &mut *streams;
-            let filled = tokio::time::timeout(remaining, wait_any_chunk(out, err))
+            let waited = tokio::time::timeout(remaining, wait_any_chunk(out, err))
                 .await
                 .map_err(|_| {
                     BridgeError::ssh(
                         "remote shell did not acknowledge readiness in time; script was not sent",
                     )
                 })?;
-            if !filled {
+            if waited == StreamEvent::AllClosed {
                 self.lost.store(true, Ordering::SeqCst);
                 return Err(BridgeError::ssh(
                     "remote shell closed during startup; script was not sent",
@@ -352,10 +377,13 @@ impl TerminalShell {
                 ));
             }
             let Streams { out, err } = &mut *streams;
-            let filled = tokio::time::timeout(remaining, wait_any_chunk(out, err)).await;
-            match filled {
-                Ok(true) => continue,
-                Ok(false) => {
+            let waited = tokio::time::timeout(remaining, wait_any_chunk(out, err)).await;
+            match waited {
+                // A single stream ending is not a verdict: loop again so the marker that
+                // is already queued on the other stream is consumed, and let
+                // `completion_impossible` decide when evidence can no longer arrive.
+                Ok(StreamEvent::Data | StreamEvent::StreamClosed) => continue,
+                Ok(StreamEvent::AllClosed) => {
                     self.lost.store(true, Ordering::SeqCst);
                     return Err(BridgeError::ssh(
                         "terminal shell closed before the completion marker; completion is unknown",
@@ -763,42 +791,42 @@ impl Interactive {
     ) -> BridgeResult<Value> {
         self.check(script, allow_dangerous)?;
         let binding = self.binding(session).await?;
-        {
-            let binding_guard = binding.lock().await;
+        // Admission is one critical section: check the shell, check that no command is
+        // active, and install this command. Two concurrent execs can no longer both pass.
+        let (host, command, result_id) = {
+            let mut binding_guard = binding.lock().await;
             self.permitted(&binding_guard).await?;
             if binding_guard.closed || binding_guard.shell.is_closing() {
                 return Err(BridgeError::invalid(
                     "terminal shell was closed/lost; open a new session explicitly",
                 ));
             }
-            if let Some(command) = &binding_guard.command {
-                if command.lock().await.is_running() {
+            if let Some(current) = &binding_guard.command {
+                if current.lock().await.is_busy() {
                     return Err(BridgeError::invalid(
                         "terminal is busy; read/write its active command first",
                     ));
                 }
             }
-        }
-        let host = { binding.lock().await.host.clone() };
-        let mut metadata = Map::new();
-        metadata.insert("kind".into(), Value::from("terminal"));
-        metadata.insert("host".into(), Value::from(host.name.clone()));
-        if let Some(asset_id) = &host.asset_id {
-            metadata.insert("asset_id".into(), Value::from(asset_id.clone()));
-        }
-        metadata.insert("session_id".into(), Value::from(session));
-        let result_id = self.store.create(metadata)?;
-        for stream in ["stdout", "stderr"] {
-            let path = self.store.path(&result_id, stream)?;
-            if !path.exists() {
-                std::fs::File::create(&path)?;
+            let host = binding_guard.host.clone();
+            let mut metadata = Map::new();
+            metadata.insert("kind".into(), Value::from("terminal"));
+            metadata.insert("host".into(), Value::from(host.name.clone()));
+            if let Some(asset_id) = &host.asset_id {
+                metadata.insert("asset_id".into(), Value::from(asset_id.clone()));
             }
-        }
-        let command = Arc::new(AsyncMutex::new(Command::new(result_id.clone())));
-        {
-            let mut binding_guard = binding.lock().await;
+            metadata.insert("session_id".into(), Value::from(session));
+            let result_id = self.store.create(metadata)?;
+            for stream in ["stdout", "stderr"] {
+                let path = self.store.path(&result_id, stream)?;
+                if !path.exists() {
+                    std::fs::File::create(&path)?;
+                }
+            }
+            let command = Arc::new(AsyncMutex::new(Command::new(result_id.clone())));
             binding_guard.command = Some(command.clone());
-        }
+            (host, command, result_id)
+        };
         if let Some(progress) = self.progress(session) {
             // The command is sent right after this point; without the mapping a crash
             // would leave a result nobody can address.
@@ -836,7 +864,10 @@ impl Interactive {
         if wait_ms > 0 {
             tokio::time::sleep(Duration::from_millis(wait_ms.min(30_000))).await;
         }
-        self.read(session, 0, max_bytes, cursor).await
+        // Bound to our own command: reading "the session's current command" could return
+        // a newer command's result id if ours finished in the meantime.
+        self.read_command(session, &command, 0, max_bytes, cursor)
+            .await
     }
 
     fn progress(&self, session: &str) -> Option<Arc<crate::storage::journal::RequestProgress>> {
@@ -875,6 +906,20 @@ impl Interactive {
                 "state": if closed { "closed" } else { "idle" },
             }));
         };
+        let _ = lost;
+        self.read_command(session, &command, wait_ms, max_bytes, cursor)
+            .await
+    }
+
+    /// Read one specific command's output, independent of what the session does next.
+    async fn read_command(
+        &self,
+        session: &str,
+        command: &Arc<AsyncMutex<Command>>,
+        wait_ms: u64,
+        max_bytes: usize,
+        cursor: Option<&Value>,
+    ) -> BridgeResult<Value> {
         let mut guard = command.lock().await;
         let mut positions: HashMap<String, u64> = guard.cursor.clone();
         if let Some(cursor) = cursor.and_then(Value::as_object) {
@@ -894,7 +939,7 @@ impl Interactive {
                     .unwrap_or(false)
             })
         };
-        if guard.is_running() && wait_ms > 0 && !available(&self.store, &positions) {
+        if guard.is_busy() && wait_ms > 0 && !available(&self.store, &positions) {
             let deadline = Duration::from_millis(wait_ms.min(30_000));
             let _ = tokio::time::timeout(deadline, guard.changed.notified()).await;
         }
@@ -966,11 +1011,6 @@ impl Interactive {
                 out.insert(key.clone(), value.clone());
             }
         }
-        if closed {
-            out.insert("session_state".into(), Value::from("closed"));
-        } else if lost {
-            out.insert("session_state".into(), Value::from("lost"));
-        }
         Ok(Value::Object(out))
     }
 
@@ -1006,7 +1046,7 @@ impl Interactive {
         };
         {
             let guard = command.lock().await;
-            if !guard.is_running() || guard.state != CmdState::Running {
+            if !guard.is_busy() || guard.state != CmdState::Running {
                 return Err(BridgeError::invalid(
                     "write needs an active foreground command; use exec for shell commands",
                 ));
@@ -1310,7 +1350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_on_closed_streams_returns_immediately() {
+    async fn a_single_closed_stream_is_reported_as_an_event_not_a_verdict() {
         let (out_tx, out_rx) = mpsc::channel(4);
         let (err_tx, err_rx) = mpsc::channel(4);
         let mut out = StreamSource {
@@ -1325,27 +1365,48 @@ mod tests {
         };
         out_tx.send(Bytes::from_static(b"hello")).await.unwrap();
         drop(out_tx);
-        drop(err_tx);
-        // No call may hang or spin: every wait returns, and the buffered chunk is
-        // delivered exactly once before both streams report closed.
-        let mut rounds = 0;
-        loop {
-            let alive =
-                tokio::time::timeout(Duration::from_secs(1), wait_any_chunk(&mut out, &mut err))
-                    .await
-                    .expect("a wait on closed streams must not block");
-            rounds += 1;
-            if !alive && out.is_closed() && err.is_closed() {
-                break;
-            }
-            assert!(
-                rounds < 6,
-                "waits must terminate once both streams are closed"
-            );
-        }
+        // A queued chunk is delivered before the end of the stream is reported.
+        assert_eq!(wait_any_chunk(&mut out, &mut err).await, StreamEvent::Data);
         assert_eq!(out.buffer, b"hello");
-        // With both flags set the function returns without touching a receiver at all.
-        assert!(!wait_any_chunk(&mut out, &mut err).await);
+        // One stream ended; the other is still open, so this is not "all closed".
+        assert_eq!(
+            wait_any_chunk(&mut out, &mut err).await,
+            StreamEvent::StreamClosed
+        );
+        assert!(out.is_closed());
+        assert!(!err.is_closed());
+        // Closing the second stream is what ends the command.
+        drop(err_tx);
+        assert_eq!(
+            wait_any_chunk(&mut out, &mut err).await,
+            StreamEvent::StreamClosed
+        );
+        assert!(err.is_closed());
+        // Both closed: callers get a definitive answer and no receiver is polled again.
+        assert_eq!(
+            wait_any_chunk(&mut out, &mut err).await,
+            StreamEvent::AllClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admitted_command_makes_the_terminal_busy_before_its_worker_exists() {
+        // This is the regression: a queued command without an installed JoinHandle used
+        // to look idle, so two execs could both be admitted and overwrite each other.
+        let mut command = Command::new("r1".to_string());
+        assert_eq!(command.state, CmdState::Queued);
+        assert!(command.task.is_none());
+        assert!(command.is_busy());
+
+        command.state = CmdState::Running;
+        assert!(command.is_busy());
+
+        command.state = CmdState::Completed;
+        assert!(!command.is_busy());
+        command.state = CmdState::Unknown;
+        assert!(!command.is_busy());
+        command.state = CmdState::NotStarted;
+        assert!(!command.is_busy());
     }
 
     #[test]
