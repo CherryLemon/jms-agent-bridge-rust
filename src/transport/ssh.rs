@@ -832,6 +832,7 @@ async fn proxy_command_stream(
     let stdin = child.stdin.take().expect("proxy stdin");
     let stdout = child.stdout.take().expect("proxy stdout");
     // Keep the stderr pipe drained: an unread pipe fills and blocks the proxy.
+    // Keep the stderr pipe drained: an unread pipe fills and blocks the proxy.
     if let Some(mut stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let mut chunk = [0u8; 4096];
@@ -916,5 +917,58 @@ impl tokio::io::AsyncWrite for ProcessStream {
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.writer).poll_shutdown(context)
+    }
+}
+
+#[cfg(test)]
+mod proxy_command_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The proxy child must stay alive while the transport is in use: dropping it at the
+    /// end of `proxy_command_stream` used to kill the tunnel immediately.
+    #[tokio::test]
+    async fn the_proxy_child_survives_after_the_stream_is_built() {
+        let program = "bash".to_string();
+        let arguments = vec!["-c".to_string(), "exec cat".to_string()];
+        let mut stream = proxy_command_stream(&program, &arguments, "gateway.invalid", 2222)
+            .await
+            .expect("the helper starts");
+
+        stream.write_all(b"ping-1\n").await.unwrap();
+        let mut buffer = vec![0u8; 7];
+        stream.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"ping-1\n");
+
+        // A second round trip proves the child was not reaped after the first exchange.
+        stream.write_all(b"ping-2\n").await.unwrap();
+        let mut buffer = vec![0u8; 7];
+        stream.read_exact(&mut buffer).await.unwrap();
+        assert_eq!(&buffer, b"ping-2\n");
+    }
+
+    /// An unread stderr pipe fills up and stalls the proxy, so it must be drained.
+    #[tokio::test]
+    async fn a_noisy_proxy_stderr_does_not_block_the_protocol() {
+        let program = "bash".to_string();
+        let arguments = vec![
+            "-c".to_string(),
+            "head -c 300000 /dev/zero >&2; exec cat".to_string(),
+        ];
+        let mut stream = proxy_command_stream(&program, &arguments, "gateway.invalid", 2222)
+            .await
+            .expect("the helper starts");
+        // Give the child time to fill the stderr pipe before the first protocol byte.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stream.write_all(b"still-alive\n").await.unwrap();
+        let mut buffer = vec![0u8; 12];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_exact(&mut buffer),
+        )
+        .await
+        .expect("the proxy must keep answering while its stderr is noisy")
+        .unwrap();
+        assert_eq!(&buffer, b"still-alive\n");
     }
 }

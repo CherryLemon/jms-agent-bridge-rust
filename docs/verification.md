@@ -9,7 +9,7 @@ credentials are deliberately not recorded here.
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 154 passed |
+| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 158 passed |
 | Relay backpressure (real binary, non-blocking stdout, slow consumer, 8 MiB) | `cargo test --test relay_backpressure` | 2 passed |
 | Inventory refresh against a mock bastion (transient vs. explicit detail errors, account ambiguity) | `cargo test --test catalog_refresh` | 2 passed |
 | Offline contracts (tool list, schema validation, guard, receipts, saved-result reads, discovery) | `cargo test --test mcp_offline` | 1 passed |
@@ -24,6 +24,8 @@ Root cause: rsync gives a custom remote-shell a non-blocking stdout unless
 | 41 | 256 MiB download | 4.11 s, 65.4 MB/s, exit 0, SHA-256 match |
 | 42 | 64 MiB download | 1.29 s, 52.1 MB/s, exit 0, SHA-256 match |
 | 43 | 8 MiB relay backpressure (non-blocking stdout) | full payload, exit 0, fails on the previous implementation |
+| 44 | 256 MiB download after the transfer-owner rework | 8.19 s, 32.8 MB/s, exit 0, SHA-256 match |
+| 45 | 64 MiB download after the transfer-owner rework | 1.71 s, exit 0 |
 
 Regression tests for the fifth review round (evidence monotonicity, result ownership):
 `a_late_annotation_failure_keeps_the_completed_verdict`,

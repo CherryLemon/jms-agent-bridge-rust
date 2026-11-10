@@ -229,6 +229,51 @@ pub struct TransferOutcome {
 
 /// Run one rsync transfer through the pooled connection.
 #[allow(clippy::too_many_arguments)]
+/// Everything the transfer starts, so no path can leave it running.
+///
+/// Preparing the local side can fail after the accept task is spawned (log file, rsync
+/// binary), and the forwarding pumps outlive a timeout unless somebody stops them.
+/// Every exit - success, error or timeout - goes through `Drop`, which stops the
+/// accept loop and aborts the pumps.
+struct TransferOwner {
+    stop: Arc<AtomicBool>,
+    accept: Option<tokio::task::JoinHandle<()>>,
+    pumps: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl TransferOwner {
+    /// Stop the accept loop and wait briefly for it to notice.
+    async fn quiesce(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(accept) = self.accept.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), accept).await;
+        }
+    }
+
+    /// Abort the forwarding pumps and wait bounded for them to finish.
+    async fn reap_pumps(&self) {
+        let handles: Vec<_> = self.pumps.lock().expect("pump lock").drain(..).collect();
+        for handle in handles {
+            handle.abort();
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
+    }
+}
+
+impl Drop for TransferOwner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(accept) = self.accept.take() {
+            accept.abort();
+        }
+        if let Ok(mut handles) = self.pumps.lock() {
+            for handle in handles.drain(..) {
+                handle.abort();
+            }
+        }
+    }
+}
+
 pub async fn transfer(
     pool: &Arc<SshPool>,
     binary: &Path,
@@ -276,6 +321,8 @@ pub async fn transfer(
     // The caller's evidence flag: what the result guard reads if this future goes away.
     let sent = evidence;
     let stop = Arc::new(AtomicBool::new(false));
+    let pumps: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let accept = {
         let pool = pool.clone();
         let host = host.clone();
@@ -284,6 +331,7 @@ pub async fn transfer(
         let sent = sent.clone();
         let stop = stop.clone();
         let err_path = err_path.to_path_buf();
+        let pumps = pumps.clone();
         tokio::spawn(async move {
             while !stop.load(Ordering::SeqCst) {
                 let accept =
@@ -299,6 +347,7 @@ pub async fn transfer(
                     stream,
                     &err_path,
                     &sent,
+                    &pumps,
                 )
                 .await
                 {
@@ -312,6 +361,13 @@ pub async fn transfer(
                 }
             }
         })
+    };
+    // From here on every return path - including `?` while preparing the local command -
+    // stops the accept loop and aborts the pumps.
+    let mut owner = TransferOwner {
+        stop: stop.clone(),
+        accept: Some(accept),
+        pumps: pumps.clone(),
     };
     let mut command = std::process::Command::new(binary);
     command.arg("-azs");
@@ -369,7 +425,20 @@ pub async fn transfer(
         }
     })
     .await;
-    stop.store(true, Ordering::SeqCst);
+    let kill_reason = match &waited {
+        Ok(Err(error)) => Some(format!("rsync failed: {error}")),
+        Err(_) => None,
+        Ok(Ok(_)) => None,
+    };
+    // Ordered teardown: stop accepting, reap the pumps, then read the evidence. The
+    // flag is snapshotted only after the producers can no longer move it.
+    owner.quiesce().await;
+    owner.reap_pumps().await;
+    if let Some(error) = kill_reason {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(BridgeError::storage(error));
+    }
     let outcome = match waited {
         Ok(Ok(code)) => TransferOutcome {
             exit_code: code,
@@ -377,11 +446,7 @@ pub async fn transfer(
             completed: true,
             timed_out: false,
         },
-        Ok(Err(error)) => {
-            let _ = child.kill();
-            return Err(BridgeError::storage(format!("rsync failed: {error}")));
-        }
-        Err(_) => {
+        _ => {
             let _ = child.kill();
             let _ = child.wait();
             TransferOutcome {
@@ -392,8 +457,7 @@ pub async fn transfer(
             }
         }
     };
-    // Give the relay task a moment to observe the stop flag and close its channels.
-    let _ = tokio::time::timeout(Duration::from_secs(2), accept).await;
+    drop(owner);
     Ok(outcome)
 }
 
@@ -405,6 +469,7 @@ async fn serve_stream(
     mut stream: UnixStream,
     err_path: &Path,
     sent: &Arc<AtomicBool>,
+    pumps: &Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 ) -> BridgeResult<()> {
     let mut line = Vec::new();
     let mut buffer = [0u8; 1];
@@ -499,7 +564,7 @@ async fn serve_stream(
     }
     sent.store(true, Ordering::SeqCst);
     let err_handle = err_path.to_path_buf();
-    tokio::spawn(async move {
+    let pump = tokio::spawn(async move {
         let mut socket_open = true;
         let mut channel_open = true;
         let mut chunk = vec![0u8; 65536];
@@ -551,6 +616,9 @@ async fn serve_stream(
             }
         }
     });
+    if let Ok(mut handles) = pumps.lock() {
+        handles.push(pump);
+    }
     Ok(())
 }
 
@@ -592,40 +660,67 @@ pub fn relay_main(argv: &[String]) -> i32 {
         Ok(clone) => clone,
         Err(_) => return 2,
     };
+    // Both directions publish their first failure here; the process exits non-zero if
+    // either one failed, so a truncated stream never looks like a clean transfer.
+    let shared = Arc::new(RelayShared::default());
+    let sender_shared = shared.clone();
     let sender = std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buffer = [0u8; 65536];
+        let mut budget = IdleBudget::relay();
+        let mut forwarded: u64 = 0;
         loop {
             match stdin.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(count) => {
-                    if socket.write_all(&buffer[..count]).is_err() {
-                        break;
+                    budget.progress();
+                    if let Err(error) =
+                        write_all_blocking(&mut socket, &buffer[..count], &mut budget)
+                    {
+                        sender_shared.fail(format!(
+                            "relay stdin->socket write failed after {forwarded} bytes: {}",
+                            describe(&error)
+                        ));
+                        // Wake the other direction: it must not wait for data that will
+                        // never come.
+                        let _ = socket.shutdown(std::net::Shutdown::Both);
+                        return;
                     }
+                    forwarded += count as u64;
                 }
-                Err(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    sender_shared.fail(format!(
+                        "relay stdin read failed after {forwarded} bytes: {}",
+                        describe(&error)
+                    ));
+                    let _ = socket.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
             }
         }
         let _ = socket.shutdown(std::net::Shutdown::Write);
     });
     // Write the protocol straight to fd 1: `std::io::stdout()` adds a line buffer whose
-    // flush can also surface WouldBlock, and a retry there would be ambiguous.
+    // flush can also surface WouldBlock, and a retry there is ambiguous.
     let mut stdout = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(1) };
     let mut incoming = reader_socket;
     let mut buffer = [0u8; 65536];
+    let mut budget = IdleBudget::relay();
     let mut forwarded: u64 = 0;
-    let mut failure: Option<String> = None;
     loop {
         match incoming.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
+                budget.progress();
                 // rsync may hand this child a non-blocking stdout, so `write_all` can
                 // return WouldBlock after part of the chunk is already out. Wait for it
                 // to become writable again and continue with the remaining suffix; never
                 // re-send a prefix and never treat a write error as end of stream.
-                if let Err(error) = write_all_blocking(&mut stdout, &buffer[..count]) {
-                    failure = Some(format!(
-                        "relay stdout write failed after {forwarded} bytes: {error}"
+                if let Err(error) = write_all_blocking(&mut stdout, &buffer[..count], &mut budget) {
+                    shared.fail(format!(
+                        "relay socket->stdout write failed after {forwarded} bytes: {}",
+                        describe(&error)
                     ));
                     break;
                 }
@@ -633,36 +728,105 @@ pub fn relay_main(argv: &[String]) -> i32 {
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => {
-                failure = Some(format!(
-                    "relay socket read failed after {forwarded} bytes: {error}"
+                shared.fail(format!(
+                    "relay socket read failed after {forwarded} bytes: {}",
+                    describe(&error)
                 ));
                 break;
             }
         }
     }
-    let failed = failure.is_some();
-    if let Some(reason) = failure {
+    // Do not join the stdin pump: rsync keeps its child's stdin open until it exits, and
+    // it only exits after this process does.
+    drop(sender);
+    if let Some(reason) = shared.first_error() {
         // stderr only: stdout carries the rsync binary protocol.
         eprintln!("{reason}");
-    }
-    // Do not join the stdin pump: rsync keeps its child's stdin open until it exits,
-    // and it only exits after this process does. The reference implementation lets the
-    // daemon thread die with the process for the same reason.
-    drop(sender);
-    // A truncated protocol stream must never look like a clean end of transfer.
-    if failed {
         74
     } else {
         0
     }
 }
 
+/// The first error of either relay direction, shared across the two threads.
+#[derive(Default)]
+struct RelayShared {
+    first: std::sync::Mutex<Option<String>>,
+}
+
+impl RelayShared {
+    fn fail(&self, reason: String) {
+        let mut slot = self.first.lock().expect("relay error lock");
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+    }
+
+    fn first_error(&self) -> Option<String> {
+        self.first.lock().expect("relay error lock").clone()
+    }
+}
+
+/// An error with its kind spelled out: `EAGAIN` and `EPIPE` are very different here.
+fn describe(error: &std::io::Error) -> String {
+    format!("{:?}: {error}", error.kind())
+}
+
+/// Idle and total budgets for one direction of the relay.
+///
+/// `idle` is reset by every successful byte, `total` never is; a slow-but-progressing
+/// transfer therefore never trips the idle limit, which is what "no progress for N
+/// seconds" is supposed to mean.
+pub(crate) struct IdleBudget {
+    idle: Duration,
+    total: Duration,
+    last_progress: std::time::Instant,
+    started: std::time::Instant,
+}
+
+impl IdleBudget {
+    pub(crate) fn new(idle: Duration, total: Duration) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            idle,
+            total,
+            last_progress: now,
+            started: now,
+        }
+    }
+
+    /// A relay transfers a file, so the idle limit is generous and the total is the
+    /// transfer timeout's business.
+    fn relay() -> Self {
+        Self::new(Duration::from_secs(600), Duration::from_secs(86_400))
+    }
+
+    fn progress(&mut self) {
+        self.last_progress = std::time::Instant::now();
+    }
+
+    /// The remaining wait before either budget expires, or `None` when the transfer is
+    /// allowed to keep waiting.
+    fn remaining(&self) -> Option<Duration> {
+        let now = std::time::Instant::now();
+        let idle_left = self
+            .idle
+            .checked_sub(now.duration_since(self.last_progress))?;
+        let total_left = self.total.checked_sub(now.duration_since(self.started))?;
+        Some(idle_left.min(total_left))
+    }
+}
+
 /// `write_all` that tolerates a non-blocking descriptor.
 ///
-/// The bytes already accepted by the kernel are lost from the caller's point of view
-/// only if the whole chunk is retried, so this retries just the remaining suffix.
-fn write_all_blocking(writer: &mut impl std::io::Write, mut data: &[u8]) -> std::io::Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+/// Bytes the kernel already accepted are never re-sent: only the remaining suffix is
+/// retried, and every accepted chunk renews the idle budget.
+pub(crate) fn write_all_blocking(
+    writer: &mut impl std::io::Write,
+    mut data: &[u8],
+    budget: &mut IdleBudget,
+) -> std::io::Result<()> {
+    let mut stall = Duration::from_millis(1);
     while !data.is_empty() {
         match writer.write(data) {
             Ok(0) => {
@@ -671,19 +835,26 @@ fn write_all_blocking(writer: &mut impl std::io::Write, mut data: &[u8]) -> std:
                     "the peer accepted no bytes",
                 ))
             }
-            Ok(count) => data = &data[count..],
+            Ok(count) => {
+                data = &data[count..];
+                budget.progress();
+                stall = Duration::from_millis(1);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "the downstream reader made no progress for 600s",
-                    ));
+                match budget.remaining() {
+                    Some(left) => std::thread::sleep(left.min(stall)),
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "no progress within the idle budget",
+                        ))
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(2));
             }
             Err(error) => return Err(error),
         }
+        stall = (stall * 2).min(Duration::from_millis(100));
     }
     Ok(())
 }
@@ -691,6 +862,72 @@ fn write_all_blocking(writer: &mut impl std::io::Write, mut data: &[u8]) -> std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slow but progressing transfer must never trip the idle limit.
+    #[test]
+    fn intermittent_progress_renews_the_idle_budget() {
+        /// Accepts one byte every 30 ms and reports `WouldBlock` in between.
+        struct Trickle {
+            last_accept: std::time::Instant,
+        }
+        impl std::io::Write for Trickle {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                if self.last_accept.elapsed() < Duration::from_millis(30) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                self.last_accept = std::time::Instant::now();
+                Ok(data.len().min(1))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = Trickle {
+            last_accept: std::time::Instant::now() - Duration::from_millis(30),
+        };
+        let mut budget = IdleBudget::new(Duration::from_millis(120), Duration::from_secs(30));
+        let payload = vec![7u8; 8];
+        // 8 writes of 30 ms each: 240 ms total, far beyond the 120 ms idle limit, but
+        // every single write is progress.
+        write_all_blocking(&mut writer, &payload, &mut budget)
+            .expect("progress must keep the transfer alive");
+    }
+
+    /// No progress at all must end the transfer, and it must not re-send a prefix.
+    #[test]
+    fn a_stalled_writer_times_out_without_duplicating_bytes() {
+        struct Stalls {
+            written: Vec<u8>,
+        }
+        impl std::io::Write for Stalls {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                if self.written.is_empty() {
+                    let count = data.len().min(3);
+                    self.written.extend_from_slice(&data[..count]);
+                    return Ok(count);
+                }
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = Stalls {
+            written: Vec::new(),
+        };
+        let mut budget = IdleBudget::new(Duration::from_millis(80), Duration::from_secs(30));
+        let started = std::time::Instant::now();
+        let error = write_all_blocking(&mut writer, b"abcdef", &mut budget)
+            .expect_err("a stalled writer must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            writer.written, b"abc",
+            "the accepted prefix is not repeated"
+        );
+    }
 
     #[test]
     fn version_parsing_accepts_rsync_banner() {

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.3.7
+
+One owner for the transfer, and progress that means progress.
+
+### Transfer ownership
+* `TransferOwner` holds the accept loop and both forwarding pumps and tears them down on
+  every exit path. Before this, a failure while preparing the local side (log file,
+  rsync spawn) left the accept task running for the life of the process, and a timeout
+  left the pumps and their SSH channel alive.
+* Teardown is ordered: stop accepting, reap the pumps, then read the evidence flag, so
+  `sent` can no longer be snapshotted while a handshake is still updating it.
+
+### Relay errors
+* Both directions now publish their first failure into a shared slot; the process exits
+  74 if either direction failed. The stdin->socket direction used to swallow errors and
+  still exit 0, so a failed upload half looked like a clean end of stream.
+* Errors are described with their `ErrorKind` (EAGAIN and EPIPE mean very different
+  things here) and the byte count actually forwarded, incremented per successful write
+  rather than per chunk. `Interrupted` is retried in both directions.
+* A failure shuts the socket down, so the other direction stops instead of waiting for
+  data that will never arrive.
+
+### Idle budget
+* "600 s without progress" now means what it says: `IdleBudget` records the last
+  successful byte and is renewed by every write, with a separate total budget. The old
+  helper started its 600 s clock when a chunk began and never refreshed it, so a slow
+  but healthy transfer could fail while a stalled one could pass. Waiting is bounded
+  and re-checked, so a blocking descriptor cannot hide the deadline either.
+
+### Sessions
+* The "shell is closing" rejection also reports `session_state: "lost"`, matching the
+  restart rejection.
+
+### Tests
+* `relay_backpressure` now has a hard watchdog: if the relay ever deadlocks the child is
+  killed at 90 s and the test fails instead of hanging.
+* `IdleBudget`: intermittent progress keeps a transfer alive far beyond the idle limit,
+  and a stalled writer times out without re-sending the prefix it already delivered.
+* `ssh_proxy_command`: the helper keeps answering after the stream is built (the child
+  used to be reaped immediately), and a helper that writes 300 KB to stderr still
+  answers, which fails when the stderr drain is removed.
+
+
 ## 0.3.6
 
 Large downloads work. The relay was being handed a non-blocking stdout and treated

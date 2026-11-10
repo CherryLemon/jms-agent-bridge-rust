@@ -1328,13 +1328,15 @@ close it or use a new session_id"
                 let mut shells = self.shells.lock().await;
                 shells.remove(&session_key);
             }
-            return Attempt::not_started(
+            let mut attempt = Attempt::not_started(
                 Some(
                     "session state was lost; inspect prior result, then use a new session_id"
                         .to_string(),
                 ),
                 "session",
             );
+            attempt.session_state = Some("lost");
+            return attempt;
         }
         if !shell.ready {
             let prime_started = Instant::now();

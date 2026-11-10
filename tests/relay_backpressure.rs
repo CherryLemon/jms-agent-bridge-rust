@@ -93,6 +93,17 @@ fn a_full_stdout_pipe_does_not_truncate_the_relay() {
     let text = String::from_utf8_lossy(&request);
     assert!(text.contains("asset.example"), "request was {text}");
 
+    let pid = child.id();
+    let watchdog = std::thread::spawn(move || {
+        // Hard deadline: if the relay ever deadlocks, fail with a clear signal instead of
+        // hanging the suite. `slow_consumer` cannot check its deadline while blocked in
+        // `read`, so the kill has to come from outside.
+        std::thread::sleep(Duration::from_secs(90));
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    });
+
     let stdout = child.stdout.take().expect("relay stdout");
     let consumer = slow_consumer(stdout, PAYLOAD);
 
@@ -111,6 +122,8 @@ fn a_full_stdout_pipe_does_not_truncate_the_relay() {
     let received = consumer.join().expect("consumer thread");
     let sent_ok = writer.join().expect("writer thread");
     let status = child.wait().expect("relay exits");
+    // The transfer finished long before the watchdog would fire.
+    let _ = watchdog;
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);
