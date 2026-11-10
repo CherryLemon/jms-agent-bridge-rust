@@ -760,7 +760,7 @@ impl Interactive {
             setup.join(" && ")
         };
         let value = self
-            .execute(&session, &script, false, 10_000, 4096, None)
+            .execute(&session, &script, false, 10_000, 4096, None, None)
             .await?;
         if value.get("state").and_then(Value::as_str) != Some("completed")
             || value.get("exit_code").and_then(Value::as_i64) != Some(0)
@@ -780,6 +780,7 @@ impl Interactive {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         session: &str,
@@ -788,6 +789,7 @@ impl Interactive {
         wait_ms: u64,
         max_bytes: usize,
         cursor: Option<&Value>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
     ) -> BridgeResult<Value> {
         self.check(script, allow_dangerous)?;
         let binding = self.binding(session).await?;
@@ -827,13 +829,25 @@ impl Interactive {
             binding_guard.command = Some(command.clone());
             (host, command, result_id)
         };
-        if let Some(progress) = self.progress(session) {
+        if let Some(progress) = progress {
             // The command is sent right after this point; without the mapping a crash
             // would leave a result nobody can address.
-            progress.record(
+            if let Err(error) = progress.record(
                 "execution_results",
                 json!({"host": host.name, "result_id": result_id}),
-            )?;
+            ) {
+                let _ = self.store.fail_before_send(
+                    &result_id,
+                    &format!(
+                        "request progress could not be persisted: {}",
+                        error.message()
+                    ),
+                );
+                let mut guard = command.lock().await;
+                guard.state = CmdState::NotStarted;
+                guard.error = Some(error.message());
+                return Err(error);
+            }
         }
         self.save().await?;
         // The worker owns the shell for the duration of the command; the caller only
@@ -868,12 +882,6 @@ impl Interactive {
         // a newer command's result id if ours finished in the meantime.
         self.read_command(session, &command, 0, max_bytes, cursor)
             .await
-    }
-
-    fn progress(&self, session: &str) -> Option<Arc<crate::storage::journal::RequestProgress>> {
-        let _ = self.requests.active_tasks();
-        let _ = session;
-        None
     }
 
     pub async fn read(

@@ -253,20 +253,25 @@ impl BridgeRuntime {
             let script = script.clone();
             let spec = spec.clone();
             let progress = progress.clone();
+            let name = host.name.clone();
             set.spawn(async move {
-                runner
+                let outcome = runner
                     .execute_to_store(&host, &script, timeout, &spec, progress.as_deref())
-                    .await
+                    .await;
+                (name, outcome)
             });
         }
         let mut metas: Vec<Map<String, Value>> = Vec::new();
+        // One target failing to set up must not hide the other targets' results: the
+        // per-target failure becomes a row of its own (executed=false, not_started).
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok(Ok(meta)) => metas.push(meta),
-                Ok(Err(error)) => return Err(error),
-                Err(error) => {
-                    return Err(BridgeError::ssh(format!("fan-out task failed: {error}")))
-                }
+                Ok((_name, Ok(meta))) => metas.push(meta),
+                Ok((name, Err(error))) => metas.push(failure_row(&name, &error)),
+                Err(error) => metas.push(failure_row(
+                    "<cancelled>",
+                    &BridgeError::ssh(format!("fan-out task failed: {error}")),
+                )),
             }
         }
         metas.sort_by_key(|meta| {
@@ -437,7 +442,8 @@ require allow_dangerous=true",
                             &request_id,
                             "terminal_exec",
                             &Value::Object(work),
-                            move |_progress| async move {
+                            move |progress| async move {
+                                let sink: Arc<dyn crate::storage::journal::ProgressSink> = progress;
                                 terminals
                                     .execute(
                                         &session,
@@ -446,6 +452,7 @@ require allow_dangerous=true",
                                         page.wait_ms,
                                         page.max_bytes,
                                         page.cursor.as_ref(),
+                                        Some(sink.as_ref()),
                                     )
                                     .await
                             },
@@ -466,6 +473,7 @@ require allow_dangerous=true",
                         page.wait_ms,
                         page.max_bytes,
                         page.cursor.as_ref(),
+                        None,
                     )
                     .await
             }
@@ -1087,42 +1095,11 @@ require allow_dangerous=true",
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 if let Some(result_id) = result_id {
-                    match self.store.metadata(&result_id) {
-                        Ok(meta) => {
-                            let mut status = Map::new();
-                            for key in [
-                                "status",
-                                "ok",
-                                "exit_code",
-                                "executed",
-                                "execution_state",
-                                "completion_unknown",
-                                "timed_out",
-                                "queue_timed_out",
-                                "reason",
-                                "retryable",
-                                "queue",
-                                "failure_stage",
-                                "startup_retry_result_id",
-                                "connection_recovery",
-                                "finished_at",
-                            ] {
-                                if let Some(value) = meta.get(key) {
-                                    status.insert(key.to_string(), value.clone());
-                                }
-                            }
-                            if let Some(map) = row.as_object_mut() {
-                                map.insert("result_status".into(), Value::Object(status));
-                            }
-                        }
-                        Err(_) => {
-                            if let Some(map) = row.as_object_mut() {
-                                map.insert(
-                                    "result_status".into(),
-                                    json!({"status": "unavailable"}),
-                                );
-                            }
-                        }
+                    if let Some(map) = row.as_object_mut() {
+                        map.insert(
+                            "result_status".into(),
+                            self.project_result_status(&result_id),
+                        );
                     }
                 }
                 enriched.push(row);
@@ -1131,7 +1108,53 @@ require allow_dangerous=true",
                 map.insert("execution_results".into(), Value::Array(enriched));
             }
         }
+        // The response of the original call recorded one result id before the work
+        // finished (a terminal command, for instance). Project its *current* state so
+        // `request_status` never keeps reporting the frozen "queued"/"running" value.
+        if let Some(result_id) = receipt
+            .get("result_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            let status = self.project_result_status(&result_id);
+            if let Some(map) = receipt.as_object_mut() {
+                map.insert("result_status".into(), status);
+            }
+        }
         Ok(receipt)
+    }
+
+    /// Current state of one saved result, as reported inside a receipt.
+    fn project_result_status(&self, result_id: &str) -> Value {
+        match self.store.metadata(result_id) {
+            Ok(meta) => {
+                let mut status = Map::new();
+                for key in [
+                    "status",
+                    "ok",
+                    "exit_code",
+                    "executed",
+                    "execution_state",
+                    "completion_unknown",
+                    "timed_out",
+                    "queue_timed_out",
+                    "reason",
+                    "retryable",
+                    "queue",
+                    "failure_stage",
+                    "error",
+                    "startup_retry_result_id",
+                    "connection_recovery",
+                    "finished_at",
+                ] {
+                    if let Some(value) = meta.get(key) {
+                        status.insert(key.to_string(), value.clone());
+                    }
+                }
+                Value::Object(status)
+            }
+            Err(_) => json!({"status": "unavailable"}),
+        }
     }
 
     // --- meta ----------------------------------------------------------------
@@ -1310,6 +1333,19 @@ pub fn string_list(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A per-target row for a failure that happened before the target produced a result.
+fn failure_row(host: &str, error: &BridgeError) -> Map<String, Value> {
+    let mut row = Map::new();
+    row.insert("host".into(), Value::from(host));
+    row.insert("ok".into(), Value::Bool(false));
+    row.insert("exit_code".into(), Value::from(75));
+    row.insert("executed".into(), Value::Bool(false));
+    row.insert("execution_state".into(), Value::from("not_started"));
+    row.insert("completion_unknown".into(), Value::Bool(false));
+    row.insert("error".into(), Value::from(error.message()));
+    row
 }
 
 /// One job row: the id is always reported, `launched` only when the launcher said so.

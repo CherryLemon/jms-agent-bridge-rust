@@ -238,6 +238,23 @@ impl ResultStore {
         Ok(result_id)
     }
 
+    /// Close a result that never left the sender and release its active slot.
+    ///
+    /// Used when a precondition (a failed progress write, a rejected queue, a broken
+    /// local channel) stops an operation *after* its result was created: the result must
+    /// not stay `active`/`running` in this process, and the caller must be able to read
+    /// the reason.
+    pub fn fail_before_send(&self, result_id: &str, reason: &str) -> BridgeResult<()> {
+        let mut values = Map::new();
+        values.insert("ok".into(), Value::Bool(false));
+        values.insert("executed".into(), Value::Bool(false));
+        values.insert("execution_state".into(), Value::from("not_started"));
+        values.insert("completion_unknown".into(), Value::Bool(false));
+        values.insert("failure_stage".into(), Value::from("sender"));
+        values.insert("error".into(), Value::from(reason));
+        self.finish(result_id, values).map(|_| ())
+    }
+
     pub fn metadata(&self, result_id: &str) -> BridgeResult<Map<String, Value>> {
         let path = self.directory(result_id)?.join("meta.json");
         let text = match fs::read_to_string(&path) {

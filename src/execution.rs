@@ -574,11 +574,21 @@ impl Runner {
         let result_id = self.store.create(metadata)?;
         if let Some(progress) = progress {
             // Nothing may be transmitted until the caller can find this result after a
-            // crash: a rejected write stops the run instead of losing the trail.
-            progress.record(
+            // crash: a rejected write stops the run instead of losing the trail. The
+            // result is closed as not_started so it does not linger as an active "run".
+            if let Err(error) = progress.record(
                 "execution_results",
                 json!({"host": host.name, "result_id": result_id}),
-            )?;
+            ) {
+                let _ = self.store.fail_before_send(
+                    &result_id,
+                    &format!(
+                        "request progress could not be persisted: {}",
+                        error.message()
+                    ),
+                );
+                return Err(error);
+            }
         }
         let out_path = self.store.path(&result_id, "stdout")?;
         let err_path = self.store.path(&result_id, "stderr")?;
@@ -1342,10 +1352,19 @@ closed and must not be reused. Inspect before rerunning."
         if let Some(progress) = progress {
             // Announce before a single byte moves: a transfer that is killed halfway
             // must still be addressable from the original request id.
-            progress.record(
+            if let Err(error) = progress.record(
                 "execution_results",
                 json!({"host": host.name, "result_id": result_id, "kind": "transfer"}),
-            )?;
+            ) {
+                let _ = self.store.fail_before_send(
+                    &result_id,
+                    &format!(
+                        "request progress could not be persisted: {}",
+                        error.message()
+                    ),
+                );
+                return Err(error);
+            }
         }
         let out_path = self.store.path(&result_id, "stdout")?;
         let err_path = self.store.path(&result_id, "stderr")?;

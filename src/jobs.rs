@@ -266,6 +266,16 @@ pub fn derive_launch_state(acknowledged: bool, meta: &Map<String, Value>) -> Lau
     LaunchState::Unknown
 }
 
+/// Terminal job states for `wait`: nothing may change after them.
+const TERMINAL_STATUSES: [&str; 4] = ["done", "failed", "cancelled", "missing"];
+
+fn is_terminal_status(row: &Value) -> bool {
+    row.get("status")
+        .and_then(Value::as_str)
+        .map(|status| TERMINAL_STATUSES.contains(&status))
+        .unwrap_or(false)
+}
+
 pub struct Jobs {
     runner: Arc<Runner>,
 }
@@ -517,20 +527,37 @@ echo \"status_before=$status_before\""
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
         loop {
-            let latest = self.status_many(pairs).await;
-            let terminal = latest.iter().all(|row| {
-                matches!(
-                    row.get("status").and_then(Value::as_str),
-                    Some("done") | Some("failed") | Some("missing")
-                )
-            });
-            if terminal {
+            // One scan is bounded by the *remaining* budget: a slow host can no longer
+            // push the whole call past its deadline by a whole probe timeout.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let probe_budget = remaining.max(std::time::Duration::from_millis(250));
+            let latest = match tokio::time::timeout(probe_budget, self.status_many(pairs)).await {
+                Ok(rows) => rows,
+                Err(_) => {
+                    // Keep the "we do not cancel remote jobs" promise: report what we know.
+                    let rows = pairs
+                        .iter()
+                        .map(|(host, job_id)| {
+                            json!({"host": host.name, "job_id": job_id,
+                                   "status": "unknown", "ok": false,
+                                   "watch_timeout": true})
+                        })
+                        .collect();
+                    return (rows, false);
+                }
+            };
+            if latest.iter().all(is_terminal_status) {
                 return (latest, true);
             }
             if tokio::time::Instant::now() >= deadline {
                 return (latest, false);
             }
-            tokio::time::sleep(std::time::Duration::from_secs_f64(interval.max(0.1))).await;
+            let sleep = std::time::Duration::from_secs_f64(interval.max(0.1));
+            let sleep = sleep.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            if sleep.is_zero() {
+                return (latest, false);
+            }
+            tokio::time::sleep(sleep).await;
         }
     }
 
@@ -746,6 +773,21 @@ mod tests {
     fn an_acknowledged_launcher_wins_over_any_other_flag() {
         let meta = evidence(json!({"executed": true, "exit_code": 5}));
         assert_eq!(derive_launch_state(true, &meta), LaunchState::Acknowledged);
+    }
+
+    #[test]
+    fn a_cancelled_job_is_a_terminal_state_for_wait() {
+        for status in ["done", "failed", "cancelled", "missing"] {
+            assert!(
+                is_terminal_status(&json!({"status": status})),
+                "{status} must end the watch"
+            );
+        }
+        for status in ["running", "queued", "unknown", ""] {
+            assert!(!is_terminal_status(&json!({"status": status})), "{status}");
+        }
+        // A row without a status is not terminal either.
+        assert!(!is_terminal_status(&json!({"host": "h1"})));
     }
 
     #[test]
