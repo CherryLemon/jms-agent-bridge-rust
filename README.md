@@ -116,7 +116,10 @@ service).
 
 `call(operation="session_list")` reports both kinds of handle (`kind: "shell"`
 for `run(session_id=...)`, `kind: "terminal"` for `terminal(action="open")`), and
-`session_close` accepts the `kind` or works it out from the handle.
+`session_close` accepts the `kind` or works it out from the handle. A handle with
+a command in flight is reported as `running`; the query never waits for that
+command, so status latency does not grow with command duration. A terminal accepts
+one command at a time: a second `exec` is refused with "terminal is busy".
 
 Advanced fields live in an `options` object so the advertised schema stays small;
 `discover(operation="run"|"fs"|"terminal")` returns the complete schema, and
@@ -144,6 +147,9 @@ business summary and a `result_id` that `read_result(stream="result")` reads bac
   Recover a lost reply with `call(operation="request_status")` or
   `meta(ref="request:<id>")`.
 * `queue_full` is an unsent per-target refusal: nothing ran, so retrying is safe.
+* `jms_job_wait` stops at `done`, `failed`, `cancelled` or `missing`. A scan that
+  cannot finish inside the remaining budget reports `status:"unknown"` with
+  `watch_timeout:true`; the remote job is never cancelled by a timeout.
 * A durable write is a precondition: if the result id or the prepared job receipt
   cannot be persisted, the operation stops before anything reaches the remote side.
 

@@ -1,6 +1,6 @@
 [package]
 name = "jms-agent-bridge"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.88"
 description = "Resident JumpServer bridge with a compact MCP surface (Rust)"

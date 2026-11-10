@@ -393,6 +393,9 @@ impl AssetCatalog {
 
     async fn fetch_assets(&self) -> BridgeResult<Vec<Value>> {
         let api = self.make_api()?;
+        // Every detail request reuses this client: one connection pool per refresh
+        // instead of N independent pools that never share a connection.
+        let shared = Arc::new(self.make_api()?);
         let (assets, truncated) = api.list_assets(None, 200, 100).await?;
         if truncated {
             return Err(BridgeError::rest("REST returned a partial asset list"));
@@ -402,11 +405,10 @@ impl AssetCatalog {
         let preferred = self.settings.preferred_account.clone();
         let login = self.cfg.login_user.clone();
         for asset in assets {
-            let api_cfg = (*self.cfg).clone();
-            let proxy = self.settings.rest_proxy.clone();
             let preferred = preferred.clone();
             let login = login.clone();
             let permit = semaphore.clone();
+            let api = shared.clone();
             let Some(id) = asset.get("id").and_then(Value::as_str).map(str::to_string) else {
                 continue;
             };
@@ -414,10 +416,6 @@ impl AssetCatalog {
                 let _permit = match permit.acquire_owned().await {
                     Ok(permit) => permit,
                     Err(_) => return DetailOutcome::Failed("detail semaphore closed".into()),
-                };
-                let api = match ApiClient::new(api_cfg, proxy.as_deref()) {
-                    Ok(api) => api,
-                    Err(error) => return DetailOutcome::Failed(error.message().to_string()),
                 };
                 match api.get_asset(&id).await {
                     Ok(data) => DetailOutcome::Row(asset_row(&data, &preferred, &login)),
@@ -467,6 +465,18 @@ impl AssetCatalog {
         }
         if refreshed <= 0.0 && locked {
             let _guard = self.refresh_lock.lock().await;
+            // Someone else may have completed the cold-start refresh while we waited;
+            // judging by the pre-wait value would trigger a second full refresh.
+            let refreshed_now = self
+                .state
+                .lock()
+                .expect("catalog lock")
+                .snapshot
+                .refreshed_at;
+            if refreshed_now > 0.0 {
+                let state = self.state.lock().expect("catalog lock");
+                return Ok(state.inventory.clone());
+            }
         }
         if now() - refreshed >= self.settings.refresh_interval as f64 {
             let last = *self.last_attempt.lock().expect("attempt lock");

@@ -20,7 +20,6 @@ use crate::guard;
 use crate::inventory::{shell_quote, Host};
 use crate::rest::AssetCatalog;
 use crate::scheduler::{queue_rejection, Lane, SlotWait, Timings};
-use crate::storage::journal::ProgressSink;
 use crate::storage::results::{atomic_json, ResultStore};
 use crate::transport::session::{
     find, new_nonce, ready_marker, ready_packet, terminal_packet, MARKER_SUFFIX,
@@ -1143,11 +1142,17 @@ impl Interactive {
         let mut rows: Vec<Value> = Vec::new();
         for (session, binding) in self.bindings.lock().await.iter() {
             let binding = binding.lock().await;
+            // A shell with a command in flight is "running", not "idle": the state
+            // shown here is what an operator uses to decide whether to reuse it.
+            let busy = match &binding.command {
+                Some(command) => command.try_lock().map(|c| c.is_busy()).unwrap_or(true),
+                None => false,
+            };
             rows.push(json!({
                 "session": session,
                 "host": binding.host.name,
                 "asset_id": binding.host.asset_id,
-                "state": if binding.closed { "closed" } else if binding.shell.is_closing() { "lost" } else { "idle" },
+                "state": if binding.closed { "closed" } else if binding.shell.is_closing() { "lost" } else if busy { "running" } else { "idle" },
             }));
         }
         json!({"sessions": rows})

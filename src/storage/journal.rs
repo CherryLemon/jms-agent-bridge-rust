@@ -54,6 +54,9 @@ pub struct RequestJournal {
     root: PathBuf,
     fs: Mutex<()>,
     claim: AsyncMutex<()>,
+    /// One lock per request: a fan-out writes many rows for the *same* request, and
+    /// different requests must not queue behind each other's fsync.
+    request_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     tasks: Mutex<HashMap<String, ()>>,
 }
 
@@ -69,6 +72,7 @@ impl RequestJournal {
             root,
             fs: Mutex::new(()),
             claim: AsyncMutex::new(()),
+            request_locks: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
         })
     }
@@ -83,8 +87,23 @@ impl RequestJournal {
         Ok(self.root.join(hex::encode(digest)))
     }
 
+    /// The lock that serializes read-modify-write for one request.
+    fn request_lock(&self, request_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.request_locks.lock().expect("request lock map");
+        locks
+            .entry(request_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     pub fn save(&self, receipt: &Map<String, Value>) -> BridgeResult<()> {
-        let _guard = self.fs.lock().expect("journal lock");
+        let request_id = receipt
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| BridgeError::storage("receipt without request_id"))?
+            .to_string();
+        let lock = self.request_lock(&request_id);
+        let _guard = lock.lock().expect("request lock");
         self.save_unlocked(receipt)
     }
 
@@ -104,7 +123,8 @@ impl RequestJournal {
     }
 
     pub fn load(&self, request_id: &str) -> BridgeResult<Map<String, Value>> {
-        let _guard = self.fs.lock().expect("journal lock");
+        let lock = self.request_lock(request_id);
+        let _guard = lock.lock().expect("request lock");
         self.load_unlocked(request_id)
     }
 
@@ -142,7 +162,8 @@ impl RequestJournal {
     }
 
     pub fn status(&self, request_id: &str, duplicate: bool) -> BridgeResult<Value> {
-        let _guard = self.fs.lock().expect("journal lock");
+        let lock = self.request_lock(request_id);
+        let _guard = lock.lock().expect("request lock");
         let mut receipt = self.load_unlocked(request_id)?;
         let live = self
             .tasks
@@ -179,9 +200,11 @@ impl RequestJournal {
     }
 
     fn progress(&self, request_id: &str, field: &str, value: Value) -> BridgeResult<()> {
-        // One lock for the whole read-modify-write: several targets finishing at once
-        // must not overwrite each other's rows.
-        let _guard = self.fs.lock().expect("journal lock");
+        // One lock per request covers the whole read-modify-write: several targets of
+        // the same request must not overwrite each other's rows, while other requests
+        // keep their own lane.
+        let lock = self.request_lock(request_id);
+        let _guard = lock.lock().expect("request lock");
         let mut receipt = self.load_unlocked(request_id)?;
         let identity = if field == "execution_results" {
             "result_id"

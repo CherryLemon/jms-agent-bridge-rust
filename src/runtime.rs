@@ -741,9 +741,7 @@ require allow_dangerous=true",
                 .journal
                 .execute(&request_id, &operation, &work, move |sink| async move {
                     let sink: Arc<dyn crate::storage::journal::ProgressSink> = sink;
-                    runtime
-                        .submit_jobs(&work_for_task, Some(sink.as_ref()))
-                        .await
+                    runtime.submit_jobs(&work_for_task, Some(sink)).await
                 })
                 .await?;
             // The receipt path returns the same kind of payload as a direct call, so it
@@ -991,7 +989,7 @@ require allow_dangerous=true",
     async fn submit_jobs(
         self: &Arc<Self>,
         arguments: &Value,
-        progress: Option<&dyn crate::storage::journal::ProgressSink>,
+        progress: Option<Arc<dyn crate::storage::journal::ProgressSink>>,
     ) -> BridgeResult<Value> {
         let map = arguments
             .as_object()
@@ -1010,31 +1008,68 @@ require allow_dangerous=true",
         }
         let targets = string_list(map.get("targets"));
         let hosts = self.resolve_many(&targets).await?;
-        let mut rows: Vec<Value> = Vec::new();
+        // Independent targets are launched side by side: each one pays its own channel
+        // setup and acknowledgement wait, which used to add up linearly.
+        const MAX_IN_FLIGHT: usize = 4;
+        let limit = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        let mut set = tokio::task::JoinSet::new();
+        for (index, host) in hosts.into_iter().enumerate() {
+            let runtime = self.clone();
+            let command = command.clone();
+            let progress = progress.clone();
+            let permit = limit.clone();
+            set.spawn(async move {
+                let _permit = permit.acquire_owned().await;
+                let name = host.name.clone();
+                let submitted = runtime
+                    .jobs
+                    .submit(&host, &command, progress.as_deref())
+                    .await;
+                (index, name, submitted)
+            });
+        }
+        let mut launched: Vec<(usize, Value)> = Vec::new();
         let mut all_launched = true;
         let mut any_unknown = false;
-        for host in hosts {
-            let (handle, outcome) = match self.jobs.submit(&host, &command, progress).await {
-                Ok(submitted) => submitted,
+        while let Some(joined) = set.join_next().await {
+            let (index, name, submitted) = match joined {
+                Ok(entry) => entry,
+                Err(error) => {
+                    all_launched = false;
+                    launched.push((
+                        usize::MAX,
+                        json!({"host": "<cancelled>", "job_id": Value::Null,
+                               "launch_state": "unknown", "launched": false,
+                               "completion_unknown": true,
+                               "error": format!("submission task failed: {error}")}),
+                    ));
+                    continue;
+                }
+            };
+            let row = match submitted {
+                Ok((handle, outcome)) => {
+                    all_launched &= handle.state == crate::jobs::LaunchState::Acknowledged;
+                    any_unknown |= handle.state == crate::jobs::LaunchState::Unknown;
+                    job_row(&handle, &outcome)
+                }
                 Err(error) => {
                     // The receipt could not be persisted, so nothing was transmitted.
-                    rows.push(json!({
-                        "host": host.name,
+                    all_launched = false;
+                    json!({
+                        "host": name,
                         "job_id": Value::Null,
                         "launch_state": "rejected",
                         "launched": false,
                         "execution_state": "not_started",
                         "completion_unknown": false,
                         "error": error.message(),
-                    }));
-                    all_launched = false;
-                    continue;
+                    })
                 }
             };
-            all_launched &= handle.state == crate::jobs::LaunchState::Acknowledged;
-            any_unknown |= handle.state == crate::jobs::LaunchState::Unknown;
-            rows.push(job_row(&handle, &outcome));
+            launched.push((index, row));
         }
+        launched.sort_by_key(|(index, _)| *index);
+        let rows: Vec<Value> = launched.into_iter().map(|(_, row)| row).collect();
         let mut value = json!({"ok": all_launched, "jobs": rows});
         if let Some(map) = value.as_object_mut() {
             if any_unknown {
@@ -1235,8 +1270,11 @@ require allow_dangerous=true",
                 "status",
                 "ok",
                 "exit_code",
+                "executed",
                 "execution_state",
                 "completion_unknown",
+                "failure_stage",
+                "error",
                 "producer",
                 "expires_at",
             ],
@@ -1392,15 +1430,17 @@ pub fn stage_if_large(
     value: Value,
 ) -> BridgeResult<Value> {
     const BUDGET: usize = 8 * 1024;
-    let text = value.to_string();
-    if text.len() <= BUDGET {
+    // Serialize once: the same bytes decide the budget, feed the preview and get saved.
+    let bytes = serde_json::to_vec(&value)?;
+    if bytes.len() <= BUDGET {
         return Ok(value);
     }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     let mut metadata = Map::new();
     metadata.insert("kind".into(), Value::from("operation"));
     metadata.insert("operation".into(), Value::from(operation));
-    metadata.insert("bytes".into(), json!(text.len()));
-    let result_id = store.save_json(&value, metadata)?;
+    metadata.insert("bytes".into(), json!(bytes.len()));
+    let result_id = store.save_serialized(&value, &bytes, metadata)?;
     let mut summary = Map::new();
     summary.insert(
         "ok".into(),
@@ -1409,7 +1449,8 @@ pub fn stage_if_large(
     summary.insert("staged".into(), Value::Bool(true));
     summary.insert("operation".into(), Value::from(operation));
     summary.insert("result_id".into(), Value::from(result_id.clone()));
-    summary.insert("bytes".into(), json!(text.len()));
+    summary.insert("bytes".into(), json!(bytes.len()));
+
     // Business-level shape the caller usually needs, without the bulk.
     // Short state fields stay on top: a staged reply must still tell the caller whether
     // the work finished and how to continue.

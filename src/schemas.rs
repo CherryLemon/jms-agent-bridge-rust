@@ -557,8 +557,9 @@ fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool
         ),
         (
             "jms_job_wait",
-            "Block until every targeted host reports a terminal status, or timeout elapses. A \
-timeout cancels nothing.",
+            "Block until every targeted host reports a terminal status (done, failed, \
+cancelled, missing), or timeout elapses. A timeout cancels nothing; rows it could not \
+refresh report status=unknown with watch_timeout=true.",
             json!({
                 "targets": array_of_strings("Targets to watch.", None),
                 "job_id": {"type": "string", "pattern": "^[0-9a-f]{8}$"},
@@ -974,12 +975,13 @@ mod tests {
         .is_err());
     }
 
-    /// Rough tokenisation-independent estimate: every real tokenizer spends at least
-    /// one token per ~4 bytes of ASCII JSON (and more on punctuation), so a byte budget
-    /// with a token estimate on top catches both raw size and pathological density.
+    /// Tokenizer-independent *estimate*, not a measurement.
+    ///
+    /// BPE tokenizers spend roughly one token per four bytes of ASCII JSON, and JSON is
+    /// punctuation-heavy, so the larger of the two proxies is used. It tracks the real
+    /// cost closely enough to catch regressions; the live numbers in
+    /// `docs/verification.md` are the ones to quote.
     fn estimate_tokens(text: &str) -> usize {
-        // Whitespace-separated runs plus one token per punctuation cluster is a close
-        // upper bound for BPE tokenizers on schema-shaped JSON.
         let bytes = text.len();
         let punctuation = text.chars().filter(|c| c.is_ascii_punctuation()).count();
         (bytes / 4).max(punctuation / 2).max(1)
@@ -987,25 +989,24 @@ mod tests {
 
     /// `tools/list` is paid on every session, so its size is a contract.
     ///
-    /// The measured payload is the whole `initialize`+`tools/list` envelope: names,
-    /// descriptions, schemas, annotations and the JSON-RPC wrapper, not just the
-    /// properties bag. `docs/verification.md` records the per-scenario accounting.
+    /// The fixture is what the server really emits: the real `INSTRUCTIONS` text, each
+    /// tool's own annotation flags, and the JSON-RPC envelope. `estimate_tokens` is a
+    /// tokenizer-independent *estimate* (the live figure is recorded in
+    /// `docs/verification.md`), not a measurement for a specific model.
     #[test]
     fn advertised_tools_stay_within_their_token_budget() {
         let tools: Vec<Value> = advertised()
             .iter()
             .map(|spec| {
+                let mut annotations = serde_json::Map::new();
+                annotations.insert("readOnlyHint".into(), json!(spec.read_only));
+                annotations.insert("destructiveHint".into(), json!(spec.destructive));
+                annotations.insert("openWorldHint".into(), json!(spec.open_world));
                 json!({
                     "name": spec.name,
                     "description": spec.description,
                     "inputSchema": spec.input_schema,
-                    // rmcp emits these hints on the wire; the live `tools/list` is
-                    // 6.8 KB with them, so the budget must count them.
-                    "annotations": {
-                        "readOnlyHint": false,
-                        "destructiveHint": true,
-                        "openWorldHint": true,
-                    },
+                    "annotations": Value::Object(annotations),
                 })
             })
             .collect();
@@ -1014,7 +1015,7 @@ mod tests {
             "id": 1,
             "result": {
                 "tools": tools,
-                "instructions": "resident JumpServer bridge",
+                "instructions": crate::INSTRUCTIONS,
             }
         })
         .to_string();
@@ -1024,18 +1025,17 @@ mod tests {
             "tools/list grew to {} bytes; move details into options or discover",
             payload.len()
         );
-        // Same payload through a tokenizer-shaped estimate: ~1.7k tokens is the ceiling
-        // an agent can afford to re-read on every turn (measured live at ~1.6k).
+        // Tokenizer-independent estimate; the ceiling leaves room for a real tokenizer.
         let tokens = estimate_tokens(&payload);
         if std::env::var("JMS_PRINT_BUDGET").is_ok() {
             eprintln!(
-                "tools/list envelope: {} bytes, ~{} tokens",
+                "tools/list envelope: {} bytes, ~{} tokens (estimate)",
                 payload.len(),
                 tokens
             );
         }
         assert!(
-            tokens <= 1700,
+            tokens <= 1800,
             "tools/list is about {tokens} tokens; move details into options or discover"
         );
         // Every advertised field must also be a real field: the lists may shrink, never drift.

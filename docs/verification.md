@@ -9,11 +9,22 @@ credentials are deliberately not recorded here.
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 131 passed |
+| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 140 passed |
 | Inventory refresh against a mock bastion (transient vs. explicit detail errors, account ambiguity) | `cargo test --test catalog_refresh` | 2 passed |
 | Offline contracts (tool list, schema validation, guard, receipts, saved-result reads, discovery) | `cargo test --test mcp_offline` | 1 passed |
 | Real `serve --stdio` subprocess: every stdout line parses as JSON-RPC while logging is at `info` | `cargo test --test mcp_stdio` | 1 passed |
 | Exec-channel plumbing against a live bastion | `cargo test --test ssh_pipe -- --ignored` | passed (manual) |
+
+Regression tests for the third review round (evidence, races, admission):
+`a_transmitted_but_unconfirmed_launch_stays_unknown`,
+`a_launcher_that_only_timed_out_waiting_stays_unknown`,
+`the_two_explicit_launcher_refusals_are_rejections`,
+`a_failure_before_sending_is_a_rejection`,
+`evidence_flows_through_the_classifier_into_the_row`,
+`a_concurrent_save_cannot_overwrite_a_newer_snapshot` (fails without the registry
+lock), `an_admitted_command_makes_the_terminal_busy_before_its_worker_exists`,
+`a_single_closed_stream_is_reported_as_an_event_not_a_verdict`,
+`a_cancelled_job_is_a_terminal_state_for_wait`.
 
 Regression tests for the second review round (state and lifecycle):
 `job_rows_distinguish_acknowledged_rejected_and_unknown` (launcher refusal is
@@ -72,6 +83,13 @@ the tool-schema budget (`advertised_tools_stay_within_their_token_budget`,
 | 25 | `call jms_submit_job` with `request_id` on two targets | `request_state:"complete"` with per-target `launch_state`; the receipt path shares the call budget |
 | 26 | measured `tools/list` from the running service | 7 tools, 6822 bytes on the wire (~1.6k tokens by the envelope estimate) |
 | 27 | `discover(operation=...)` sizes | `run` 2799 B, `fs` 3673 B, `terminal` 2261 B, `jms_submit_job` 635 B |
+| 28 | two concurrent `terminal exec` on one handle | first accepted and `running`, second refused with "terminal is busy"; the first response's `result_id` belongs to the first command |
+| 29 | `session_list` while a `sleep 25` command runs | returns in ~0 s; the terminal row says `running`, the named-shell row says `active` |
+| 30 | `terminal close` during a running command, then `result_metadata` | `execution_state:"unknown"`, `completion_unknown:true`, `failure_stage:"closed_by_caller"`, `executed:true` |
+| 31 | `jms_job_wait` after a cancel | returns in 0.71 s with `status:"cancelled"`, `finished:true` |
+| 32 | `jms_job_wait` with a budget shorter than the job | returns at ~3.25 s with `status:"unknown"`, `watch_timeout:true`; nothing is cancelled remotely |
+| 33 | `jms_submit_job` on two targets | both `acknowledged`; the 8.4 s wall time is dominated by the second host's first login (paced by design), not by serialisation |
+| 34 | `tools/list` measured on the wire | 7 tools, 6795 B for the list, ~7.0 KB with the server instructions |
 
 ## Deliberately not exercised here
 
@@ -98,6 +116,20 @@ the gateway:
 The resident service belongs on the host that holds the deployment's login
 material; nothing was transmitted before the refusal, so the probe reported
 `not_started` rather than a partial success.
+
+## Cost profile
+
+| Scenario | Measured cost |
+| --- | --- |
+| `initialize` + `tools/list` (7 tools, instructions, annotations) | 7047 B / ~1.8k tokens (estimate), 6795 B of tool list on the wire |
+| `discover(operation="run")` | 2799 B |
+| a compact single-host `run` response | ~0.4 KB |
+| a `read_result` page | the requested `limit` (4 KiB default) |
+| a staged `call` summary | < 4 KB, with `result_id` for the full payload |
+
+The token numbers are tokenizer-independent *estimates* (`bytes/4` versus a
+punctuation-density proxy, whichever is larger). They are stable enough to catch
+regressions and must not be quoted as a model-specific measurement.
 
 ## Notes and known limits
 

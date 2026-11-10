@@ -24,6 +24,36 @@ pub fn now() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Write bytes atomically: a reader sees either the old file or the complete new one.
+pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> BridgeResult<()> {
+    let temp = path.with_file_name(format!(
+        "{}.{}.tmp",
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "state.json".into()),
+        Uuid::new_v4().simple()
+    ));
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+    }
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(BridgeError::storage(format!(
+                "could not replace {}: {error}",
+                path.display()
+            )))
+        }
+    }
+}
+
 pub fn atomic_json(path: &Path, value: &Value) -> BridgeResult<()> {
     let temp = path.with_file_name(format!(
         "{}.{}.tmp",
@@ -326,8 +356,19 @@ impl ResultStore {
     }
 
     pub fn save_json(&self, value: &Value, metadata: Map<String, Value>) -> BridgeResult<String> {
+        self.save_serialized(value, &serde_json::to_vec(value)?, metadata)
+    }
+
+    /// Save a payload that is already serialized (the caller needed the bytes anyway to
+    /// decide whether it was oversized), so it is not serialized twice.
+    pub fn save_serialized(
+        &self,
+        value: &Value,
+        bytes: &[u8],
+        metadata: Map<String, Value>,
+    ) -> BridgeResult<String> {
         let result_id = self.create(metadata)?;
-        atomic_json(&self.path(&result_id, "result")?, value)?;
+        atomic_write_bytes(&self.path(&result_id, "result")?, bytes)?;
         let ok = !matches!(value, Value::Object(map) if map.get("ok") == Some(&Value::Bool(false)));
         let mut values = Map::new();
         values.insert("ok".into(), Value::Bool(ok));

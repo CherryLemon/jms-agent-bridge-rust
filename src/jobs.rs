@@ -401,16 +401,45 @@ else echo 'status=missing'; fi"
         Ok(Value::Object(parsed))
     }
 
+    /// Status for several (host, job) pairs with bounded concurrency.
+    ///
+    /// Sequential probing made a multi-host watch cost the sum of every target's
+    /// latency; independent targets now run side by side, capped so a large fan-out
+    /// cannot open an unbounded number of channels.
     pub async fn status_many(&self, pairs: &[(Host, String)]) -> Vec<Value> {
-        let mut out = Vec::new();
-        for (host, job_id) in pairs {
-            match self.status(host, job_id).await {
-                Ok(value) => out.push(value),
-                Err(error) => out.push(json!({"host": host.name, "job_id": job_id,
-                                              "ok": false, "error": error.message()})),
+        const MAX_IN_FLIGHT: usize = 4;
+        let mut set = tokio::task::JoinSet::new();
+        let limit = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        for (index, (host, job_id)) in pairs.iter().enumerate() {
+            let runner = self.runner.clone();
+            let host = host.clone();
+            let job_id = job_id.clone();
+            let permit = limit.clone();
+            let jobs = Jobs { runner };
+            set.spawn(async move {
+                let _permit = permit.acquire_owned().await;
+                let row = match jobs.status(&host, &job_id).await {
+                    Ok(value) => value,
+                    Err(error) => json!({"host": host.name, "job_id": job_id,
+                                         "ok": false, "error": error.message()}),
+                };
+                (index, row)
+            });
+        }
+        let mut rows: Vec<(usize, Value)> = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(entry) => rows.push(entry),
+                Err(error) => rows.push((
+                    usize::MAX,
+                    json!({"ok": false,
+                    "error": format!("status task failed: {error}")}),
+                )),
             }
         }
-        out
+        // Keep the caller's order so pairing rows with inputs stays trivial.
+        rows.sort_by_key(|(index, _)| *index);
+        rows.into_iter().map(|(_, row)| row).collect()
     }
 
     pub async fn logs(

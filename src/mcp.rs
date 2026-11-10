@@ -20,11 +20,22 @@ use crate::views;
 
 pub struct BridgeServer {
     pub runtime: Arc<BridgeRuntime>,
-    tools: Vec<Tool>,
+    /// Advertised tools, shared as one allocation instead of cloned per request.
+    tools: Arc<[Tool]>,
+    /// Full specs (the validation contract) built once and indexed by name.
+    specs: Arc<HashMap<String, Arc<schemas::ToolSpec>>>,
 }
 
 impl BridgeServer {
     pub fn new(runtime: Arc<BridgeRuntime>) -> Self {
+        // Every full specification is built once per process: `dispatch` needs exactly
+        // one of them, and rebuilding all seven on each call was pure overhead.
+        let specs: Arc<HashMap<String, Arc<schemas::ToolSpec>>> = Arc::new(
+            schemas::full_specs()
+                .into_iter()
+                .map(|spec| (spec.name.to_string(), Arc::new(spec)))
+                .collect(),
+        );
         let tools = schemas::advertised()
             .into_iter()
             .map(|spec| {
@@ -42,12 +53,17 @@ impl BridgeServer {
                 ));
                 tool
             })
-            .collect();
-        Self { runtime, tools }
+            .collect::<Vec<Tool>>()
+            .into();
+        Self {
+            runtime,
+            tools,
+            specs,
+        }
     }
 
     pub fn tool_specs(&self) -> Vec<Tool> {
-        self.tools.clone()
+        self.tools.to_vec()
     }
 
     /// Validate, merge advanced options and dispatch, then compact the answer.
@@ -58,10 +74,11 @@ impl BridgeServer {
     ) -> Result<Value, BridgeError> {
         // Validate against the complete definition: the advertised schema is a
         // token-saving subset, not the contract.
-        let spec = schemas::full_specs()
-            .into_iter()
-            .find(|spec| spec.name == name)
-            .ok_or_else(|| BridgeError::invalid(format!("unknown tool {name:?}")))?;
+        let spec = self
+            .specs
+            .get(name)
+            .ok_or_else(|| BridgeError::invalid(format!("unknown tool {name:?}")))?
+            .clone();
         // `detail` was advertised by earlier releases; it is accepted (and honoured)
         // without spending tokens on it in every schema.
         let mut arguments = arguments;
@@ -166,7 +183,7 @@ impl ServerHandler for BridgeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(self.tools.clone()))
+        Ok(ListToolsResult::with_all_items(self.tools.to_vec()))
     }
 
     async fn call_tool(
@@ -176,11 +193,13 @@ impl ServerHandler for BridgeServer {
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
         let arguments = request.arguments.unwrap_or_default();
-        let runtime = self.runtime.clone();
-        let tools = self.tools.clone();
         // Run the request in a service-owned task: a client that disconnects cannot
         // cancel an accepted execution half way through a transfer.
-        let server = BridgeServer { runtime, tools };
+        let server = BridgeServer {
+            runtime: self.runtime.clone(),
+            tools: self.tools.clone(),
+            specs: self.specs.clone(),
+        };
         let result = tokio::spawn(async move { server.dispatch(&name, arguments).await })
             .await
             .map_err(|error| {

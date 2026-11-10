@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.3.3
+
+Correctness follow-up on the 0.3.2 lifecycle work, plus the latency fixes that the
+higher concurrency exposed.
+
+### Jobs
+* `launch_state` is derived from execution evidence in one place: an unknown
+  execution state stays `unknown`, a launcher that only timed out waiting for its
+  runner (exit 5) stays `unknown`, and only the launcher's own refusals (exit 3/4)
+  or a failure proven to happen before sending become `rejected`.
+* `jms_job_wait` treats `cancelled` as terminal and bounds every status scan and
+  sleep by the remaining budget; a scan that cannot finish reports
+  `status=unknown, watch_timeout=true` without touching the remote job.
+* Multi-target submission and status run with bounded concurrency (4 in flight).
+
+### Sessions
+* Registry saves take a lock across snapshot+write+rename: a stale snapshot can no
+  longer be renamed over a newer one and silently drop a session after restart.
+* A status query never waits on a shell that is executing: `sessions()` reports
+  such a shell as `running` from a `try_lock` snapshot.
+* The final result uses the session state the attempt already carries instead of
+  re-locking the shell, so a finished request cannot wait behind the next command.
+
+### Terminal
+* Admission is atomic (check + reserve + install under one lock), so two concurrent
+  execs cannot both start; a command is busy from admission, before its worker
+  handle exists.
+* The exec response is bound to the command that was admitted.
+* One stream ending no longer ends the command while the other still holds a
+  queued completion marker (`Data`/`StreamClosed`/`AllClosed`).
+* `session_list` shows `running` for a terminal with a command in flight.
+
+### Receipts and results
+* A pre-send failure closes the result as `not_started` and releases its active
+  slot instead of leaving a phantom active run.
+* Fan-out keeps every target's outcome: a failed target becomes its own row.
+* Terminal exec records its result id before sending, and `request_status`
+  projects the live state of the stored result under both the rows and the
+  top-level result id.
+* Journal progress uses one lock per request instead of one global lock.
+
+### Performance
+* One REST client per inventory refresh (the detail fan-out shares its connection
+  pool), and `ensure()` re-checks after taking the refresh lock so a slow
+  cold-start refresh cannot trigger a second full fetch.
+* Full tool schemas are built once and indexed; the advertised list is shared
+  instead of cloned per call.
+* Staging serializes a payload once and reuses the bytes for the size decision,
+  the preview and the saved file.
+
+### Tests
+* `tools/list` budget is measured on the real envelope (real instructions text and
+  each tool's own annotation flags): 7047 bytes, ~1.8k tokens *estimated*; the
+  live service reports 6795 bytes for the tool list alone.
+
 ## 0.3.2
 
 Lifecycle and state-transition pass. Every item below changes what the caller can

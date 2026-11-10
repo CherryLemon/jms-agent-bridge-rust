@@ -370,11 +370,11 @@ impl Runner {
 
     /// Every registered named shell with its *live* state.
     ///
-    /// A registry entry only says the id was used before; whether the shell is still
-    /// there is decided by the live map, so `lost` is not assumed.
+    /// A shell that is executing a command holds its own lock, and a status query must
+    /// not queue behind it: `try_lock` reports such a shell as `running` instead.
     pub async fn sessions(&self) -> Vec<Value> {
         let known = self.known_sessions.lock().expect("session lock").clone();
-        let live: Vec<((String, String), Arc<AsyncMutex<ShellSession>>)> = {
+        let live: HashMap<(String, String), Arc<AsyncMutex<ShellSession>>> = {
             let shells = self.shells.lock().await;
             shells
                 .iter()
@@ -384,14 +384,20 @@ impl Runner {
         let mut rows: Vec<Value> = Vec::new();
         for (target, session_id) in known.iter() {
             let asset_id = target.split('\u{1f}').last().unwrap_or("").to_string();
-            let mut state = "lost";
-            for ((key, live_session), slot) in &live {
-                if key != target || live_session != session_id {
-                    continue;
-                }
-                let shell = slot.lock().await;
-                state = if shell.is_closing() { "lost" } else { "active" };
-            }
+            let state = match live.get(&(target.clone(), session_id.clone())) {
+                None => "lost",
+                Some(slot) => match slot.try_lock() {
+                    Ok(shell) => {
+                        if shell.is_closing() {
+                            "lost"
+                        } else {
+                            "active"
+                        }
+                    }
+                    // Busy means a command is running right now.
+                    Err(_) => "running",
+                },
+            };
             rows.push(json!({
                 "asset_id": asset_id,
                 "session_id": session_id,
@@ -684,17 +690,11 @@ impl Runner {
             host.connection_key()?,
             spec.session_id.clone().unwrap_or_default(),
         );
+        // The attempt already decided this while it owned the shell; re-locking here
+        // would make a finished request wait behind the *next* command on that session.
         let session_state = if spec.session_id.is_some() {
-            let entry = {
-                let shells = self.shells.lock().await;
-                shells.get(&session_key).cloned()
-            };
-            match entry {
-                Some(shell) => {
-                    let shell = shell.lock().await;
-                    Some(if shell.is_closing() { "lost" } else { "active" })
-                }
-                None => Some(
+            attempt.session_state.clone().or_else(|| {
+                Some(
                     if self
                         .known_sessions
                         .lock()
@@ -705,8 +705,8 @@ impl Runner {
                     } else {
                         "not_started"
                     },
-                ),
-            }
+                )
+            })
         } else {
             None
         };
