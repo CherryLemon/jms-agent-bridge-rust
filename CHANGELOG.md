@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.2
+
+* The pre-transfer `stat` only applies to regular files. A directory's own inode size is
+  not the size of what will be transferred, so using it would have reported 100% from
+  the first byte; directories now fall back to rsync's own percentage, which covers all
+  files.
+
 ## 0.4.1
 
 Follow-ups on the 0.4.0 teardown and progress work.

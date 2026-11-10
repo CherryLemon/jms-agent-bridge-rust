@@ -501,9 +501,12 @@ impl Filesystem {
         container: Option<&str>,
         progress: Option<&dyn crate::storage::journal::ProgressSink>,
     ) -> Option<u64> {
+        // Only a regular file has a meaningful transfer size. A directory's own size is
+        // its inode size, not the sum of what will be transferred, and using it would
+        // report 100% immediately.
         let script = format!(
-            "stat -c %s -- {} 2>/dev/null || true",
-            crate::fsprobe::shlex_quote(remote)
+            "if [ -f {path} ]; then stat -c %s -- {path} 2>/dev/null; fi; true",
+            path = crate::fsprobe::shlex_quote(remote)
         );
         let meta = self
             .workers
