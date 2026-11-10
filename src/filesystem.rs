@@ -493,6 +493,18 @@ impl Filesystem {
         }
     }
 
+    /// Size of one local upload, or `None` when the path is not a plain file.
+    ///
+    /// Only a regular file has a size that equals what rsync will send. A directory is
+    /// transferred recursively, and `-a` copies a symlink *as a link*, so following it
+    /// would report the target's size for a few bytes of link - hence `symlink_metadata`.
+    pub fn upload_size_hint(local: &str) -> Option<u64> {
+        std::fs::symlink_metadata(local)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+    }
+
     /// Size of one remote file, or `None` when it cannot be determined cheaply.
     async fn remote_size(
         &self,
@@ -556,13 +568,7 @@ impl Filesystem {
             // A known size makes progress and ETA available from the first byte: the
             // local file for an upload, one `stat` for a download.
             let expected_total = if action == "upload" {
-                // A directory's own length is not what will be transferred, so only a
-                // regular file may provide the denominator; directories use rsync's own
-                // accounting instead.
-                std::fs::metadata(&local)
-                    .ok()
-                    .filter(|meta| meta.is_file())
-                    .map(|meta| meta.len())
+                Self::upload_size_hint(&local)
             } else {
                 self.remote_size(&host, &remote, options.container.as_deref(), progress)
                     .await
@@ -768,6 +774,45 @@ pub fn worker_counts(status: &Value) -> HashMap<String, u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The upload denominator only comes from a plain file.
+    ///
+    /// `-a` copies a symlink as a link and a directory recursively, so following either
+    /// would report a size that has nothing to do with what rsync sends.
+    #[test]
+    fn only_regular_files_provide_an_upload_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("plain.bin");
+        std::fs::write(&file, vec![7u8; 4_096]).unwrap();
+        assert_eq!(
+            Filesystem::upload_size_hint(&file.to_string_lossy()),
+            Some(4_096)
+        );
+
+        let subdirectory = directory.path().join("nested");
+        std::fs::create_dir(&subdirectory).unwrap();
+        assert_eq!(
+            Filesystem::upload_size_hint(&subdirectory.to_string_lossy()),
+            None,
+            "a directory is transferred recursively; its own length is not the size"
+        );
+
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link.bin");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert_eq!(
+                Filesystem::upload_size_hint(&link.to_string_lossy()),
+                None,
+                "a symlink is copied as a link, not as its target"
+            );
+        }
+
+        assert_eq!(
+            Filesystem::upload_size_hint(&directory.path().join("missing").to_string_lossy()),
+            None
+        );
+    }
 
     fn args(value: Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap()

@@ -41,6 +41,7 @@ Root cause: rsync gives a custom remote-shell a non-blocking stdout unless
 | 58 | idle stall mid-transfer (remote sender frozen, `rsync_idle_seconds = 8`) | returned after 12.6 s: exit 124, `completion_unknown=true`, `execution_state=unknown`, 12% of the real total, local rsync terminated |
 | 59 | teardown with an injected channel handle (unit) | stalled child reaped, channel closed exactly once, handle consumed |
 | 60 | `-e` quoting through a port of rsync's parser (unit) | spaces, quotes and backslashes all round-trip |
+| 61 | upload size hint (unit) | plain file yes; directory, symlink and missing path no |
 
 Regression tests for the fifth review round (evidence monotonicity, result ownership):
 `a_late_annotation_failure_keeps_the_completed_verdict`,

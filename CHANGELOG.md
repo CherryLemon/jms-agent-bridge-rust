@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.4
+
+* The upload size hint uses `symlink_metadata`. `-a` copies a symlink *as a link*, so
+  following it reported the target's size for a few bytes of link; symlinks and
+  directories now fall back to rsync's own accounting. Regression covers a plain file,
+  a directory, a symlink and a missing path.
+
 ## 0.4.3
 
 Review round after 0.4.2: one real defect in the idle path, plus four narrower ones.
