@@ -26,6 +26,10 @@ Root cause: rsync gives a custom remote-shell a non-blocking stdout unless
 | 43 | 8 MiB relay backpressure (non-blocking stdout) | full payload, exit 0, fails on the previous implementation |
 | 44 | 256 MiB download after the transfer-owner rework | 8.19 s, 32.8 MB/s, exit 0, SHA-256 match |
 | 45 | 64 MiB download after the transfer-owner rework | 1.71 s, exit 0 |
+| 46 | 256 MiB download with independent pumps | 11.94 s, 22.5 MB/s, SHA-256 match |
+| 47 | 256 MiB download interrupted at 3 s (`timeout: 3`) | exit 124, no final file, `.jms-partial/` kept |
+| 48 | Retry of 47 with `overwrite=false` | 5.0 s (11.9 s from scratch), SHA-256 match, partial cleaned |
+| 49 | `overwrite=false` onto an existing complete file | file preserved verbatim, transfer reports ok |
 
 Regression tests for the fifth review round (evidence monotonicity, result ownership):
 `a_late_annotation_failure_keeps_the_completed_verdict`,

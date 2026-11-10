@@ -229,6 +229,34 @@ pub struct TransferOutcome {
 
 /// Run one rsync transfer through the pooled connection.
 #[allow(clippy::too_many_arguments)]
+/// Where an interrupted transfer keeps its data so a retry can resume.
+pub(crate) const PARTIAL_DIR: &str = ".jms-partial";
+
+/// Ask rsync to shut down, then force it.
+///
+/// rsync saves the partial file in its own cleanup, so a SIGKILL straight away loses the
+/// work; SIGTERM first gives it the chance to keep what it has.
+fn terminate(child: &mut std::process::Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(_) => return,
+    }
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Everything the transfer starts, so no path can leave it running.
 ///
 /// Preparing the local side can fail after the accept task is spawned (log file, rsync
@@ -348,6 +376,7 @@ pub async fn transfer(
                     &err_path,
                     &sent,
                     &pumps,
+                    &stop,
                 )
                 .await
                 {
@@ -385,6 +414,10 @@ pub async fn transfer(
         crate::fsprobe::shlex_quote(&relay.socket.to_string_lossy())
     );
     command.arg("-e").arg(relay_cmd);
+    // Resumable partials: rsync keeps an interrupted file in this directory, separate
+    // from the destination name, so a retry can reuse it while `--ignore-existing`
+    // still protects an already complete file.
+    command.arg("--partial-dir").arg(PARTIAL_DIR);
     if !overwrite {
         command.arg("--ignore-existing");
     }
@@ -435,8 +468,7 @@ pub async fn transfer(
     owner.quiesce().await;
     owner.reap_pumps().await;
     if let Some(error) = kill_reason {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate(&mut child);
         return Err(BridgeError::storage(error));
     }
     let outcome = match waited {
@@ -447,8 +479,8 @@ pub async fn transfer(
             timed_out: false,
         },
         _ => {
-            let _ = child.kill();
-            let _ = child.wait();
+            // Timeout: let rsync keep its partial before forcing it out.
+            terminate(&mut child);
             TransferOutcome {
                 exit_code: 124,
                 sent: sent.load(Ordering::SeqCst),
@@ -470,6 +502,7 @@ async fn serve_stream(
     err_path: &Path,
     sent: &Arc<AtomicBool>,
     pumps: &Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    stop_flag: &Arc<AtomicBool>,
 ) -> BridgeResult<()> {
     let mut line = Vec::new();
     let mut buffer = [0u8; 1];
@@ -564,60 +597,71 @@ async fn serve_stream(
     }
     sent.store(true, Ordering::SeqCst);
     let err_handle = err_path.to_path_buf();
-    let pump = tokio::spawn(async move {
-        let mut socket_open = true;
-        let mut channel_open = true;
+    // rsync is full duplex, so each direction gets its own task: a write that waits for
+    // SSH window space must not stop the other direction from draining. Dropping the
+    // channel writer after a socket EOF would tear the SSH channel down while the
+    // download direction is still streaming, so the uplink keeps it until the transfer
+    // stops.
+    let (socket_read, socket_write) = stream.into_split();
+    let uplink_stop = stop_flag.clone();
+    let uplink = tokio::spawn(async move {
+        let mut socket_read = socket_read;
+        let channel_writer = writer;
         let mut chunk = vec![0u8; 65536];
-        // Both directions are serviced concurrently: rsync is full duplex, so a
-        // blocking read on one side deadlocks the handshake.
-        while socket_open || channel_open {
-            tokio::select! {
-                read = stream.read(&mut chunk), if socket_open => {
-                    match read {
-                        Ok(0) => {
-                            socket_open = false;
-                            writer.write_eof().await;
-                        }
-                        Ok(count) => {
-                            if let Err(error) = writer.write(&chunk[..count]).await {
-                                tracing::debug!(error = error.message(), "rsync socket->channel failed");
-                                return;
-                            }
-                        }
-                        Err(_) => socket_open = false,
+        loop {
+            match socket_read.read(&mut chunk).await {
+                Ok(0) => {
+                    // A one-way end: half-close the remote stdin and keep the channel.
+                    channel_writer.write_eof().await;
+                    while !uplink_stop.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    return;
+                }
+                Ok(count) => {
+                    if let Err(error) = channel_writer.write(&chunk[..count]).await {
+                        tracing::debug!(error = error.message(), "rsync socket->channel failed");
+                        return;
                     }
                 }
-                event = reader.recv(), if channel_open => {
-                    match event {
-                        Some(ShellEvent::Data(data)) => {
-                            if stream.write_all(&data).await.is_err() {
-                                return;
-                            }
-                        }
-                        Some(ShellEvent::ExtData(data)) => {
-                            if let Ok(mut file) = std::fs::OpenOptions::new()
-                                .append(true)
-                                .create(true)
-                                .open(&err_handle)
-                            {
-                                let _ = file.write_all(&data);
-                            }
-                        }
-                        Some(ShellEvent::ExecRejected) | None => {
-                            channel_open = false;
-                            // The remote side is gone: close the local socket so the relay
-                            // (and therefore rsync) can exit instead of waiting forever.
-                            let _ = stream.shutdown().await;
-                            socket_open = false;
-                        }
-                        Some(_) => {}
-                    }
+                Err(error) => {
+                    tracing::debug!(%error, "rsync socket read failed");
+                    return;
                 }
             }
         }
     });
+    let downlink = tokio::spawn(async move {
+        let mut socket_write = socket_write;
+        let mut reader = reader;
+        let mut channel_open = true;
+        while channel_open {
+            match reader.recv().await {
+                Some(ShellEvent::Data(data)) => {
+                    if socket_write.write_all(&data).await.is_err() {
+                        return;
+                    }
+                }
+                Some(ShellEvent::ExtData(data)) => {
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&err_handle)
+                    {
+                        let _ = file.write_all(&data);
+                    }
+                }
+                Some(ShellEvent::ExecRejected) | None => channel_open = false,
+                Some(_) => {}
+            }
+        }
+        // The remote side is gone: close the local socket so rsync's own write path
+        // fails and it exits instead of waiting for a peer that will never answer.
+        let _ = socket_write.shutdown().await;
+    });
     if let Ok(mut handles) = pumps.lock() {
-        handles.push(pump);
+        handles.push(uplink);
+        handles.push(downlink);
     }
     Ok(())
 }

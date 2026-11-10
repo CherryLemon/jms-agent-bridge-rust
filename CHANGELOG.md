@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.3.8
+
+Independent pumps, resumable transfers, and a shutdown rsync can survive.
+
+### Relay
+* The relay now runs one task per direction (socket->SSH, SSH->socket) instead of a
+  single `select!` loop whose branch awaited the whole write. A write waiting for SSH
+  window space can no longer stop the other direction from draining.
+* A socket EOF half-closes the remote stdin and keeps the channel writer alive until
+  the transfer stops; dropping it there used to tear the SSH channel down while the
+  download direction was still streaming.
+
+### Resumable transfers
+* rsync now runs with `--partial-dir=.jms-partial`: an interrupted transfer keeps its
+  data in a directory beside the destination, never under the final name, so
+  `overwrite=false` still protects a complete file while a retry can reuse the partial.
+* Timeout and error paths send SIGTERM first and only SIGKILL after 15 s, so rsync gets
+  the chance to save its partial in its own cleanup. Verified live: a 256 MiB download
+  interrupted at 3 s left `.jms-partial/` with no final file, and the retry with
+  `overwrite=false` finished in 5.0 s with a matching SHA-256 (11.9 s from scratch).
+
+### Notes
+* The `.jms-partial` directory is left in place after a failed transfer on purpose; it
+  is what makes the retry cheap. It is removed by rsync once the file completes.
+
+
 ## 0.3.7
 
 One owner for the transfer, and progress that means progress.
