@@ -266,6 +266,47 @@ pub fn derive_launch_state(acknowledged: bool, meta: &Map<String, Value>) -> Lau
     LaunchState::Unknown
 }
 
+/// One row per requested pair, using the latest observation and marking the pairs that
+/// were never observed (`watch_timeout`) instead of inventing a status for them.
+fn collect_rows(
+    pairs: &[(Host, String)],
+    last: &std::collections::HashMap<(String, String), Value>,
+    watch_timeout: bool,
+) -> Vec<Value> {
+    pairs
+        .iter()
+        .map(
+            |(host, job_id)| match last.get(&(host.name.clone(), job_id.clone())) {
+                Some(row) => {
+                    let mut row = row.clone();
+                    if watch_timeout && !is_terminal_status(&row) && is_unfinished_status(&row) {
+                        if let Some(map) = row.as_object_mut() {
+                            map.insert("watch_timeout".into(), Value::Bool(true));
+                        }
+                    }
+                    row
+                }
+                None => json!({
+                    "host": host.name,
+                    "job_id": job_id,
+                    "status": "unknown",
+                    "ok": false,
+                    "watch_timeout": true,
+                    "note": "the status scan ran out of budget before this host answered",
+                }),
+            },
+        )
+        .collect()
+}
+
+/// A row that may still change (as opposed to a terminal one).
+fn is_unfinished_status(row: &Value) -> bool {
+    row.get("status")
+        .and_then(Value::as_str)
+        .map(|status| status != "missing")
+        .unwrap_or(true)
+}
+
 /// Terminal job states for `wait`: nothing may change after them.
 const TERMINAL_STATUSES: [&str; 4] = ["done", "failed", "cancelled", "missing"];
 
@@ -555,36 +596,51 @@ echo \"status_before=$status_before\""
     ) -> (Vec<Value>, bool) {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
+        // Rows are kept across rounds: a host that already answered must not be replaced
+        // by "unknown" just because a later scan of *another* host ran out of budget.
+        let mut last: std::collections::HashMap<(String, String), Value> =
+            std::collections::HashMap::new();
         loop {
-            // One scan is bounded by the *remaining* budget: a slow host can no longer
-            // push the whole call past its deadline by a whole probe timeout.
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let probe_budget = remaining.max(std::time::Duration::from_millis(250));
-            let latest = match tokio::time::timeout(probe_budget, self.status_many(pairs)).await {
-                Ok(rows) => rows,
-                Err(_) => {
-                    // Keep the "we do not cancel remote jobs" promise: report what we know.
-                    let rows = pairs
-                        .iter()
-                        .map(|(host, job_id)| {
-                            json!({"host": host.name, "job_id": job_id,
-                                   "status": "unknown", "ok": false,
-                                   "watch_timeout": true})
-                        })
-                        .collect();
-                    return (rows, false);
+            if remaining.is_zero() {
+                return (collect_rows(pairs, &last, true), false);
+            }
+            let probe_budget = remaining;
+            match tokio::time::timeout(probe_budget, self.status_many(pairs)).await {
+                Ok(rows) => {
+                    for row in rows {
+                        let key = (
+                            row.get("host")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            row.get("job_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                        last.insert(key, row);
+                    }
                 }
-            };
-            if latest.iter().all(is_terminal_status) {
-                return (latest, true);
+                // The scan itself was cut short. Whatever was collected before is kept;
+                // the outstanding pairs are reported as not watched, and nothing is
+                // cancelled on the remote side.
+                Err(_) => return (collect_rows(pairs, &last, true), false),
+            }
+            if pairs.iter().all(|(host, job)| {
+                last.get(&(host.name.clone(), job.clone()))
+                    .map(is_terminal_status)
+                    .unwrap_or(false)
+            }) {
+                return (collect_rows(pairs, &last, false), true);
             }
             if tokio::time::Instant::now() >= deadline {
-                return (latest, false);
+                return (collect_rows(pairs, &last, false), false);
             }
             let sleep = std::time::Duration::from_secs_f64(interval.max(0.1));
             let sleep = sleep.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
             if sleep.is_zero() {
-                return (latest, false);
+                return (collect_rows(pairs, &last, false), false);
             }
             tokio::time::sleep(sleep).await;
         }
@@ -802,6 +858,27 @@ mod tests {
     fn an_acknowledged_launcher_wins_over_any_other_flag() {
         let meta = evidence(json!({"executed": true, "exit_code": 5}));
         assert_eq!(derive_launch_state(true, &meta), LaunchState::Acknowledged);
+    }
+
+    #[test]
+    fn wait_rows_keep_known_statuses_and_flag_only_the_unwatched_ones() {
+        let pairs = vec![
+            (host(None), "aaaa1111".to_string()),
+            (host(None), "bbbb2222".to_string()),
+        ];
+        let mut last = std::collections::HashMap::new();
+        last.insert(
+            ("asset-1".to_string(), "aaaa1111".to_string()),
+            json!({"host": "asset-1", "job_id": "aaaa1111", "status": "done", "exit_code": "0"}),
+        );
+        // A host that already answered keeps its verdict...
+        let rows = collect_rows(&pairs, &last, true);
+        assert_eq!(rows[0]["status"], "done");
+        assert!(rows[0].get("watch_timeout").is_none());
+        // ...while the one that never answered is flagged, not invented.
+        assert_eq!(rows[1]["status"], "unknown");
+        assert_eq!(rows[1]["watch_timeout"], true);
+        assert_eq!(rows.len(), pairs.len());
     }
 
     #[test]

@@ -70,7 +70,6 @@ impl BridgeRuntime {
             catalog.clone(),
             runner.clone(),
             store.clone(),
-            journal.clone(),
         ));
         terminals.start().await?;
         let jobs = Arc::new(Jobs::new(runner.clone()));
@@ -267,10 +266,11 @@ impl BridgeRuntime {
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((_name, Ok(meta))) => metas.push(meta),
-                Ok((name, Err(error))) => metas.push(failure_row(&name, &error)),
-                Err(error) => metas.push(failure_row(
+                Ok((name, Err(failure))) => metas.push(failure_row(&name, &failure)),
+                // A panicked or cancelled task says nothing about the wire.
+                Err(error) => metas.push(unknown_row(
                     "<cancelled>",
-                    &BridgeError::ssh(format!("fan-out task failed: {error}")),
+                    &format!("fan-out task failed: {error}"),
                 )),
             }
         }
@@ -1013,6 +1013,7 @@ require allow_dangerous=true",
         const MAX_IN_FLIGHT: usize = 4;
         let limit = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
         let mut set = tokio::task::JoinSet::new();
+        let command: Arc<str> = Arc::from(command.as_str());
         for (index, host) in hosts.into_iter().enumerate() {
             let runtime = self.clone();
             let command = command.clone();
@@ -1023,7 +1024,7 @@ require allow_dangerous=true",
                 let name = host.name.clone();
                 let submitted = runtime
                     .jobs
-                    .submit(&host, &command, progress.as_deref())
+                    .submit(&host, command.as_ref(), progress.as_deref())
                     .await;
                 (index, name, submitted)
             });
@@ -1373,17 +1374,59 @@ pub fn string_list(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A per-target row for a failure that happened before the target produced a result.
-fn failure_row(host: &str, error: &BridgeError) -> Map<String, Value> {
+/// A per-target row built from the evidence the execution layer captured.
+///
+/// The classification comes from the failure itself: a local write after a successful
+/// run keeps `completed`/`unknown` and its exit code, while only a proven pre-send
+/// failure is reported as `not_started`.
+fn failure_row(host: &str, failure: &crate::execution::ExecFailure) -> Map<String, Value> {
     let mut row = Map::new();
     row.insert("host".into(), Value::from(host));
+    for key in [
+        "result_id",
+        "exit_code",
+        "executed",
+        "execution_state",
+        "completion_unknown",
+        "timed_out",
+        "queue_timed_out",
+        "failure_stage",
+        "session_state",
+        "warning",
+    ] {
+        if let Some(value) = failure.meta.get(key) {
+            row.insert(key.to_string(), value.clone());
+        }
+    }
     row.insert("ok".into(), Value::Bool(false));
-    row.insert("exit_code".into(), Value::from(75));
-    row.insert("executed".into(), Value::Bool(false));
-    row.insert("execution_state".into(), Value::from("not_started"));
-    row.insert("completion_unknown".into(), Value::Bool(false));
-    row.insert("error".into(), Value::from(error.message()));
+    if !row.contains_key("executed") {
+        row.insert("executed".into(), Value::Null);
+    }
+    if !row.contains_key("execution_state") {
+        // No evidence at all: unknown is the only safe answer.
+        row.insert("execution_state".into(), Value::from("unknown"));
+        row.insert("completion_unknown".into(), Value::Bool(true));
+    }
+    row.insert("error".into(), Value::from(failure.error.message()));
+    if failure.meta.get("local_error") == Some(&Value::Bool(true)) {
+        row.insert("local_error".into(), Value::Bool(true));
+    }
     row
+}
+
+/// A row for work whose outcome is not known (panicked task, cancelled join).
+fn unknown_row(host: &str, message: &str) -> Map<String, Value> {
+    json!({
+        "host": host,
+        "ok": false,
+        "executed": Value::Null,
+        "execution_state": "unknown",
+        "completion_unknown": true,
+        "error": message,
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default()
 }
 
 /// One job row: the id is always reported, `launched` only when the launcher said so.
@@ -1435,7 +1478,9 @@ pub fn stage_if_large(
     if bytes.len() <= BUDGET {
         return Ok(value);
     }
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    // `serde_json` output is UTF-8; borrow it instead of copying the whole payload.
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| BridgeError::storage("serialized payload is not valid UTF-8"))?;
     let mut metadata = Map::new();
     metadata.insert("kind".into(), Value::from("operation"));
     metadata.insert("operation".into(), Value::from(operation));
@@ -1556,6 +1601,72 @@ pub fn dangerous_flag_description() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local persistence failure after a successful run must not read as "not run".
+    #[test]
+    fn a_store_failure_after_the_run_keeps_the_execution_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::storage::results::ResultStore::new(
+                directory.path().to_path_buf(),
+                3600.0,
+                3600.0,
+            )
+            .unwrap(),
+        );
+        let result_id = store
+            .create(
+                json!({"kind": "run", "host": "asset-1"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            )
+            .unwrap();
+        // Simulate "the remote command ran, then the metadata write failed": the result
+        // directory disappears before `finish`.
+        std::fs::remove_dir_all(store.root.join(&result_id)).unwrap();
+        let mut values = Map::new();
+        values.insert("result_id".into(), Value::from(result_id.clone()));
+        values.insert("ok".into(), Value::Bool(true));
+        values.insert("exit_code".into(), json!(0));
+        values.insert("executed".into(), Value::Bool(true));
+        values.insert("execution_state".into(), Value::from("completed"));
+        values.insert("completion_unknown".into(), Value::Bool(false));
+        let error = store
+            .finish(&result_id, values.clone())
+            .err()
+            .expect("finish must fail on a missing result");
+        let failure = crate::execution::ExecFailure::after(values, error);
+        let row = failure_row("asset-1", &failure);
+        assert_eq!(
+            row["execution_state"], "completed",
+            "must not become not_started"
+        );
+        assert_eq!(row["executed"], true);
+        assert_eq!(row["exit_code"], 0);
+        assert_eq!(row["result_id"], result_id);
+        assert_eq!(row["ok"], false);
+        assert!(
+            row["error"].as_str().unwrap().contains("unknown")
+                || !row["error"].as_str().unwrap().is_empty()
+        );
+        // The active slot is released even though the write failed.
+        assert_eq!(store.retention_status()["active_results"], 0);
+    }
+
+    /// Only a proven pre-send failure may be reported as "not executed".
+    #[test]
+    fn a_presend_failure_is_still_reported_as_not_started() {
+        let failure = crate::execution::ExecFailure::before_send(
+            "channel",
+            crate::errors::BridgeError::ssh("channel refused"),
+        );
+        let row = failure_row("asset-1", &failure);
+        assert_eq!(row["execution_state"], "not_started");
+        assert_eq!(row["executed"], false);
+        assert_eq!(row["completion_unknown"], false);
+        assert_eq!(row["failure_stage"], "channel");
+    }
 
     /// A staged summary must not swallow the fields that say whether the work finished.
     #[test]

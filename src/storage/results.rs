@@ -25,6 +25,62 @@ pub fn now() -> f64 {
 }
 
 /// Write bytes atomically: a reader sees either the old file or the complete new one.
+/// Keeps a created result from being left "active" when its producer goes away.
+///
+/// `complete()` is the normal path. If the future is dropped (task aborted, panic, an
+/// early error after the result exists) the guard closes the result as not_started or
+/// unknown, depending on whether anything could have been sent.
+pub struct ResultLease {
+    store: Arc<ResultStore>,
+    result_id: String,
+    sent: Arc<std::sync::atomic::AtomicBool>,
+    done: bool,
+}
+
+impl ResultLease {
+    pub fn new(
+        store: Arc<ResultStore>,
+        result_id: String,
+        sent: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            store,
+            result_id,
+            sent,
+            done: true,
+        }
+    }
+
+    /// Mark the guard armed: dropping it without `complete` will close the result.
+    pub fn arm(&mut self) {
+        self.done = false;
+    }
+
+    /// The caller already recorded a verdict itself; leave the metadata alone.
+    pub fn disarm(&mut self) {
+        self.done = true;
+    }
+
+    pub fn complete(mut self, values: Map<String, Value>) -> BridgeResult<Map<String, Value>> {
+        self.done = true;
+        self.store.finish(&self.result_id, values)
+    }
+}
+
+impl Drop for ResultLease {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let sent = self.sent.load(std::sync::atomic::Ordering::SeqCst);
+        self.store.abandon(
+            &self.result_id,
+            sent,
+            "the local producer ended without recording a verdict",
+        );
+    }
+}
+
 pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> BridgeResult<()> {
     let temp = path.with_file_name(format!(
         "{}.{}.tmp",
@@ -307,7 +363,20 @@ impl ResultStore {
     }
 
     /// Mark a result complete and record the byte size of every stored stream.
+    ///
+    /// The active slot is released whatever happens to the metadata write: "is the
+    /// producer still running" is not the same question as "did the last write succeed".
     pub fn finish(
+        &self,
+        result_id: &str,
+        values: Map<String, Value>,
+    ) -> BridgeResult<Map<String, Value>> {
+        let outcome = self.finish_inner(result_id, values);
+        self.release_active(result_id);
+        outcome
+    }
+
+    fn finish_inner(
         &self,
         result_id: &str,
         values: Map<String, Value>,
@@ -329,12 +398,40 @@ impl ResultStore {
             }
         }
         meta.insert("bytes".into(), Value::Object(sizes));
+        // Whether the caller is still running is decided here, not by the write below:
+        // a failed metadata write must not leave the result counted as active forever.
         atomic_json(
             &self.directory(result_id)?.join("meta.json"),
             &Value::Object(meta.clone()),
         )?;
-        self.active.lock().expect("active lock").remove(result_id);
         Ok(meta)
+    }
+
+    /// Drop a result from the active set without touching its metadata.
+    pub fn release_active(&self, result_id: &str) {
+        self.active.lock().expect("active lock").remove(result_id);
+    }
+
+    /// Close a result whose producer disappeared (cancelled, aborted, panicked).
+    ///
+    /// `sent` decides the verdict: an unsent command is `not_started`, anything that may
+    /// have reached the remote side is `unknown`. The active slot is released in both
+    /// cases, and a failing write cannot keep it alive.
+    pub fn abandon(&self, result_id: &str, sent: bool, reason: &str) {
+        let mut values = Map::new();
+        values.insert("ok".into(), Value::Bool(false));
+        values.insert("executed".into(), Value::Bool(sent));
+        values.insert(
+            "execution_state".into(),
+            Value::from(if sent { "unknown" } else { "not_started" }),
+        );
+        values.insert("completion_unknown".into(), Value::Bool(sent));
+        values.insert("failure_stage".into(), Value::from("abandoned"));
+        values.insert("error".into(), Value::from(reason.to_string()));
+        if self.finish(result_id, values).is_err() {
+            // The metadata could not be written; the slot is still returned here.
+            self.release_active(result_id);
+        }
     }
 
     /// Attach diagnostic associations without changing completion or retention.

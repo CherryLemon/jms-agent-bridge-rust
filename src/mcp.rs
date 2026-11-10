@@ -18,25 +18,26 @@ use crate::runtime::{string_list, BridgeRuntime};
 use crate::schemas;
 use crate::views;
 
-pub struct BridgeServer {
-    pub runtime: Arc<BridgeRuntime>,
-    /// Advertised tools, shared as one allocation instead of cloned per request.
+/// The immutable part of a server: tools and validation specs.
+///
+/// Stateless HTTP builds a `BridgeServer` per request, so this catalog must outlive the
+/// instance; `shared()` builds it once per process.
+pub struct ToolCatalog {
     tools: Arc<[Tool]>,
-    /// Full specs (the validation contract) built once and indexed by name.
     specs: Arc<HashMap<String, Arc<schemas::ToolSpec>>>,
 }
 
-impl BridgeServer {
-    pub fn new(runtime: Arc<BridgeRuntime>) -> Self {
-        // Every full specification is built once per process: `dispatch` needs exactly
-        // one of them, and rebuilding all seven on each call was pure overhead.
+impl ToolCatalog {
+    pub fn build() -> Self {
+        // Every full specification is built once: `dispatch` needs exactly one of them,
+        // and rebuilding all seven on each call was pure overhead.
         let specs: Arc<HashMap<String, Arc<schemas::ToolSpec>>> = Arc::new(
             schemas::full_specs()
                 .into_iter()
                 .map(|spec| (spec.name.to_string(), Arc::new(spec)))
                 .collect(),
         );
-        let tools = schemas::advertised()
+        let tools: Arc<[Tool]> = schemas::advertised()
             .into_iter()
             .map(|spec| {
                 let schema: Map<String, Value> = match spec.input_schema {
@@ -55,15 +56,38 @@ impl BridgeServer {
             })
             .collect::<Vec<Tool>>()
             .into();
+        Self { tools, specs }
+    }
+
+    /// Process-wide catalog, so per-request servers share one copy.
+    pub fn shared() -> Arc<ToolCatalog> {
+        static SHARED: std::sync::OnceLock<Arc<ToolCatalog>> = std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| Arc::new(ToolCatalog::build()))
+            .clone()
+    }
+}
+
+pub struct BridgeServer {
+    pub runtime: Arc<BridgeRuntime>,
+    catalog: Arc<ToolCatalog>,
+}
+
+impl BridgeServer {
+    pub fn new(runtime: Arc<BridgeRuntime>) -> Self {
         Self {
             runtime,
-            tools,
-            specs,
+            catalog: ToolCatalog::shared(),
         }
     }
 
+    /// A server sharing an existing catalog (used by the stateless HTTP factory).
+    pub fn with_catalog(runtime: Arc<BridgeRuntime>, catalog: Arc<ToolCatalog>) -> Self {
+        Self { runtime, catalog }
+    }
+
     pub fn tool_specs(&self) -> Vec<Tool> {
-        self.tools.to_vec()
+        self.catalog.tools.to_vec()
     }
 
     /// Validate, merge advanced options and dispatch, then compact the answer.
@@ -75,6 +99,7 @@ impl BridgeServer {
         // Validate against the complete definition: the advertised schema is a
         // token-saving subset, not the contract.
         let spec = self
+            .catalog
             .specs
             .get(name)
             .ok_or_else(|| BridgeError::invalid(format!("unknown tool {name:?}")))?
@@ -183,7 +208,7 @@ impl ServerHandler for BridgeServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(self.tools.to_vec()))
+        Ok(ListToolsResult::with_all_items(self.catalog.tools.to_vec()))
     }
 
     async fn call_tool(
@@ -197,8 +222,7 @@ impl ServerHandler for BridgeServer {
         // cancel an accepted execution half way through a transfer.
         let server = BridgeServer {
             runtime: self.runtime.clone(),
-            tools: self.tools.clone(),
-            specs: self.specs.clone(),
+            catalog: self.catalog.clone(),
         };
         let result = tokio::spawn(async move { server.dispatch(&name, arguments).await })
             .await
@@ -242,6 +266,26 @@ pub fn targets_of(arguments: &Map<String, Value>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Stateless HTTP builds a server per request: the schemas must be built once.
+    #[test]
+    fn the_tool_catalog_is_shared_process_wide() {
+        let first = ToolCatalog::shared();
+        let second = ToolCatalog::shared();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the catalog must be built once, not per request"
+        );
+        assert_eq!(first.tools.len(), 7);
+        assert_eq!(first.specs.len(), 7);
+        // Every advertised tool has a validation spec under the same name.
+        for tool in first.tools.iter() {
+            assert!(
+                first.specs.contains_key(tool.name.as_ref()),
+                "{} has no full spec",
+                tool.name
+            );
+        }
+    }
 
     #[test]
     fn options_cannot_shadow_top_level_arguments() {

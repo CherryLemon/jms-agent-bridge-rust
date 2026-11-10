@@ -112,6 +112,46 @@ impl ExecOutcome {
     }
 }
 
+/// An execution error that still carries what the sender saw.
+///
+/// A call that failed *after* the bytes left must never be reported as "not executed":
+/// the caller would retry a completed side effect. The metadata captured here is exactly
+/// what the success path would have stored.
+#[derive(Debug)]
+pub struct ExecFailure {
+    pub error: BridgeError,
+    pub meta: Map<String, Value>,
+}
+
+impl From<BridgeError> for ExecFailure {
+    /// Safe default: an unclassified error has no transmission evidence.
+    fn from(error: BridgeError) -> Self {
+        Self::before_send("internal", error)
+    }
+}
+
+impl ExecFailure {
+    /// Nothing reached the remote side (validation, connection, queue, local store).
+    pub fn before_send(stage: &str, error: BridgeError) -> Self {
+        let mut meta = Map::new();
+        meta.insert("ok".into(), Value::Bool(false));
+        meta.insert("executed".into(), Value::Bool(false));
+        meta.insert("execution_state".into(), Value::from("not_started"));
+        meta.insert("completion_unknown".into(), Value::Bool(false));
+        meta.insert("failure_stage".into(), Value::from(stage));
+        Self { error, meta }
+    }
+
+    /// The attempt ran; `meta` is what the store would have written.
+    pub fn after(meta: Map<String, Value>, error: BridgeError) -> Self {
+        Self { error, meta }
+    }
+
+    pub fn result_id(&self) -> Option<&str> {
+        self.meta.get("result_id").and_then(Value::as_str)
+    }
+}
+
 /// Internal outcome of one attempt; always converted into result metadata.
 struct Attempt {
     code: i64,
@@ -409,6 +449,27 @@ impl Runner {
         rows
     }
 
+    /// Best-effort shell state without waiting for a running command.
+    async fn session_state_snapshot(&self, key: &(String, String)) -> Option<&'static str> {
+        let slot = {
+            let shells = self.shells.lock().await;
+            shells.get(key).cloned()
+        };
+        let slot = slot?;
+        let state = match slot.try_lock() {
+            Ok(shell) => {
+                if shell.is_closing() {
+                    "lost"
+                } else {
+                    "active"
+                }
+            }
+            // Busy: a command is running, so the shell is alive but not inspectable.
+            Err(_) => "active",
+        };
+        Some(state)
+    }
+
     /// Full execution lifecycle for one target; returns finished result metadata.
     pub async fn execute_to_store(
         &self,
@@ -417,17 +478,21 @@ impl Runner {
         timeout: f64,
         spec: &ExecSpec,
         progress: Option<&dyn ProgressSink>,
-    ) -> BridgeResult<Map<String, Value>> {
+    ) -> Result<Map<String, Value>, ExecFailure> {
         if spec.env.iter().any(|(key, _)| !valid_env_name(key)) {
-            return Err(BridgeError::invalid("invalid environment variable name"));
+            return Err(ExecFailure::before_send(
+                "validation",
+                BridgeError::invalid("invalid environment variable name"),
+            ));
         }
         if script.contains('\0')
             || spec.cwd.as_deref().unwrap_or("").contains('\0')
             || spec.env.iter().any(|(_, value)| value.contains('\0'))
             || spec.docker_args.iter().any(|value| value.contains('\0'))
         {
-            return Err(BridgeError::invalid(
-                "NUL bytes are not valid shell arguments",
+            return Err(ExecFailure::before_send(
+                "validation",
+                BridgeError::invalid("NUL bytes are not valid shell arguments"),
             ));
         }
         if spec.internal_session {
@@ -443,7 +508,10 @@ impl Runner {
                 })
                 .unwrap_or(false);
             if !ok {
-                return Err(BridgeError::invalid("invalid private filesystem worker ID"));
+                return Err(ExecFailure::before_send(
+                    "validation",
+                    BridgeError::invalid("invalid private filesystem worker ID"),
+                ));
             }
         }
         if let (Some(session_id), false) = (&spec.session_id, spec.internal_session) {
@@ -453,17 +521,26 @@ impl Runner {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
             {
-                return Err(BridgeError::invalid(
-                    "session_id must contain 1..64 letters, digits, dots, underscores, or hyphens",
+                return Err(ExecFailure::before_send(
+                    "validation",
+                    BridgeError::invalid(
+                        "session_id must contain 1..64 letters, digits, dots, underscores, or hyphens",
+                    ),
                 ));
             }
         }
         let queue_timeout = spec.queue_timeout.unwrap_or(self.queue_timeout);
         if queue_timeout <= 0.0 {
-            return Err(BridgeError::invalid("queue_timeout must be positive"));
+            return Err(ExecFailure::before_send(
+                "validation",
+                BridgeError::invalid("queue_timeout must be positive"),
+            ));
         }
         if self.closing.load(Ordering::SeqCst) {
-            return Err(BridgeError::invalid("SSH runner is closing"));
+            return Err(ExecFailure::before_send(
+                "connection",
+                BridgeError::invalid("SSH runner is closing"),
+            ));
         }
         let isolated_retryable = spec.session_id.is_none()
             && spec.image.is_none()
@@ -554,13 +631,15 @@ impl Runner {
         spec: &ExecSpec,
         queue_timeout: f64,
         progress: Option<&dyn ProgressSink>,
-    ) -> BridgeResult<Map<String, Value>> {
-        let command = self.command(
-            spec.container.as_deref(),
-            spec.image.as_deref(),
-            &spec.docker_args,
-            spec.session_id.is_some(),
-        )?;
+    ) -> Result<Map<String, Value>, ExecFailure> {
+        let command = self
+            .command(
+                spec.container.as_deref(),
+                spec.image.as_deref(),
+                &spec.docker_args,
+                spec.session_id.is_some(),
+            )
+            .map_err(|error| ExecFailure::before_send("validation", error))?;
         let mut metadata = Map::new();
         metadata.insert("kind".into(), Value::from(spec.kind()));
         metadata.insert("host".into(), Value::from(host.name.clone()));
@@ -577,7 +656,20 @@ impl Runner {
             metadata.insert("session_id".into(), Value::from(session_id.clone()));
         }
         metadata.insert("lane".into(), Value::from(spec.lane.as_str()));
-        let result_id = self.store.create(metadata)?;
+        let result_id = match self.store.create(metadata) {
+            Ok(result_id) => result_id,
+            Err(error) => return Err(ExecFailure::before_send("results", error)),
+        };
+        // From here until the verdict is stored, dropping this future (task abort,
+        // timeout of the caller, panic) closes the result instead of leaking an active
+        // "running" entry that cleanup would skip.
+        let sent_flag = Arc::new(AtomicBool::new(false));
+        let mut lease = crate::storage::results::ResultLease::new(
+            self.store.clone(),
+            result_id.clone(),
+            sent_flag.clone(),
+        );
+        lease.arm();
         if let Some(progress) = progress {
             // Nothing may be transmitted until the caller can find this result after a
             // crash: a rejected write stops the run instead of losing the trail. The
@@ -586,14 +678,13 @@ impl Runner {
                 "execution_results",
                 json!({"host": host.name, "result_id": result_id}),
             ) {
-                let _ = self.store.fail_before_send(
-                    &result_id,
-                    &format!(
-                        "request progress could not be persisted: {}",
-                        error.message()
-                    ),
+                let message = format!(
+                    "request progress could not be persisted: {}",
+                    error.message()
                 );
-                return Err(error);
+                let _ = self.store.fail_before_send(&result_id, &message);
+                lease.disarm();
+                return Err(ExecFailure::before_send("results", error));
             }
         }
         let out_path = self.store.path(&result_id, "stdout")?;
@@ -629,7 +720,6 @@ impl Runner {
                 )
             };
         }
-        let sent = Arc::new(AtomicBool::new(false));
         let mut timings = Timings::default();
         let attempt = self
             .attempt(
@@ -641,7 +731,7 @@ impl Runner {
                 queue_timeout,
                 &out_path,
                 &err_path,
-                &sent,
+                &sent_flag,
                 &mut timings,
             )
             .await;
@@ -686,31 +776,17 @@ impl Runner {
         } else {
             "disconnected"
         };
-        let session_key = (
-            host.connection_key()?,
-            spec.session_id.clone().unwrap_or_default(),
-        );
-        // The attempt already decided this while it owned the shell; re-locking here
-        // would make a finished request wait behind the *next* command on that session.
+        // The attempt decides this while it owns the shell; re-locking here would make a
+        // finished request wait behind the *next* command on that session. A registered
+        // id is *not* evidence that the shell is alive, so there is no implicit default.
         let session_state = if spec.session_id.is_some() {
-            attempt.session_state.clone().or_else(|| {
-                Some(
-                    if self
-                        .known_sessions
-                        .lock()
-                        .expect("session lock")
-                        .contains(&session_key)
-                    {
-                        "lost"
-                    } else {
-                        "not_started"
-                    },
-                )
-            })
+            attempt.session_state
         } else {
             None
         };
         let mut values = Map::new();
+        values.insert("result_id".into(), Value::from(result_id.clone()));
+        values.insert("host".into(), Value::from(host.name.clone()));
         values.insert(
             "ok".into(),
             Value::Bool(attempt.code == 0 && attempt.executed == Some(true)),
@@ -770,7 +846,18 @@ impl Runner {
         for (key, value) in attempt.rejection {
             values.insert(key, value);
         }
-        let meta = self.store.finish(&result_id, values)?;
+        let meta = match lease.complete(values.clone()) {
+            Ok(meta) => meta,
+            Err(error) => {
+                // The remote side already ran: never turn a local write failure into
+                // "not executed". Keep the values this call would have stored.
+                let mut meta = values;
+                meta.insert("result_id".into(), Value::from(result_id.clone()));
+                meta.insert("error".into(), Value::from(error.message()));
+                meta.insert("local_error".into(), Value::Bool(true));
+                return Err(ExecFailure::after(meta, error));
+            }
+        };
         let finished_ok = meta
             .get("ok")
             .and_then(serde_json::Value::as_bool)
@@ -858,8 +945,16 @@ impl Runner {
                             failure_stage: Some("session_queue"),
                             queue_timed_out: true,
                             rejection: Map::new(),
-                            session_state: None,
-                        }
+                            // Nothing was taken over; a non-blocking snapshot says
+                            // whether the shell is still there without queueing behind
+                            // the command that holds it.
+                            session_state: self
+                                .session_state_snapshot(&(
+                                    key.clone(),
+                                    spec.session_id.clone().unwrap_or_default(),
+                                ))
+                                .await,
+                        };
                     }
                 }
             }
@@ -1349,6 +1444,13 @@ closed and must not be reused. Inspect before rerunning."
             metadata.insert("container".into(), Value::from(container));
         }
         let result_id = self.store.create(metadata)?;
+        let sent_flag = Arc::new(AtomicBool::new(false));
+        let mut lease = crate::storage::results::ResultLease::new(
+            self.store.clone(),
+            result_id.clone(),
+            sent_flag.clone(),
+        );
+        lease.arm();
         if let Some(progress) = progress {
             // Announce before a single byte moves: a transfer that is killed halfway
             // must still be addressable from the original request id.
@@ -1363,6 +1465,7 @@ closed and must not be reused. Inspect before rerunning."
                         error.message()
                     ),
                 );
+                lease.disarm();
                 return Err(error);
             }
         }
@@ -1417,7 +1520,11 @@ closed and must not be reused. Inspect before rerunning."
             json!(round(started.elapsed().as_secs_f64(), 3)),
         );
         values.insert("session_state".into(), Value::Null);
-        let meta = self.store.finish(&result_id, values)?;
+        sent_flag.store(
+            values.get("executed") == Some(&Value::Bool(true)),
+            Ordering::SeqCst,
+        );
+        let meta = lease.complete(values)?;
         Ok(self.outcome_from_meta(host, meta, true))
     }
 
@@ -1498,7 +1605,8 @@ closed and must not be reused. Inspect before rerunning."
         };
         let meta = self
             .execute_to_store(host, &script, timeout, &spec, None)
-            .await?;
+            .await
+            .map_err(|failure| failure.error)?;
         Ok(self.outcome_from_meta(host, meta, preview_only))
     }
 
@@ -1626,14 +1734,20 @@ pub fn fanout_rows(
             "warning",
             "startup_retry_result_id",
             "connection_recovery",
+            "error",
+            "local_error",
         ] {
             if let Some(value) = meta.get(key) {
                 row.insert(key.to_string(), value.clone());
             }
         }
         if !result_id.is_empty() {
-            for (key, value) in store.preview(&result_id, budget)? {
-                row.insert(key, value);
+            // A result whose metadata never landed cannot be read back; that must not
+            // hide the other targets' rows.
+            if let Ok(preview) = store.preview(&result_id, budget) {
+                for (key, value) in preview {
+                    row.insert(key, value);
+                }
             }
         }
         for (key, value) in queue_rejection(meta) {

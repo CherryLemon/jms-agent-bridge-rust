@@ -351,6 +351,7 @@ impl FilesystemWorkers {
                 self.runner
                     .execute_to_store(host, script, timeout, &spec, progress)
                     .await
+                    .map_err(|failure| failure.error)
             }
             Some(session_id) => {
                 let spec = ExecSpec {
@@ -362,7 +363,8 @@ impl FilesystemWorkers {
                 let result = self
                     .runner
                     .execute_to_store(host, script, timeout, &spec, progress)
-                    .await;
+                    .await
+                    .map_err(|failure| failure.error);
                 let failed = match &result {
                     Ok(meta) => meta.get("ok") != Some(&Value::Bool(true)),
                     Err(_) => true,

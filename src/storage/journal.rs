@@ -56,7 +56,7 @@ pub struct RequestJournal {
     claim: AsyncMutex<()>,
     /// One lock per request: a fan-out writes many rows for the *same* request, and
     /// different requests must not queue behind each other's fsync.
-    request_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    request_locks: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     tasks: Mutex<HashMap<String, ()>>,
 }
 
@@ -88,12 +88,18 @@ impl RequestJournal {
     }
 
     /// The lock that serializes read-modify-write for one request.
+    ///
+    /// Entries are weak: once nobody holds the guard the entry disappears, so a long
+    /// running service does not accumulate one lock per request id it has ever seen.
     fn request_lock(&self, request_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.request_locks.lock().expect("request lock map");
-        locks
-            .entry(request_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        locks.retain(|_, weak| weak.strong_count() > 0);
+        if let Some(existing) = locks.get(request_id).and_then(|weak| weak.upgrade()) {
+            return existing;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(request_id.to_string(), Arc::downgrade(&lock));
+        lock
     }
 
     pub fn save(&self, receipt: &Map<String, Value>) -> BridgeResult<()> {

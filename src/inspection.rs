@@ -190,6 +190,7 @@ async fn run_json(
     let meta = match runner
         .execute_to_store(host, &node_payload(&options), timeout, &spec, None)
         .await
+        .map_err(|failure| failure.error)
     {
         Ok(meta) => meta,
         Err(error) => {

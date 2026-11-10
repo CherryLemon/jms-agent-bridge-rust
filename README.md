@@ -74,9 +74,9 @@ The gateway's host key is **always** verified: the bridge reads
 pinned, and refuses keys that changed. Nothing is accepted implicitly.
 
 SSH authentication must complete without further interaction: a private key, a
-password, or the password prompt of keyboard-interactive authentication. A
-gateway that asks for anything else after the password fails fast with an
-authentication error instead of holding the request.
+password, or the password prompt of keyboard-interactive authentication. The whole
+sequence shares one 90-second budget, so a gateway that keeps prompting fails with
+an authentication error instead of holding the login gate.
 
 When JumpServer permits several accounts on one asset the bridge does not pick
 one: set `bridge.preferred_account` to the account you want, or the asset stays
@@ -152,6 +152,8 @@ business summary and a `result_id` that `read_result(stream="result")` reads bac
   `watch_timeout:true`; the remote job is never cancelled by a timeout.
 * A durable write is a precondition: if the result id or the prepared job receipt
   cannot be persisted, the operation stops before anything reaches the remote side.
+  A write that fails *after* the work ran is reported next to the real verdict
+  (`local_error: true`), never as `not_started`.
 
 ## State
 

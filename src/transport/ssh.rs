@@ -473,27 +473,53 @@ impl SshPool {
         let mut handle = connect;
         let user = host.login_string(self.cfg.login_user.as_deref())?;
         // Authentication must not hang: a gateway waiting on a prompt nobody can
-        // answer would otherwise hold the request until the deadline expires.
+        // answer would otherwise hold the request until the deadline expires. One
+        // absolute deadline covers the whole sequence (key lookup, public key,
+        // password and every challenge round), not each step separately.
         let mut result: Option<AuthResult> = None;
+        let auth_started = Instant::now();
+        let auth_total = Duration::from_secs(90);
         let auth_deadline = Duration::from_secs(60);
+        let remaining_auth = |stage: &str| -> BridgeResult<Duration> {
+            let left = auth_total.saturating_sub(auth_started.elapsed());
+            if left.is_zero() {
+                return Err(BridgeError::ssh(format!(
+                    "SSH authentication timed out during {stage}; the gateway did not finish"
+                )));
+            }
+            Ok(left.min(auth_deadline))
+        };
         if let Some(key_path) = &self.cfg.ssh_key {
             let private = load_private_key(key_path)?;
-            let hash = handle
-                .best_supported_rsa_hash()
+            let window = remaining_auth("the public key exchange")?;
+            let hash = tokio::time::timeout(window, handle.best_supported_rsa_hash())
                 .await
+                .map_err(|_| {
+                    BridgeError::ssh(
+                        "SSH authentication timed out while negotiating a key algorithm",
+                    )
+                })?
                 .ok()
                 .flatten()
                 .flatten();
+            let window = remaining_auth("public key authentication")?;
             result = Some(
-                handle
-                    .authenticate_publickey(
+                tokio::time::timeout(
+                    window,
+                    handle.authenticate_publickey(
                         user.clone(),
                         PrivateKeyWithHashAlg::new(Arc::new(private), hash),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    BridgeError::ssh(
+                        "SSH authentication timed out during public key authentication",
                     )
-                    .await
-                    .map_err(|error| {
-                        BridgeError::ssh(format!("SSH authentication failed ({error})"))
-                    })?,
+                })?
+                .map_err(|error| {
+                    BridgeError::ssh(format!("SSH authentication failed ({error})"))
+                })?,
             );
         }
         let password = self
@@ -503,13 +529,21 @@ impl SshPool {
             .or_else(crate::config::stored_password);
         if !matches!(result, Some(AuthResult::Success)) {
             if let Some(password) = &password {
+                let window = remaining_auth("password authentication")?;
                 result = Some(
-                    handle
-                        .authenticate_password(user.clone(), password.clone())
-                        .await
-                        .map_err(|error| {
-                            BridgeError::ssh(format!("SSH authentication failed ({error})"))
-                        })?,
+                    tokio::time::timeout(
+                        window,
+                        handle.authenticate_password(user.clone(), password.clone()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        BridgeError::ssh(
+                            "SSH authentication timed out during password authentication",
+                        )
+                    })?
+                    .map_err(|error| {
+                        BridgeError::ssh(format!("SSH authentication failed ({error})"))
+                    })?,
                 );
             }
         }
@@ -517,8 +551,9 @@ impl SshPool {
             if let Some(password) = &password {
                 // JumpServer may answer with a keyboard-interactive challenge instead of
                 // plain password auth; only the password and username prompts are filled in.
+                let window = remaining_auth("the interactive challenge")?;
                 let mut response = tokio::time::timeout(
-                    auth_deadline,
+                    window,
                     handle.authenticate_keyboard_interactive_start(user.clone(), None::<String>),
                 )
                 .await
@@ -549,8 +584,9 @@ impl SshPool {
                                     replies.push(String::new());
                                 }
                             }
+                            let window = remaining_auth("an interactive challenge round")?;
                             response = tokio::time::timeout(
-                                auth_deadline,
+                                window,
                                 handle.authenticate_keyboard_interactive_respond(replies),
                             )
                             .await

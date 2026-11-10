@@ -9,11 +9,22 @@ credentials are deliberately not recorded here.
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 140 passed |
+| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 149 passed |
 | Inventory refresh against a mock bastion (transient vs. explicit detail errors, account ambiguity) | `cargo test --test catalog_refresh` | 2 passed |
 | Offline contracts (tool list, schema validation, guard, receipts, saved-result reads, discovery) | `cargo test --test mcp_offline` | 1 passed |
 | Real `serve --stdio` subprocess: every stdout line parses as JSON-RPC while logging is at `info` | `cargo test --test mcp_stdio` | 1 passed |
 | Exec-channel plumbing against a live bastion | `cargo test --test ssh_pipe -- --ignored` | passed (manual) |
+
+Regression tests for the fourth review round (fault paths and state boundaries):
+`a_store_failure_after_the_run_keeps_the_execution_evidence` (a local write failure
+after a completed run stays `completed` and releases the active slot),
+`a_presend_failure_is_still_reported_as_not_started`,
+`closing_before_the_worker_takes_over_sends_nothing`,
+`a_worker_that_took_over_first_is_reported_as_unknown_when_closed`,
+`rolling_back_admission_only_clears_its_own_command`,
+`a_long_poll_read_does_not_block_the_worker`,
+`wait_rows_keep_known_statuses_and_flag_only_the_unwatched_ones`,
+`the_tool_catalog_is_shared_process_wide`.
 
 Regression tests for the third review round (evidence, races, admission):
 `a_transmitted_but_unconfirmed_launch_stays_unknown`,
@@ -90,12 +101,18 @@ the tool-schema budget (`advertised_tools_stay_within_their_token_budget`,
 | 32 | `jms_job_wait` with a budget shorter than the job | returns at ~3.25 s with `status:"unknown"`, `watch_timeout:true`; nothing is cancelled remotely |
 | 33 | `jms_submit_job` on two targets | both `acknowledged`; the 8.4 s wall time is dominated by the second host's first login (paced by design), not by serialisation |
 | 34 | `tools/list` measured on the wire | 7 tools, 6795 B for the list, ~7.0 KB with the server instructions |
+| 35 | terminal exec after the takeover rework | `takeover-ok` returned, `state: completed` |
+| 36 | `read(wait_ms=9000)` on a `sleep 4; echo` command started with `wait_ms=0` | returns after ~3.0 s with the output: the reader never blocks the worker |
+| 37 | three stateless HTTP `run` calls | each returns its own output; the shared catalog is built once |
+| 38 | cancel → `jms_job_wait` | returns in 0.64 s with `status:"cancelled"`, `finished:true` |
+| 39 | `jms_job_wait` with `timeout:3` on a 40 s job | returns at 3.00 s keeping the last known `status:"running"` (no invented `unknown`) |
 
 ## Deliberately not exercised here
 
 | Area | Why | How to check |
 | --- | --- | --- |
 | Docker `container`/`image` execution | No Docker daemon on the probed assets | `run` with `container` on a host that has Docker |
+| A terminal command aborted mid-flight by a service restart | Requires killing the process with a command in flight | covered by unit tests (`ResultLease`, close transitions); a live kill would only re-verify the same paths |
 | Launcher rejection paths (`no tmux and no setsid`, tmux refusing a session) | Both launchers exist on every probed asset | covered by the mapping test; nothing is claimed as `launched` without an acknowledgement |
 | Connection replacement with live named shells | Needs a deliberately broken pooled connection while a shell is open | the recovery path now refuses to replace a connection that still carries shells (`protected` reflects them); unit test covers the tracker, not a real disconnect |
 | `session_id` loss across a normal (non-kill) restart | Requires restarting the resident service holding live shells | restart `serve`, then reuse the same `session_id`: expect `not_started` with "session state was lost" |

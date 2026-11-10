@@ -160,7 +160,15 @@ async fn serve(flags: Flags) -> Result<(), BridgeError> {
         StreamableHttpService::new(
             {
                 let runtime = runtime.clone();
-                move || Ok(jms_bridge::mcp::BridgeServer::new(runtime.clone()))
+                // Stateless mode builds one server per request; the schemas are shared so
+                // this closure only clones an Arc.
+                let catalog = jms_bridge::mcp::ToolCatalog::shared();
+                move || {
+                    Ok(jms_bridge::mcp::BridgeServer::with_catalog(
+                        runtime.clone(),
+                        catalog.clone(),
+                    ))
+                }
             },
             Arc::new(LocalSessionManager::default()),
             config,

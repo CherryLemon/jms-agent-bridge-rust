@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.3.4
+
+Fault-path pass: what the caller is told when something fails locally, and what the
+terminal does when a command is accepted but the worker has not started.
+
+### Execution evidence
+* `execute_to_store` returns a failure that carries the evidence it already had:
+  `result_id`, `executed`, `execution_state`, `completion_unknown`, `exit_code` and
+  `failure_stage`. A local write failure after a completed run is reported as
+  `completed` with `local_error: true`, never as `not_started`.
+* Only a proven pre-send failure is `not_started`; a panicked or cancelled fan-out task
+  is `unknown`; `error` and `local_error` are part of the projected row.
+* Fan-out still reports every target, now with the right verdict per target.
+
+### Result lifecycle
+* `ResultStore::finish` releases the active slot whatever happens to the metadata write,
+  and `ResultLease` closes a result whose producer disappears (task aborted, caller
+  gone, panic) as `not_started` or `unknown` depending on whether anything was sent.
+  Run and transfer results both use it.
+* A terminal command that is accepted but whose terminal registry cannot be saved rolls
+  the admission back: the command slot is cleared, the result is closed as
+  `not_started`, and the terminal is not left permanently busy.
+
+### Terminal
+* The worker takes the command over and writes its first packet under the command lock:
+  a `close` that ran first wins and nothing is sent; a worker that took over first makes
+  `close` report `unknown`. The final state can no longer be flipped by a late worker.
+* The worker refuses to overwrite a command that is no longer queued.
+
+### Jobs
+* `jms_job_wait` keeps each host's last answer: a scan that runs out of budget marks only
+  the pairs it never observed with `watch_timeout: true` instead of replacing a known
+  `done`/`running` with `unknown`.
+
+### Sessions
+* Session state is explicit: a rejected reuse after a restart reports `lost`, a queue
+  timeout reports a non-blocking snapshot instead of a guess, and the "a registered id
+  must be active" fallback is gone.
+
+### Connections and terminals
+* SSH authentication uses one absolute deadline (90 s) for algorithm negotiation, key,
+  password and every challenge round, so a gateway that keeps prompting fails instead of
+  holding the login gate.
+* A long-poll terminal `read` no longer holds the command lock while waiting: the worker
+  can publish `running` and write output immediately.
+
+### Performance
+* The tool catalog is built once per process and shared by every server instance, which
+  also covers the stateless HTTP path that builds a server per request.
+* Multi-target jobs share one `Arc<str>` script instead of copying it per target.
+* Journal request locks are weak references and are pruned, so the lock table no longer
+  grows with every request id ever seen.
+* Staging borrows the serialized payload for its preview instead of copying it.
+
 ## 0.3.3
 
 Correctness follow-up on the 0.3.2 lifecycle work, plus the latency fixes that the
