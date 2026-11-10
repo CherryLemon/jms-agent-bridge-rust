@@ -124,9 +124,12 @@ pub struct ExecFailure {
 }
 
 impl From<BridgeError> for ExecFailure {
-    /// Safe default: an unclassified error has no transmission evidence.
+    /// An unclassified error carries no transmission evidence, so it must never claim
+    /// "nothing was sent": the safe reading is "we do not know".
+    ///
+    /// Call sites that *proved* nothing was sent use `before_send` explicitly.
     fn from(error: BridgeError) -> Self {
-        Self::before_send("internal", error)
+        Self::unknown_after_error("internal", error)
     }
 }
 
@@ -139,6 +142,24 @@ impl ExecFailure {
         meta.insert("execution_state".into(), Value::from("not_started"));
         meta.insert("completion_unknown".into(), Value::Bool(false));
         meta.insert("failure_stage".into(), Value::from(stage));
+        Self { error, meta }
+    }
+
+    /// No usable evidence either way (an error raised after the send point).
+    pub fn unknown_after_error(stage: &str, error: BridgeError) -> Self {
+        let mut meta = Map::new();
+        meta.insert("ok".into(), Value::Bool(false));
+        meta.insert("executed".into(), Value::Null);
+        meta.insert("execution_state".into(), Value::from("unknown"));
+        meta.insert("completion_unknown".into(), Value::Bool(true));
+        meta.insert("failure_stage".into(), Value::from(stage));
+        Self { error, meta }
+    }
+
+    /// The result exists and its verdict is known; only the *annotation* write failed.
+    pub fn after_local_write(meta: Map<String, Value>, error: BridgeError) -> Self {
+        let mut meta = meta;
+        meta.insert("local_error".into(), Value::Bool(true));
         Self { error, meta }
     }
 
@@ -616,8 +637,21 @@ impl Runner {
         }
         if !annotations.is_empty() {
             if let Some(result_id) = meta.get("result_id").and_then(Value::as_str) {
-                let updated = self.store.annotate(result_id, annotations.clone())?;
-                meta = updated;
+                // The run itself succeeded: failing to attach the extra metadata must not
+                // turn the verdict back into "not executed".
+                match self.store.annotate(result_id, annotations.clone()) {
+                    Ok(updated) => meta = updated,
+                    Err(error) => {
+                        let message = format!(
+                            "the run finished but its metadata could not be updated: {}",
+                            error.message()
+                        );
+                        return Err(ExecFailure::after_local_write(
+                            meta,
+                            BridgeError::storage(message),
+                        ));
+                    }
+                }
             }
         }
         Ok(meta)
@@ -765,17 +799,9 @@ impl Runner {
                 let _ = writeln!(file, "\n{text}");
             }
         }
-        let connection_state = if self
-            .pool
-            .connection(host)
-            .await
-            .map(|connection| !connection.is_closed())
-            .unwrap_or(false)
-        {
-            "connected"
-        } else {
-            "disconnected"
-        };
+        // Read-only: a finished command must not pay for a new login just to label
+        // `<which>` connection carried it.
+        let connection_state = self.pool.connection_state(host).unwrap_or("disconnected");
         // The attempt decides this while it owns the shell; re-locking here would make a
         // finished request wait behind the *next* command on that session. A registered
         // id is *not* evidence that the shell is alive, so there is no implicit default.
@@ -1021,7 +1047,7 @@ impl Runner {
         // by another channel on this connection must wait until this one is finished.
         let _lease = lease;
         let deadline = Duration::from_secs_f64(timeout);
-        let mut attempt = if let Some(session_id) = &spec.session_id {
+        let attempt = if let Some(session_id) = &spec.session_id {
             self.run_on_session(
                 host, command, body, deadline, spec, session_id, &key, out_path, err_path, sent,
                 timings,
@@ -1033,9 +1059,11 @@ impl Runner {
             )
             .await
         };
-        if spec.session_id.is_some() {
-            attempt.session_state = attempt.session_state.or(Some("active"));
-        }
+        // No default here: a named session is only "active" when a shell was actually
+        // obtained and used. Each path that touches the shell sets the state itself
+        // (restart refusal -> lost, queue timeout -> snapshot, success -> active), and a
+        // path that never reached the shell reports nothing.
+
         drop(session_gate);
         attempt
     }
@@ -1146,7 +1174,12 @@ printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
                     },
                     queue_timed_out: false,
                     rejection: Map::new(),
-                    session_state: None,
+                    // A channel that ended mid-command leaves a shell we must not trust.
+                    session_state: if completed && started {
+                        Some("active")
+                    } else {
+                        Some("lost")
+                    },
                 }
             }
             Err(error) if error.message().contains("timed out") => Attempt {
@@ -1163,7 +1196,7 @@ printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
                 failure_stage: Some("execution"),
                 queue_timed_out: false,
                 rejection: Map::new(),
-                session_state: None,
+                session_state: Some("lost"),
             },
             Err(error) => Attempt {
                 code: 255,
@@ -1176,7 +1209,7 @@ printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
                 failure_stage: Some("execution"),
                 queue_timed_out: false,
                 rejection: Map::new(),
-                session_state: None,
+                session_state: Some("lost"),
             },
         }
     }
@@ -1473,8 +1506,20 @@ closed and must not be reused. Inspect before rerunning."
         let err_path = self.store.path(&result_id, "stderr")?;
         let started = Instant::now();
         let transfer = crate::transport::rsync::transfer(
-            &self.pool, &binary, host, local, remote, direction, excludes, delete, timeout,
-            container, overwrite, &out_path, &err_path,
+            &self.pool,
+            &binary,
+            host,
+            local,
+            remote,
+            direction,
+            excludes,
+            delete,
+            timeout,
+            container,
+            overwrite,
+            &out_path,
+            &err_path,
+            sent_flag.clone(),
         )
         .await;
         let mut values = Map::new();
@@ -1520,10 +1565,6 @@ closed and must not be reused. Inspect before rerunning."
             json!(round(started.elapsed().as_secs_f64(), 3)),
         );
         values.insert("session_state".into(), Value::Null);
-        sent_flag.store(
-            values.get("executed") == Some(&Value::Bool(true)),
-            Ordering::SeqCst,
-        );
         let meta = lease.complete(values)?;
         Ok(self.outcome_from_meta(host, meta, true))
     }

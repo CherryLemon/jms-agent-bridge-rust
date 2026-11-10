@@ -243,6 +243,7 @@ pub async fn transfer(
     overwrite: bool,
     out_path: &Path,
     err_path: &Path,
+    evidence: Arc<std::sync::atomic::AtomicBool>,
 ) -> BridgeResult<TransferOutcome> {
     if let Some(container) = container {
         if container.is_empty()
@@ -272,7 +273,8 @@ pub async fn transfer(
         .asset_id
         .clone()
         .ok_or_else(|| BridgeError::config("target needs a permitted REST asset ID"))?;
-    let sent = Arc::new(AtomicBool::new(false));
+    // The caller's evidence flag: what the result guard reads if this future goes away.
+    let sent = evidence;
     let stop = Arc::new(AtomicBool::new(false));
     let accept = {
         let pool = pool.clone();

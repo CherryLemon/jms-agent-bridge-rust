@@ -350,6 +350,18 @@ impl SshPool {
         self.closing.load(Ordering::SeqCst)
     }
 
+    /// Whether a live connection exists right now, without ever logging in.
+    ///
+    /// Reporting the *result* of a finished command must not trigger a fresh
+    /// authentication (and its login gate) just to label the connection.
+    pub fn connection_state(&self, host: &Host) -> Option<&'static str> {
+        let key = self.key(host).ok()?;
+        match self.existing(&key) {
+            Some(connection) if !connection.is_closed() => Some("connected"),
+            _ => Some("disconnected"),
+        }
+    }
+
     /// Reuse a healthy connection, else authenticate a new one.
     pub async fn connection(&self, host: &Host) -> BridgeResult<Arc<SshConnection>> {
         let key = self.key(host)?;

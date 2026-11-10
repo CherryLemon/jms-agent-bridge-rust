@@ -31,7 +31,7 @@ pub fn now() -> f64 {
 /// early error after the result exists) the guard closes the result as not_started or
 /// unknown, depending on whether anything could have been sent.
 pub struct ResultLease {
-    store: Arc<ResultStore>,
+    store: Option<Arc<ResultStore>>,
     result_id: String,
     sent: Arc<std::sync::atomic::AtomicBool>,
     done: bool,
@@ -44,7 +44,7 @@ impl ResultLease {
         sent: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
-            store,
+            store: Some(store),
             result_id,
             sent,
             done: true,
@@ -56,14 +56,36 @@ impl ResultLease {
         self.done = false;
     }
 
+    /// A guard that owns nothing: the caller uses it only for the "close on error"
+    /// path of an operation that already holds the store.
+    pub fn borrowed(result_id: String) -> Self {
+        Self {
+            store: None,
+            result_id,
+            sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            done: true,
+        }
+    }
+
     /// The caller already recorded a verdict itself; leave the metadata alone.
     pub fn disarm(&mut self) {
         self.done = true;
     }
 
+    /// Close the result because the local work failed; releases the active slot.
+    pub fn fail(&mut self, reason: &str) {
+        self.done = true;
+        if let Some(store) = &self.store {
+            store.abandon(&self.result_id, false, reason);
+        }
+    }
+
     pub fn complete(mut self, values: Map<String, Value>) -> BridgeResult<Map<String, Value>> {
         self.done = true;
-        self.store.finish(&self.result_id, values)
+        match &self.store {
+            Some(store) => store.finish(&self.result_id, values),
+            None => Ok(values),
+        }
     }
 }
 
@@ -73,11 +95,13 @@ impl Drop for ResultLease {
             return;
         }
         let sent = self.sent.load(std::sync::atomic::Ordering::SeqCst);
-        self.store.abandon(
-            &self.result_id,
-            sent,
-            "the local producer ended without recording a verdict",
-        );
+        if let Some(store) = &self.store {
+            store.abandon(
+                &self.result_id,
+                sent,
+                "the local producer ended without recording a verdict",
+            );
+        }
     }
 }
 
@@ -465,11 +489,21 @@ impl ResultStore {
         metadata: Map<String, Value>,
     ) -> BridgeResult<String> {
         let result_id = self.create(metadata)?;
-        atomic_write_bytes(&self.path(&result_id, "result")?, bytes)?;
+        // A payload write can fail (no space, no permission) *after* the result exists;
+        // without this guard the id would stay active and cleanup would skip it forever.
+        let mut lease = ResultLease::borrowed(result_id.clone());
+        lease.arm();
+        if let Err(error) = atomic_write_bytes(&self.path(&result_id, "result")?, bytes) {
+            lease.fail(&format!(
+                "the result payload could not be written: {}",
+                error.message()
+            ));
+            return Err(error);
+        }
         let ok = !matches!(value, Value::Object(map) if map.get("ok") == Some(&Value::Bool(false)));
         let mut values = Map::new();
         values.insert("ok".into(), Value::Bool(ok));
-        self.finish(&result_id, values)?;
+        lease.complete(values)?;
         Ok(result_id)
     }
 
@@ -1003,5 +1037,24 @@ mod tests {
         assert_eq!(report["active_skipped"], 1);
         assert!(!store.directory(&done).unwrap().exists());
         assert!(store.directory(&running).unwrap().exists());
+    }
+    #[test]
+    fn abandoning_a_result_releases_its_active_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(directory.path().join("results"), 3600.0, 3600.0).unwrap();
+        let result_id = store
+            .create(
+                json!({"kind": "operation"})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .unwrap();
+        assert_eq!(store.retention_status()["active_results"], 1);
+        store.abandon(&result_id, false, "the payload could not be written");
+        assert_eq!(store.retention_status()["active_results"], 0);
+        let meta = store.metadata(&result_id).unwrap();
+        assert_eq!(meta["execution_state"], "not_started");
+        assert_eq!(meta["failure_stage"], "abandoned");
     }
 }

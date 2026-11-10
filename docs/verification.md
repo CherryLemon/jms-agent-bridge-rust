@@ -9,11 +9,22 @@ credentials are deliberately not recorded here.
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 149 passed |
+| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 152 passed |
 | Inventory refresh against a mock bastion (transient vs. explicit detail errors, account ambiguity) | `cargo test --test catalog_refresh` | 2 passed |
 | Offline contracts (tool list, schema validation, guard, receipts, saved-result reads, discovery) | `cargo test --test mcp_offline` | 1 passed |
 | Real `serve --stdio` subprocess: every stdout line parses as JSON-RPC while logging is at `info` | `cargo test --test mcp_stdio` | 1 passed |
 | Exec-channel plumbing against a live bastion | `cargo test --test ssh_pipe -- --ignored` | passed (manual) |
+
+Known failure, reproduced on 0.3.4 and 0.3.5: a 64 MiB download fails with rsync exit
+12 ("connection unexpectedly closed") after 0.7-1.6 MB while the same file uploads at
+25-41 MB/s. Tracked in CHANGELOG; not covered by the automated suites, which transfer a
+~1.9 KB file.
+
+Regression tests for the fifth review round (evidence monotonicity, result ownership):
+`a_late_annotation_failure_keeps_the_completed_verdict`,
+`an_unclassified_error_is_unknown_not_not_started`,
+`a_failed_send_after_takeover_stays_unknown`,
+`abandoning_a_result_releases_its_active_slot`.
 
 Regression tests for the fourth review round (fault paths and state boundaries):
 `a_store_failure_after_the_run_keeps_the_execution_evidence` (a local write failure

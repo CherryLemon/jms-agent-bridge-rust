@@ -483,6 +483,38 @@ else echo 'status=missing'; fi"
         rows.into_iter().map(|(_, row)| row).collect()
     }
 
+    /// Report each target's status as soon as it is known.
+    ///
+    /// `wait` uses this so a finished host is recorded even when another host never
+    /// answers and the overall scan has to be abandoned.
+    async fn status_incremental(
+        &self,
+        pairs: &[(Host, String)],
+    ) -> tokio::sync::mpsc::Receiver<(usize, Value)> {
+        const MAX_IN_FLIGHT: usize = 4;
+        let limit = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        let (sender, receiver) = tokio::sync::mpsc::channel(pairs.len().max(1));
+        for (index, (host, job_id)) in pairs.iter().enumerate() {
+            let runner = self.runner.clone();
+            let host = host.clone();
+            let job_id = job_id.clone();
+            let permit = limit.clone();
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                let _permit = permit.acquire_owned().await;
+                let jobs = Jobs { runner };
+                let row = match jobs.status(&host, &job_id).await {
+                    Ok(value) => value,
+                    Err(error) => json!({"host": host.name, "job_id": job_id,
+                                         "ok": false, "error": error.message()}),
+                };
+                let _ = sender.send((index, row)).await;
+            });
+        }
+        drop(sender);
+        receiver
+    }
+
     pub async fn logs(
         &self,
         host: &Host,
@@ -596,19 +628,26 @@ echo \"status_before=$status_before\""
     ) -> (Vec<Value>, bool) {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
-        // Rows are kept across rounds: a host that already answered must not be replaced
-        // by "unknown" just because a later scan of *another* host ran out of budget.
+        // Rows are recorded the moment they arrive, so a host that answered in the current
+        // round keeps its verdict even if another host never answers.
         let mut last: std::collections::HashMap<(String, String), Value> =
             std::collections::HashMap::new();
+        // Targets that reached a terminal state are not probed again.
+        let mut pending: Vec<(Host, String)> = pairs.to_vec();
         loop {
+            if pending.is_empty() {
+                return (collect_rows(pairs, &last, false), true);
+            }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return (collect_rows(pairs, &last, true), false);
             }
-            let probe_budget = remaining;
-            match tokio::time::timeout(probe_budget, self.status_many(pairs)).await {
-                Ok(rows) => {
-                    for row in rows {
+            let mut stream = self.status_incremental(&pending).await;
+            let scan_deadline = tokio::time::Instant::now() + remaining;
+            let mut answered: Vec<(String, String, bool)> = Vec::new();
+            loop {
+                match tokio::time::timeout_at(scan_deadline, stream.recv()).await {
+                    Ok(Some((_, row))) => {
                         let key = (
                             row.get("host")
                                 .and_then(Value::as_str)
@@ -619,28 +658,28 @@ echo \"status_before=$status_before\""
                                 .unwrap_or("")
                                 .to_string(),
                         );
+                        let terminal = is_terminal_status(&row);
+                        answered.push((key.0.clone(), key.1.clone(), terminal));
                         last.insert(key, row);
                     }
+                    // Every answer of this round arrived.
+                    Ok(None) => break,
+                    // Out of budget: keep what was already recorded, flag the rest.
+                    Err(_) => return (collect_rows(pairs, &last, true), false),
                 }
-                // The scan itself was cut short. Whatever was collected before is kept;
-                // the outstanding pairs are reported as not watched, and nothing is
-                // cancelled on the remote side.
-                Err(_) => return (collect_rows(pairs, &last, true), false),
             }
-            if pairs.iter().all(|(host, job)| {
-                last.get(&(host.name.clone(), job.clone()))
-                    .map(is_terminal_status)
-                    .unwrap_or(false)
-            }) {
+            pending.retain(|(host, job_id)| {
+                !answered
+                    .iter()
+                    .any(|(name, id, terminal)| *terminal && name == &host.name && id == job_id)
+            });
+            if pending.is_empty() {
                 return (collect_rows(pairs, &last, false), true);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return (collect_rows(pairs, &last, false), false);
             }
             let sleep = std::time::Duration::from_secs_f64(interval.max(0.1));
             let sleep = sleep.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
             if sleep.is_zero() {
-                return (collect_rows(pairs, &last, false), false);
+                return (collect_rows(pairs, &last, true), false);
             }
             tokio::time::sleep(sleep).await;
         }

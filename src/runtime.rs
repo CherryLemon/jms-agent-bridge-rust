@@ -247,6 +247,9 @@ impl BridgeRuntime {
         };
         let hosts = self.resolve_many(&targets).await?;
         let mut set = tokio::task::JoinSet::new();
+        // One shared copy of the script: a large script on many targets must not be
+        // cloned once per task.
+        let script: Arc<str> = Arc::from(script.as_str());
         for host in hosts {
             let runner = self.runner.clone();
             let script = script.clone();
@@ -255,7 +258,7 @@ impl BridgeRuntime {
             let name = host.name.clone();
             set.spawn(async move {
                 let outcome = runner
-                    .execute_to_store(&host, &script, timeout, &spec, progress.as_deref())
+                    .execute_to_store(&host, script.as_ref(), timeout, &spec, progress.as_deref())
                     .await;
                 (name, outcome)
             });
@@ -1652,6 +1655,39 @@ mod tests {
         );
         // The active slot is released even though the write failed.
         assert_eq!(store.retention_status()["active_results"], 0);
+    }
+
+    /// A local write after a successful retry must not un-prove the run.
+    #[test]
+    fn a_late_annotation_failure_keeps_the_completed_verdict() {
+        let mut meta = Map::new();
+        meta.insert("result_id".into(), Value::from("abc123"));
+        meta.insert("ok".into(), Value::Bool(true));
+        meta.insert("executed".into(), Value::Bool(true));
+        meta.insert("execution_state".into(), Value::from("completed"));
+        meta.insert("completion_unknown".into(), Value::Bool(false));
+        meta.insert("exit_code".into(), json!(0));
+        let failure = crate::execution::ExecFailure::after_local_write(
+            meta,
+            crate::errors::BridgeError::storage("metadata write failed"),
+        );
+        let row = failure_row("asset-1", &failure);
+        assert_eq!(row["execution_state"], "completed");
+        assert_eq!(row["executed"], true);
+        assert_eq!(row["result_id"], "abc123");
+        assert_eq!(row["local_error"], true);
+        assert_eq!(row["ok"], false);
+    }
+
+    /// An error with no transmission evidence must never claim "nothing was sent".
+    #[test]
+    fn an_unclassified_error_is_unknown_not_not_started() {
+        let failure: crate::execution::ExecFailure =
+            crate::errors::BridgeError::storage("something failed").into();
+        let row = failure_row("asset-1", &failure);
+        assert_eq!(row["execution_state"], "unknown");
+        assert_eq!(row["completion_unknown"], true);
+        assert!(row["executed"].is_null());
     }
 
     /// Only a proven pre-send failure may be reported as "not executed".

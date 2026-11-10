@@ -869,9 +869,29 @@ impl Interactive {
             metadata.insert("session_id".into(), Value::from(session));
             let result_id = self.store.create(metadata)?;
             for stream in ["stdout", "stderr"] {
-                let path = self.store.path(&result_id, stream)?;
-                if !path.exists() {
-                    std::fs::File::create(&path)?;
+                let created = self.store.path(&result_id, stream).and_then(|path| {
+                    std::fs::File::create(&path).map(|_| path).map_err(|error| {
+                        crate::errors::BridgeError::storage(format!(
+                            "cannot create the {stream} file for {result_id}: {error}"
+                        ))
+                    })
+                });
+                if let Err(error) = created {
+                    // The result exists but can never be produced: close it so cleanup
+                    // does not treat it as an active transfer forever.
+                    let _ = self.store.finish(
+                        &result_id,
+                        json!({
+                            "ok": false, "executed": false, "execution_state": "not_started",
+                            "completion_unknown": false, "failure_stage": "results",
+                            "error": error.message(),
+                        })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    );
+                    binding_guard.command = None;
+                    return Err(error);
                 }
             }
             let command = Arc::new(AsyncMutex::new(Command::new(result_id.clone())));
@@ -922,7 +942,12 @@ impl Interactive {
         let script = script.to_string();
         let command_for_task = command.clone();
         let session_id = session.to_string();
+        // The worker must not run before its handle is published: `close` needs the
+        // handle to abort a send that is stuck on the channel.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let worker_gate = gate.clone();
         let task = tokio::spawn(async move {
+            worker_gate.notified().await;
             let _ = run_terminal_command(
                 runner,
                 store,
@@ -938,6 +963,7 @@ impl Interactive {
             let mut command_guard = command.lock().await;
             command_guard.task = Some(task);
         }
+        gate.notify_one();
         if wait_ms > 0 {
             tokio::time::sleep(Duration::from_millis(wait_ms.min(30_000))).await;
         }
@@ -1354,36 +1380,61 @@ async fn run_terminal_command(
     // either `close` wins (the state is already final and nothing is sent), or this
     // worker wins (sent=true, and close must report unknown instead of not_started).
     let plan = CommandPlan::new(&script);
-    let (result_id, changed, started, sent) = {
+    let (result_id, changed, started) = {
+        // Irreversible decisions under the lock: if we win, the command may be sent and
+        // `close` must never report "not started" from now on.
         let mut guard = command.lock().await;
         if !try_take_over(&mut guard) {
             // Closed (or otherwise finished) between admission and this moment.
             return Ok(());
         }
-        let result_id = guard.result_id.clone();
-        let changed = guard.changed.clone();
-        let started = Arc::new(AtomicBool::new(false));
-        let sent = match shell.send_packet(&plan.packet).await {
-            Ok(()) => true,
-            Err(error) => {
-                guard.state = CmdState::NotStarted;
-                guard.error = Some(error.message());
-                false
+        guard.sent = true;
+        (
+            guard.result_id.clone(),
+            guard.changed.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+    };
+    // The write itself happens outside the lock: a channel that stops consuming must not
+    // keep `close` from taking the lock and aborting this task.
+    let sent = match tokio::time::timeout(Duration::from_secs(120), shell.send_packet(&plan.packet))
+        .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            // Part of the packet may already have reached the shell, and the packet
+            // starts with `builtin eval`, so a write error is not proof of "not run".
+            let mut guard = command.lock().await;
+            if guard.state == CmdState::Running {
+                guard.state = CmdState::Unknown;
+                guard.error = Some(format!(
+                    "the command could not be written completely: {}",
+                    error.message()
+                ));
             }
-        };
-        guard.sent = sent;
-        (result_id, changed, started, sent)
+            false
+        }
+        Err(_) => {
+            let mut guard = command.lock().await;
+            if guard.state == CmdState::Running {
+                guard.state = CmdState::Unknown;
+                guard.error = Some("writing the command to the terminal timed out".to_string());
+            }
+            false
+        }
     };
     if !sent {
         let mut values = Map::new();
         values.insert("ok".into(), Value::Bool(false));
-        values.insert("executed".into(), Value::Bool(false));
-        values.insert("execution_state".into(), Value::from("not_started"));
-        values.insert("completion_unknown".into(), Value::Bool(false));
+        values.insert("executed".into(), Value::Bool(true));
+        values.insert("execution_state".into(), Value::from("unknown"));
+        values.insert("completion_unknown".into(), Value::Bool(true));
         values.insert("failure_stage".into(), Value::from("channel"));
         values.insert(
             "error".into(),
-            Value::from("the terminal channel refused the command"),
+            Value::from(
+                "the command may have reached the terminal only partially; check the session before retrying",
+            ),
         );
         let _ = store.finish(&result_id, values);
         changed.notify_waiters();
@@ -1589,6 +1640,29 @@ mod tests {
             (state, executed, unknown, stage),
             ("unknown", true, true, "closed_by_caller")
         );
+    }
+
+    /// A write that fails midway is not proof that nothing was sent: the packet starts
+    /// with `builtin eval`, so a partial write can still run the script.
+    #[tokio::test]
+    async fn a_failed_send_after_takeover_stays_unknown() {
+        let command = Arc::new(AsyncMutex::new(Command::new("r3".to_string())));
+        {
+            let mut guard = command.lock().await;
+            assert!(try_take_over(&mut guard));
+            guard.sent = true;
+        }
+        // The worker's failure path.
+        {
+            let mut guard = command.lock().await;
+            if guard.state == CmdState::Running {
+                guard.state = CmdState::Unknown;
+                guard.error = Some("partial write".to_string());
+            }
+        }
+        let guard = command.lock().await;
+        assert_eq!(guard.state, CmdState::Unknown);
+        assert!(guard.sent, "the send evidence must not be reversed");
     }
 
     #[test]

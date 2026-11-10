@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.3.5
+
+Evidence can only become more certain, never less; every result that is created has an
+owner that closes it.
+
+### Execution evidence
+* An error that carries no transmission evidence is now `unknown`, not `not_started`:
+  the blanket `BridgeError -> ExecFailure` conversion no longer claims "nothing was
+  sent". Call sites that proved it use `before_send` explicitly.
+* A retry that succeeds and then fails to attach its annotation (`store.annotate`)
+  keeps the completed verdict, the result id and the exit code, and reports the write
+  failure as `local_error: true`.
+* Terminal commands: the worker marks the command `may have been sent` *before* writing
+  the packet, and a failed or timed-out write leaves the state `unknown` instead of
+  reverting it to `not_started` - the packet starts with `builtin eval`, so a partial
+  write can still run the script.
+
+### Result lifecycle
+* `ResultLease` now also covers the staging payload write (`save_serialized`) and the
+  terminal's stream-file creation: a failure after `create()` closes the result and
+  releases the active slot instead of leaving an entry cleanup would skip.
+* The rsync transfer writes to the caller's evidence flag, so an aborted transfer is
+  reported as `unknown` rather than `not_started`.
+
+### Terminal concurrency
+* The takeover decision stays under the command lock, but the packet write happens
+  outside it, with a 120 s bound. A channel that stops consuming can no longer hold the
+  lock, so `close` can still take it and abort the worker.
+* The worker's task handle is published before the worker may run (start gate), so
+  `close` always sees a handle to abort.
+
+### Jobs
+* `jms_job_wait` records each host's answer as it arrives (`status_incremental`) and
+  drops targets that reached a terminal state from later probes: a host that finished in
+  the current round keeps its verdict even when another host never answers.
+
+### Sessions and latency
+* Session state is set by the path that touched the shell (success -> active, restart
+  refusal / dead channel -> lost, queue timeout -> snapshot). The generic
+  "named session means active" fallback is gone.
+* Reporting a finished command no longer calls `pool.connection()`: the connection label
+  comes from a read-only snapshot, so an expired connection cannot trigger a new login
+  on the response path.
+* `run` shares one `Arc<str>` script across targets.
+
+### Known issue (tracked, not fixed here)
+* Large downloads through the relay fail: rsync exits 12 with "connection unexpectedly
+  closed" after roughly 0.7-1.6 MB, while uploads of the same file succeed (25-41 MB/s
+  measured on the test asset, 64 MiB). Verified against the unmodified 0.3.4 code as
+  well, so it predates this change. A two-task relay (independent uplink/downlink) was
+  implemented and produced the same symptom, so the cause is not the pump structure; the
+  remote sender appears to receive an early EOF/close. Downloads of small files (the
+  live suite uses ~1.9 KB) are unaffected.
+
 ## 0.3.4
 
 Fault-path pass: what the caller is told when something fails locally, and what the
