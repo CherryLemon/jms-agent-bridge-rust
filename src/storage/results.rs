@@ -4,7 +4,7 @@
 //! Raw bytes are always written whole; previews and pages are computed when a
 //! caller asks for them, never by truncating a saved stream.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -254,6 +254,9 @@ pub struct ResultStore {
     active: Mutex<HashSet<String>>,
     /// Serializes metadata mutation so two writers cannot lose an update.
     io: Mutex<()>,
+    /// Live progress for running results. Reads take it from memory so a polling caller
+    /// does not force a durable write per tick; `finish` drops the entry.
+    live: Mutex<HashMap<String, Map<String, Value>>>,
     last_cleanup: Mutex<Option<Value>>,
     stop_retention: Arc<AtomicBool>,
 }
@@ -281,6 +284,7 @@ impl ResultStore {
             cleanup_interval_seconds,
             active: Mutex::new(HashSet::new()),
             io: Mutex::new(()),
+            live: Mutex::new(HashMap::new()),
             last_cleanup: Mutex::new(None),
             stop_retention: Arc::new(AtomicBool::new(false)),
         })
@@ -348,6 +352,33 @@ impl ResultStore {
     }
 
     pub fn metadata(&self, result_id: &str) -> BridgeResult<Map<String, Value>> {
+        let mut meta = self.metadata_on_disk(result_id)?;
+        if meta.get("status").and_then(Value::as_str) == Some("running") {
+            if let Some(live) = self.live_progress(result_id) {
+                for (key, value) in live {
+                    meta.insert(key, value);
+                }
+            }
+        }
+        Ok(meta)
+    }
+
+    /// Live progress overlay for a running result.
+    pub fn live_progress(&self, result_id: &str) -> Option<Map<String, Value>> {
+        self.live
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(result_id).cloned())
+    }
+
+    /// Publish live progress without touching the disk.
+    pub fn set_live_progress(&self, result_id: &str, values: Map<String, Value>) {
+        if let Ok(mut cache) = self.live.lock() {
+            cache.insert(result_id.to_string(), values);
+        }
+    }
+
+    fn metadata_on_disk(&self, result_id: &str) -> BridgeResult<Map<String, Value>> {
         let path = self.directory(result_id)?.join("meta.json");
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -387,8 +418,13 @@ impl ResultStore {
         result_id: &str,
         values: Map<String, Value>,
     ) -> BridgeResult<Map<String, Value>> {
+        // The overlay must go before the verdict is written, or a reader could merge a
+        // live tick into a finished result.
+        if let Ok(mut cache) = self.live.lock() {
+            cache.remove(result_id);
+        }
         let _guard = self.io.lock().expect("result store lock");
-        let mut meta = self.metadata(result_id)?;
+        let mut meta = self.metadata_on_disk(result_id)?;
         for (key, value) in values {
             meta.insert(key, value);
         }
@@ -964,6 +1000,35 @@ mod tests {
     fn write_streams(store: &ResultStore, result_id: &str, stdout: &[u8], stderr: &[u8]) {
         fs::write(store.path(result_id, "stdout").unwrap(), stdout).unwrap();
         fs::write(store.path(result_id, "stderr").unwrap(), stderr).unwrap();
+    }
+
+    /// Live progress is served from memory and disappears with the verdict.
+    #[test]
+    fn live_progress_is_read_from_memory_and_cleared_on_finish() {
+        let (_tmp, store) = store();
+        let result_id = store.create(Map::new()).unwrap();
+        let mut tick = Map::new();
+        tick.insert("bytes_done".into(), json!(512));
+        store.set_live_progress(&result_id, tick);
+        let running = store.metadata(&result_id).unwrap();
+        assert_eq!(
+            running["bytes_done"], 512,
+            "a running result serves the live value"
+        );
+
+        store
+            .finish(
+                &result_id,
+                Map::from_iter([("bytes_done".into(), json!(512))]),
+            )
+            .unwrap();
+        assert!(
+            store.live_progress(&result_id).is_none(),
+            "the overlay is dropped with the verdict"
+        );
+        let done = store.metadata(&result_id).unwrap();
+        assert_eq!(done["bytes_done"], 512);
+        assert_eq!(done["status"], "complete");
     }
 
     /// A live progress tick must never resurrect a result that already finished.

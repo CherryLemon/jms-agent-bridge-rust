@@ -1521,6 +1521,7 @@ closed and must not be reused. Inspect before rerunning."
             let handle = progress_handle.clone();
             tokio::spawn(async move {
                 let mut last = 0u64;
+                let mut ticks = 0u32;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     let snapshot = handle.snapshot();
@@ -1529,6 +1530,13 @@ closed and must not be reused. Inspect before rerunning."
                         continue;
                     }
                     last = done;
+                    // Live reads come from memory; the disk copy is refreshed once every
+                    // few seconds so a restart still has recent numbers.
+                    store.set_live_progress(&id, snapshot.clone());
+                    ticks += 1;
+                    if ticks % 5 != 0 {
+                        continue;
+                    }
                     // Never overwrite a finished result with a stale tick.
                     if let Err(error) = store.annotate_if_running(&id, snapshot) {
                         tracing::debug!(error = error.message(), "progress annotate failed");

@@ -836,12 +836,17 @@ pub async fn transfer(
         Err(_) => None,
         Ok(Ok(_)) => None,
     };
-    // Ordered teardown: stop accepting, reap the pumps, then read the evidence. The
-    // flag is snapshotted only after the producers can no longer move it.
+    // Ordered teardown: stop accepting new work, end the child, then reap the pumps and
+    // only then read the evidence. Terminating before reaping matters: the stderr and
+    // stdout watchers are blocking reads that cannot be aborted early, and they finish
+    // exactly when the child's pipes close.
     owner.quiesce().await;
+    let unfinished = kill_reason.is_some() || !matches!(waited, Ok(Ok(_)));
+    if unfinished {
+        terminate_off_thread(&mut child).await;
+    }
     owner.reap_pumps().await;
     if let Some(error) = kill_reason {
-        terminate_off_thread(&mut child).await;
         return Err(BridgeError::storage(error));
     }
     let outcome = match waited {
@@ -852,8 +857,8 @@ pub async fn transfer(
             timed_out: false,
         },
         _ => {
-            // Timeout: let rsync keep its partial before forcing it out.
-            terminate_off_thread(&mut child).await;
+            // Timeout: the child was already stopped above, after it had the chance to
+            // keep its partial.
             TransferOutcome {
                 exit_code: 124,
                 sent: sent.load(Ordering::SeqCst),
@@ -984,7 +989,7 @@ async fn serve_stream(
         let mut socket_read = socket_read;
         let channel_writer = writer;
         let mut chunk = vec![0u8; 65536];
-        loop {
+        let forwarded = loop {
             match socket_read.read(&mut chunk).await {
                 Ok(0) => {
                     // A one-way end: half-close the remote stdin and keep the channel.
@@ -992,20 +997,25 @@ async fn serve_stream(
                     while !uplink_stop.load(Ordering::SeqCst) {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                    return;
+                    break false;
                 }
                 Ok(count) => {
                     if let Err(error) = channel_writer.write(&chunk[..count]).await {
                         tracing::debug!(error = error.message(), "rsync socket->channel failed");
-                        return;
+                        break true;
                     }
                     progress_up.add_bytes(count);
                 }
                 Err(error) => {
                     tracing::debug!(%error, "rsync socket read failed");
-                    return;
+                    break true;
                 }
             }
+        };
+        // Aborting a task that holds the writer never sends SSH Close, so the channel
+        // is closed explicitly whenever this direction stops on its own.
+        if forwarded {
+            channel_writer.close().await;
         }
     });
     let downlink = tokio::spawn(async move {

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.1
+
+Follow-ups on the 0.4.0 teardown and progress work.
+
+* The uplink closes its SSH channel explicitly when it stops on its own: aborting a task
+  that holds the writer never sends SSH Close, so the channel is now released by the
+  direction that owns it.
+* Teardown ends the child before reaping the pumps. The stdout/stderr watchers are
+  blocking reads that cannot be aborted early; they finish when the child's pipes close,
+  so reaping first only spent the grace period and detached the handles.
+* Live progress is served from memory (`ResultStore::live_progress`) and flushed to disk
+  once every five ticks. A polling caller no longer forces a durable metadata write per
+  second, and the overlay is dropped as part of the final verdict.
+* Verified live: 1 GiB download, 24 in-flight samples (`progress_source: "rsync"`,
+  `protocol_bytes` tracked separately), final row 100% of the exact stat size, SHA-256
+  match.
+
+
 ## 0.4.0
 
 Review round after 0.3.9: path handling, progress semantics and teardown edges.

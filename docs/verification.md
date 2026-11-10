@@ -36,6 +36,7 @@ Root cause: rsync gives a custom remote-shell a non-blocking stdout unless
 | 53 | transfer tuning sweep (1 GiB, medians of 3) | no regression; spread too large for a ranking, run stopped early to protect the shared gateway |
 | 54 | remote path with a space (`/tmp/a b.bin`) upload + download | remote name and content identical to the input |
 | 55 | 1 GiB download cut by `timeout: 2` | `ok=false`, exit 124, `completion_unknown=true`, 21% of the real total, `eta_seconds: null` |
+| 56 | live progress from memory during a 1 GiB download | 24 samples, `protocol_bytes` diverges from `bytes_done`, final 100% + SHA match |
 
 Regression tests for the fifth review round (evidence monotonicity, result ownership):
 `a_late_annotation_failure_keeps_the_completed_verdict`,
