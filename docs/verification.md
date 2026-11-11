@@ -9,7 +9,7 @@ credentials are deliberately not recorded here.
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport) | `cargo test --lib` | 158 passed |
+| Unit tests (guard, scheduler, results, journal, inventory, REST signing, schema, views, jobs, terminal, transport, transfer progress) | `cargo test --lib` | 175 passed |
 | Relay backpressure (real binary, non-blocking stdout, slow consumer, 8 MiB) | `cargo test --test relay_backpressure` | 2 passed |
 | Inventory refresh against a mock bastion (transient vs. explicit detail errors, account ambiguity) | `cargo test --test catalog_refresh` | 2 passed |
 | Offline contracts (tool list, schema validation, guard, receipts, saved-result reads, discovery) | `cargo test --test mcp_offline` | 1 passed |
@@ -42,6 +42,7 @@ Root cause: rsync gives a custom remote-shell a non-blocking stdout unless
 | 59 | teardown with an injected channel handle (unit) | stalled child reaped, channel closed exactly once, handle consumed |
 | 60 | `-e` quoting through a port of rsync's parser (unit) | spaces, quotes and backslashes all round-trip |
 | 61 | upload size hint (unit) | plain file yes; directory, symlink and missing path no |
+| 62 | progress projection completeness (unit) | every snapshot key (including `protocol_rate_bps`) survives `meta(section="progress")` |
 
 Regression tests for the fifth review round (evidence monotonicity, result ownership):
 `a_late_annotation_failure_keeps_the_completed_verdict`,

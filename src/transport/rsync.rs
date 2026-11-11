@@ -49,11 +49,13 @@ pub struct RsyncRelay {
     pub socket: PathBuf,
     /// A single-word remote-shell command.
     ///
-    /// rsync needs the whole `-e` command as one token here. A multi-word command makes
-    /// rsync materialise a helper file next to this binary (`<dir>/.ps__<hash>`), which
-    /// it then reaps - a reaped helper turns every later transfer into
-    /// "Failed to exec ... (deleted)". A wrapper script in the private temp directory
-    /// avoids that path entirely and costs one small file instead of a 25 MB copy.
+    /// rsync needs the whole `-e` command as one token here. With a multi-word command we
+    /// observed rsync creating a helper file next to this binary
+    /// (`<dir>/.ps__<hash>`); once such a file was reaped, every later transfer failed
+    /// with "Failed to exec ... (deleted)" (exit 14). Why upstream writes that helper is
+    /// still undetermined - it does not match the documented `--protect-args` path - but
+    /// a wrapper script in the private temp directory avoids the situation entirely and
+    /// costs one small file instead of a 25 MB copy.
     pub wrapper: PathBuf,
     directory: PathBuf,
 }

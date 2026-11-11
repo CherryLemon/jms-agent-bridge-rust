@@ -1265,81 +1265,7 @@ require allow_dangerous=true",
         }
         let result_id = reference.strip_prefix("result:").unwrap_or(reference);
         let meta = self.store.metadata(result_id)?;
-        let keys: &[&str] = match section {
-            "summary" => &[
-                "result_id",
-                "kind",
-                "operation",
-                "host",
-                "status",
-                "ok",
-                "exit_code",
-                "executed",
-                "execution_state",
-                "completion_unknown",
-                "failure_stage",
-                "error",
-                "producer",
-                "expires_at",
-            ],
-            "timing" => &[
-                "result_id",
-                "host",
-                "created_at",
-                "finished_at",
-                "elapsed_seconds",
-                "timing",
-                "connection_timing",
-            ],
-            "progress" => &[
-                "result_id",
-                "kind",
-                "operation",
-                "host",
-                "status",
-                // The verdict travels with the numbers: a partial percentage alone does
-                // not say whether the transfer succeeded, failed or timed out.
-                "ok",
-                "exit_code",
-                "completion_unknown",
-                "execution_state",
-                "bytes_done",
-                "total_bytes",
-                "progress_pct",
-                "progress_source",
-                "protocol_bytes",
-                "rate_bps",
-                "eta_seconds",
-                "created_at",
-                "finished_at",
-                "expires_at",
-            ],
-            "transport" => &[
-                "result_id",
-                "host",
-                "asset_id",
-                "container",
-                "image",
-                "lane",
-                "session_id",
-                "connection_state",
-                "session_state",
-                "reconnected",
-                "executed",
-                "execution_state",
-                "completion_unknown",
-                "timed_out",
-                "queue_timed_out",
-                "failure_stage",
-                "reason",
-                "retryable",
-                "queue",
-                "startup_retry_result_id",
-                "connection_recovery",
-                "warning",
-            ],
-            _ => &[],
-        };
+        let keys = meta_section_keys(section);
         if keys.is_empty() {
             return Ok(Value::Object(meta));
         }
@@ -1624,9 +1550,121 @@ pub fn dangerous_flag_description() -> &'static str {
     DANGEROUS_FLAG_DESCRIPTION
 }
 
+fn meta_section_keys(section: &str) -> &'static [&'static str] {
+    match section {
+        "summary" => &[
+            "result_id",
+            "kind",
+            "operation",
+            "host",
+            "status",
+            "ok",
+            "exit_code",
+            "executed",
+            "execution_state",
+            "completion_unknown",
+            "failure_stage",
+            "error",
+            "producer",
+            "expires_at",
+        ],
+        "timing" => &[
+            "result_id",
+            "host",
+            "created_at",
+            "finished_at",
+            "elapsed_seconds",
+            "timing",
+            "connection_timing",
+        ],
+        "progress" => &[
+            "result_id",
+            "kind",
+            "operation",
+            "host",
+            "status",
+            // The verdict travels with the numbers: a partial percentage alone does
+            // not say whether the transfer succeeded, failed or timed out.
+            "ok",
+            "exit_code",
+            "completion_unknown",
+            "execution_state",
+            "bytes_done",
+            "total_bytes",
+            "progress_pct",
+            "progress_source",
+            "protocol_bytes",
+            "protocol_rate_bps",
+            "rate_bps",
+            "eta_seconds",
+            "created_at",
+            "finished_at",
+            "expires_at",
+        ],
+        "transport" => &[
+            "result_id",
+            "host",
+            "asset_id",
+            "container",
+            "image",
+            "lane",
+            "session_id",
+            "connection_state",
+            "session_state",
+            "reconnected",
+            "executed",
+            "execution_state",
+            "completion_unknown",
+            "timed_out",
+            "queue_timed_out",
+            "failure_stage",
+            "reason",
+            "retryable",
+            "queue",
+            "startup_retry_result_id",
+            "connection_recovery",
+            "warning",
+        ],
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything the transfer snapshot emits must survive the projection.
+    ///
+    /// `protocol_rate_bps` was generated but missing from the whitelist, so the usual
+    /// progress poll showed protocol bytes without the rate that goes with them.
+    #[test]
+    fn the_progress_projection_carries_every_snapshot_field() {
+        use crate::transport::rsync::TransferProgress;
+        let keys = meta_section_keys("progress");
+
+        let with_rsync = TransferProgress::default();
+        with_rsync.start();
+        with_rsync.set_total(1_000);
+        with_rsync.add_bytes(120);
+        with_rsync.observe("     500  50%  1MB/s  0:00:01");
+        for key in with_rsync.snapshot().keys() {
+            assert!(
+                keys.contains(&key.as_str()),
+                "`meta(section=progress)` drops {key}; the whitelist is out of date"
+            );
+        }
+
+        let protocol_only = TransferProgress::default();
+        protocol_only.start();
+        protocol_only.set_total(1_000);
+        protocol_only.add_bytes(64);
+        for key in protocol_only.snapshot().keys() {
+            assert!(
+                keys.contains(&key.as_str()),
+                "`meta(section=progress)` drops {key} for a transfer without rsync progress"
+            );
+        }
+    }
 
     /// A local persistence failure after a successful run must not read as "not run".
     #[test]
