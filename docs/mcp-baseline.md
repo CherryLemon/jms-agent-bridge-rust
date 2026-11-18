@@ -1,4 +1,4 @@
-# Offline MCP transport baseline (v1)
+# Offline MCP transport baseline (v2)
 
 Build the bridge from the revision being compared and run the same fixture on
 the same machine for both revisions. The Python 3.9+ harness uses the standard
@@ -8,12 +8,21 @@ host keys, credentials or a model API.
 
 ```sh
 cargo build --locked --release
-python3 tools/mcp_baseline.py --binary target/release/jms-bridge --repeats 30 > baseline.json
+python3 tools/mcp_baseline.py --binary target/release/jms-bridge \
+  --server-git-sha "$(git rev-parse HEAD)" --repeats 30 > baseline.json
 ```
 
 Run on a quiet machine and keep the build profile, repeat count and fixture
-constant. Archive the JSON alongside the binary's Git revision. A wrong reply
-or unexpected error fails the run instead of contaminating percentiles.
+constant. The explicit revision above is valid only if you built that binary
+from the corresponding clean checkout. For an existing binary, use the
+revision recorded by its build, not the current checkout. The harness cannot
+infer or verify this mapping. The report includes that supplied revision,
+plus SHA-256 digests of the binary and the exact fixture bytes.
+
+A wrong reply or unexpected error fails the run instead of contaminating
+percentiles. A missing tool used by the fixture fails the run; extra tools
+are allowed. The report records the complete declared tool-name set and the
+actual declaration response sizes.
 
 | Step | Real protocol / offline fixture scope |
 | --- | --- |
@@ -24,7 +33,9 @@ or unexpected error fails the run instead of contaminating percentiles.
 | Terminal read | Real unknown-handle rejection. No terminal is opened. |
 
 - **Calls and errors:** `messages` counts all JSON-RPC submissions, including
-  the notification; `tool_calls` counts only `tools/call`. The negative terminal
+  the notification; `tool_calls` counts only `tools/call`. Startup (one
+  initialize, one notification, one tools/list) and repeated workload calls
+  are reported separately. The negative terminal
   case contributes one expected MCP error per iteration. A reconciled receipt
   with `completion_unknown` is a valid tool response, not an MCP error.
 - **Bytes:** stdio counts UTF-8 frames including the newline; Streamable HTTP
@@ -45,9 +56,15 @@ or unexpected error fails the run instead of contaminating percentiles.
 The existing unit-test limit on the advertised declaration stays in place:
 `cargo test --lib advertised_tools_stay_within_their_token_budget`.
 
-A sanity run on `7d62f6c` (debug build, Linux x86-64, 30 iterations per
-transport) completed 182 MCP messages, 150 tool calls and 30 expected terminal
-errors per transport. The largest tool-list reply was 6,470 JSON bytes on both
-transports; initialize was 824 JSON bytes. Total stdio request/response frames
-were 21,947/261,359 bytes; total HTTP bodies were 21,765/261,178 bytes. These
-figures are a check of the fixture, not thresholds for future runs.
+A matched sanity run (debug builds, Linux x86-64, 30 iterations per transport,
+same fixture) completed three startup messages, 150 workload tool calls and
+30 expected terminal errors per transport on both builds:
+
+| Source build | Tool-list JSON bytes | Initialize JSON bytes | Stdio workload response frames | HTTP workload response bodies |
+| --- | ---: | ---: | ---: | ---: |
+| `7d62f6c`, original | 6,468 | 824 | 66,406 B | 66,256 B |
+| `6d3560b`, initial combined first-wave candidate (adds `job`) | 5,966 | 829 | 77,566 B | 77,416 B |
+
+The startup byte improvement is separate from repeated workload traffic and
+does not imply that workload replies shrank. These figures are checks of the
+fixture, not thresholds or model token measurements.

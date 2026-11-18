@@ -8,6 +8,7 @@ import http.client
 import json
 import math
 from pathlib import Path
+import re
 import select
 import socket
 import subprocess
@@ -126,6 +127,15 @@ def exchange_http(port, body, reply):
         conn.close()
 
 
+def declared_tools(listed, fixture):
+    required = {step["tool"] for step in fixture["steps"]}
+    declared = {tool["name"] for tool in listed["tools"]}
+    missing = required - declared
+    if missing:
+        raise RuntimeError(f"missing fixture tools: {', '.join(sorted(missing))}")
+    return sorted(declared)
+
+
 def benchmark(exchange, fixture, repeats):
     samples = defaultdict(list)
     rpc_id = 0
@@ -173,13 +183,11 @@ def benchmark(exchange, fixture, repeats):
         raise RuntimeError("unexpected server")
     bridge_version = init["serverInfo"]["version"]
     call("initialized_notification", "notifications/initialized", reply=False)
+    listed = call("tools_list", "tools/list")
+    declared = declared_tools(listed, fixture)
+    startup_labels = set(samples)
     tool_calls = {step["name"] for step in fixture["steps"]}
     for iteration in range(repeats):
-        listed = call("tools_list", "tools/list")
-        if {tool["name"] for tool in listed["tools"]} != {
-            "run", "fs", "terminal", "read_result", "discover", "call", "meta",
-        }:
-            raise RuntimeError("unexpected tool declarations")
         for step in fixture["steps"]:
             label = step["name"]
             if label == "lost_reply_receipt" and iteration == 0:
@@ -205,16 +213,23 @@ def benchmark(exchange, fixture, repeats):
                 round(sorted_times[math.ceil(0.95 * len(rows)) - 1], 3),
         }
 
-    details = {label: summarize(label, rows) for label, rows in samples.items()}
-    totals = {key: sum(stats[key] for stats in details.values()) for key in
-              ("messages", "tool_calls", "request_bytes", "response_bytes", "mcp_errors")}
+    def phase(labels):
+        details = {label: summarize(label, rows) for label, rows in samples.items()
+                   if label in labels}
+        fields = ("messages", "tool_calls", "request_bytes", "response_bytes", "mcp_errors")
+        return {
+            "totals": {key: sum(stats[key] for stats in details.values()) for key in fields},
+            "per_operation": details,
+        }
+
     return {
         "bridge_version": bridge_version,
-        "totals": totals,
-        "per_operation": details,
-        "declaration_bytes": {
-            "initialize_response_json": samples["initialize"][0][4],
-            "tools_list_response_json_max": max(row[4] for row in samples["tools_list"]),
+        "startup": phase(startup_labels),
+        "workload": phase(samples.keys() - startup_labels),
+        "declarations": {
+            "tools": declared,
+            "initialize_response_json_bytes": samples["initialize"][0][4],
+            "tools_list_response_json_bytes": samples["tools_list"][0][4],
         },
     }
 
@@ -222,14 +237,26 @@ def benchmark(exchange, fixture, repeats):
 def main():
     arg = argparse.ArgumentParser(description=__doc__)
     arg.add_argument("--binary", type=Path, required=True)
+    arg.add_argument("--server-git-sha", required=True,
+                     help="full Git commit ID of the source used to build --binary")
     arg.add_argument("--repeats", type=int, default=30)
     options = arg.parse_args()
     if options.repeats < 1:
         arg.error("--repeats must be positive")
-    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", options.server_git_sha):
+        arg.error("--server-git-sha must be a full 40-hex Git commit ID")
+    fixture_bytes = FIXTURE.read_bytes()
+    fixture = json.loads(fixture_bytes)
+    binary_sha256 = hashlib.sha256()
+    with options.binary.open("rb") as binary:
+        for chunk in iter(lambda: binary.read(1024 * 1024), b""):
+            binary_sha256.update(chunk)
     data = {
-        "report_version": 1,
+        "report_version": 2,
+        "server_git_sha": options.server_git_sha.lower(),
+        "binary_sha256": binary_sha256.hexdigest(),
         "fixture": FIXTURE.name,
+        "fixture_sha256": hashlib.sha256(fixture_bytes).hexdigest(),
         "repeats": options.repeats,
         "model_tokens": None,
         "ssh_probes": None,
