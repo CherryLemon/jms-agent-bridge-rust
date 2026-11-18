@@ -411,6 +411,9 @@ require allow_dangerous=true",
             }
             identity
         };
+        if action != "read" && arguments.contains_key("result_id") {
+            return Err(BridgeError::invalid("result_id is only for terminal read"));
+        }
         match action {
             "open" => {
                 let target = arguments
@@ -483,6 +486,19 @@ require allow_dangerous=true",
             }
             "read" => {
                 let session = used_string(&arguments, "session")?;
+                if arguments.contains_key("result_id") {
+                    let result_id = used_string(&arguments, "result_id")?;
+                    return self
+                        .terminals
+                        .read_result(
+                            &session,
+                            &result_id,
+                            page.wait_ms,
+                            page.max_bytes,
+                            page.cursor.as_ref(),
+                        )
+                        .await;
+                }
                 self.terminals
                     .read(&session, page.wait_ms, page.max_bytes, page.cursor.as_ref())
                     .await

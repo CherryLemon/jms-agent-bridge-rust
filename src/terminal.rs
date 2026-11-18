@@ -1085,6 +1085,34 @@ impl Interactive {
             .await
     }
 
+    /// Read a command by its immutable ID, including after replacement or restart.
+    /// This uses the same retained output access as read_result.
+    pub async fn read_result(
+        &self,
+        session: &str,
+        result_id: &str,
+        wait_ms: u64,
+        max_bytes: usize,
+        cursor: Option<&Value>,
+    ) -> BridgeResult<Value> {
+        let explicit = json!({});
+        let cursor = cursor.or(Some(&explicit));
+        let binding = self.bindings.lock().await.get(session).cloned();
+        if let Some(binding) = binding {
+            let command = binding.lock().await.command.clone();
+            if let Some(command) = command {
+                // Retain this exact Arc across the wait, never re-lookup session.current.
+                if command.lock().await.result_id == result_id {
+                    terminal_result_metadata(&self.store, session, result_id)?;
+                    return self
+                        .read_command(session, &command, wait_ms, max_bytes, cursor)
+                        .await;
+                }
+            }
+        }
+        read_saved_terminal_result(&self.store, session, result_id, max_bytes, cursor)
+    }
+
     /// Read one specific command's output, independent of what the session does next.
     async fn read_command(
         &self,
@@ -1123,14 +1151,11 @@ async fn read_command_state(
     cursor: Option<&Value>,
 ) -> BridgeResult<Value> {
     let mut guard = command.lock().await;
-    let mut positions: HashMap<String, u64> = guard.cursor.clone();
-    if let Some(cursor) = cursor.and_then(Value::as_object) {
-        for (stream, value) in cursor {
-            if let Some(offset) = value.as_u64() {
-                positions.insert(stream.clone(), offset);
-            }
-        }
-    }
+    let mut positions = if cursor.is_some() {
+        terminal_positions(cursor)
+    } else {
+        guard.cursor.clone()
+    };
     {
         // The result id is copied out so the helper never borrows the lock guard.
         let result_id = guard.result_id.clone();
@@ -1174,41 +1199,10 @@ async fn read_command_state(
         out.insert("session".into(), Value::from(session));
         out.insert("result_id".into(), Value::from(guard.result_id.clone()));
         out.insert("state".into(), Value::from(guard.state.as_str()));
-        let mut budget = max_bytes;
-        for stream in ["stderr", "stdout"] {
-            let path = store.path(&guard.result_id, stream)?;
-            let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-            let position = positions.get(stream).copied().unwrap_or(0);
-            let available = size.saturating_sub(position);
-            let limit = (budget as u64).min(available);
-            if limit > 0 {
-                let page = store.read(
-                    &guard.result_id,
-                    stream,
-                    position,
-                    limit as usize,
-                    false,
-                    None,
-                )?;
-                let text = page.get("text").and_then(Value::as_str).unwrap_or("");
-                out.insert(stream.to_string(), Value::from(text));
-                let next = page
-                    .get("next_offset")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(position);
-                positions.insert(stream.to_string(), next);
-                budget = budget.saturating_sub(text.len());
-            }
-            if positions.get(stream).copied().unwrap_or(0) < size {
-                out.insert("more".into(), Value::Bool(true));
-            }
+        append_terminal_page(store, &guard.result_id, max_bytes, &mut positions, &mut out)?;
+        if cursor.is_none() {
+            guard.cursor = positions;
         }
-        guard.cursor = positions.clone();
-        let mut cursor_map = Map::new();
-        for (stream, value) in &positions {
-            cursor_map.insert(stream.clone(), json!(value));
-        }
-        out.insert("cursor".into(), Value::Object(cursor_map));
         if guard.state == CmdState::Completed {
             let exit_code = guard.exit_code.unwrap_or(255);
             out.insert("ok".into(), Value::Bool(exit_code == 0));
@@ -1239,6 +1233,94 @@ async fn read_command_state(
         }
         Ok(Value::Object(out))
     }
+}
+
+fn terminal_positions(cursor: Option<&Value>) -> HashMap<String, u64> {
+    ["stdout", "stderr"]
+        .into_iter()
+        .filter_map(|stream| {
+            cursor?
+                .get(stream)?
+                .as_u64()
+                .map(|offset| (stream.to_string(), offset))
+        })
+        .collect()
+}
+
+fn append_terminal_page(
+    store: &ResultStore,
+    result_id: &str,
+    max_bytes: usize,
+    positions: &mut HashMap<String, u64>,
+    out: &mut Map<String, Value>,
+) -> BridgeResult<()> {
+    let mut budget = max_bytes;
+    for stream in ["stderr", "stdout"] {
+        let path = store.path(result_id, stream)?;
+        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let position = positions.get(stream).copied().unwrap_or(0);
+        let limit = (budget as u64).min(size.saturating_sub(position));
+        if limit > 0 {
+            let page = store.read(result_id, stream, position, limit as usize, false, None)?;
+            let text = page.get("text").and_then(Value::as_str).unwrap_or("");
+            out.insert(stream.to_string(), Value::from(text));
+            let next = page
+                .get("next_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(position);
+            positions.insert(stream.to_string(), next);
+            budget = budget.saturating_sub(text.len());
+        }
+        if positions.get(stream).copied().unwrap_or(0) < size {
+            out.insert("more".into(), Value::Bool(true));
+        }
+    }
+    out.insert("cursor".into(), json!(positions));
+    Ok(())
+}
+
+fn terminal_result_metadata(
+    store: &ResultStore,
+    session: &str,
+    result_id: &str,
+) -> BridgeResult<Map<String, Value>> {
+    let meta = store.metadata(result_id)?;
+    if meta.get("kind").and_then(Value::as_str) != Some("terminal")
+        || meta.get("session_id").and_then(Value::as_str) != Some(session)
+    {
+        return Err(BridgeError::invalid(
+            "result is not a command for this terminal session",
+        ));
+    }
+    Ok(meta)
+}
+
+fn read_saved_terminal_result(
+    store: &ResultStore,
+    session: &str,
+    result_id: &str,
+    max_bytes: usize,
+    cursor: Option<&Value>,
+) -> BridgeResult<Value> {
+    let meta = terminal_result_metadata(store, session, result_id)?;
+    let state = match meta.get("execution_state").and_then(Value::as_str) {
+        Some(state @ ("completed" | "not_started" | "unknown")) => state,
+        _ => "unknown",
+    };
+    let mut result = json!({
+        "session": session, "result_id": result_id, "state": state,
+        "ok": state == "completed" && meta.get("ok").and_then(Value::as_bool) == Some(true),
+        "completion_unknown": state == "unknown",
+    });
+    let out = result.as_object_mut().expect("object");
+    for key in ["exit_code", "executed", "error", "failure_stage"] {
+        if let Some(value) = meta.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    let mut positions = terminal_positions(cursor);
+    append_terminal_page(store, result_id, max_bytes, &mut positions, out)?;
+    Ok(result)
 }
 
 impl Interactive {
@@ -1596,11 +1678,11 @@ async fn run_terminal_command(
     for (key, value) in guard.rejection.clone() {
         values.insert(key, value);
     }
-    let result_id = guard.result_id.clone();
+    // Publish historical evidence before another command can replace this one.
+    let _ = store.finish(&guard.result_id, values);
     guard.changed.notify_waiters();
     drop(guard);
     drop(slot);
-    let _ = store.finish(&result_id, values);
     Ok(())
 }
 
@@ -1617,6 +1699,95 @@ pub fn command_rejection(meta: &Map<String, Value>) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_command(store: &ResultStore, kind: &str, session: &str, bytes: &[u8]) -> String {
+        let id = store
+            .create(
+                json!({"kind": kind, "session_id": session})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        std::fs::write(store.path(&id, "stdout").unwrap(), bytes).unwrap();
+        id
+    }
+
+    #[test]
+    fn retained_terminal_pages_are_bound_to_the_original_session_and_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let result_id = {
+            let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+            let a = test_command(&store, "terminal", "s", b"abcdef");
+            let b = test_command(&store, "terminal", "s", b"second command");
+            let ordinary = test_command(&store, "run", "s", b"not a terminal");
+            store
+                .finish(
+                    &a,
+                    json!({"execution_state":"completed","exit_code":7,"ok":false})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap();
+            let page = read_saved_terminal_result(&store, "s", &a, 3, None).unwrap();
+            assert_eq!(page["result_id"], a);
+            assert_eq!(page["stdout"], "abc");
+            assert_eq!(page["state"], "completed");
+            assert_eq!(page["exit_code"], 7);
+            assert_eq!(page["ok"], false);
+            assert_eq!(page["more"], true);
+            assert!(read_saved_terminal_result(&store, "wrong", &a, 8, None).is_err());
+            assert!(read_saved_terminal_result(&store, "s", &ordinary, 8, None).is_err());
+            assert_eq!(
+                read_saved_terminal_result(&store, "s", &b, 16, None).unwrap()["state"],
+                "unknown"
+            );
+            a
+        };
+        // New store instance; no live Session/Command needed for output.
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let page =
+            read_saved_terminal_result(&store, "s", &result_id, 3, Some(&json!({"stdout":3})))
+                .unwrap();
+        assert_eq!(page["stdout"], "def");
+        std::fs::remove_file(store.directory(&result_id).unwrap().join("meta.json")).unwrap();
+        assert!(read_saved_terminal_result(&store, "s", &result_id, 3, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_cursors_do_not_advance_or_rewind_implicit_terminal_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let id = test_command(&store, "terminal", "s", b"abcdef");
+        let command = Arc::new(AsyncMutex::new(Command::new(id)));
+        let wait = ReadWait::Output(0);
+        assert_eq!(
+            read_command_state(&store, "s", &command, wait, 2, None)
+                .await
+                .unwrap()["stdout"],
+            "ab"
+        );
+        for (offset, expected) in [(0, "ab"), (4, "ef"), (0, "ab")] {
+            let page = read_command_state(
+                &store,
+                "s",
+                &command,
+                wait,
+                2,
+                Some(&json!({"stdout":offset})),
+            )
+            .await
+            .unwrap();
+            assert_eq!(page["stdout"], expected);
+        }
+        assert_eq!(
+            read_command_state(&store, "s", &command, wait, 2, None)
+                .await
+                .unwrap()["stdout"],
+            "cd"
+        );
+    }
 
     #[test]
     fn a_closed_stream_without_its_marker_ends_the_command() {

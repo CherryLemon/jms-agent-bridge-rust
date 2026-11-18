@@ -137,6 +137,65 @@ max_parallel = 2\n",
         .unwrap_err();
     assert!(error.message().contains("unknown terminal session"));
 
+    // Historical command output is addressable through both terminal entry
+    // points without creating a shell, even when its old handle is absent.
+    let command_id = runtime
+        .store
+        .create(object(json!({
+            "kind": "terminal", "session_id": "previous-shell"
+        })))
+        .unwrap();
+    std::fs::write(
+        runtime.store.path(&command_id, "stdout").unwrap(),
+        b"recorded",
+    )
+    .unwrap();
+    runtime
+        .store
+        .finish(
+            &command_id,
+            object(json!({
+                "execution_state": "completed", "exit_code": 0, "ok": true
+            })),
+        )
+        .unwrap();
+    let first = server
+        .dispatch(
+            "terminal",
+            object(json!({
+                "action": "read", "session": "previous-shell",
+                "options": {"result_id": command_id, "max_bytes": 3}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["stdout"], "rec");
+    let second = server
+        .dispatch(
+            "call",
+            object(json!({
+                "operation": "terminal_read", "arguments": {
+                    "session": "previous-shell", "result_id": command_id, "cursor": first["cursor"]
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["stdout"], "orded");
+    let wrong_session = server
+        .dispatch(
+            "terminal",
+            object(json!({
+                "action": "read", "session": "unrelated",
+                "options": {"result_id": command_id}
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(wrong_session
+        .message()
+        .contains("not a command for this terminal"));
+
     // Failure counters stay visible in the receipts surface.
     let status = runtime.status().await;
     assert!(status.get("execution").is_some());

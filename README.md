@@ -131,6 +131,13 @@ a command in flight is reported as `running`; the query never waits for that
 command, so status latency does not grow with command duration. A terminal accepts
 one command at a time: a second `exec` is refused with "terminal is busy".
 
+For a command's saved output, call
+`terminal(action="read", session=..., options={"result_id":"..."})`
+(or legacy `terminal_read` with the same ID). It reads that command even if a
+new command owns the terminal or the server has restarted. Use the returned
+cursor for subsequent pages; explicit cursors do not move the implicit session
+cursor. Omit the result ID to read the session's current command as before.
+
 Advanced fields live in an `options` object so the advertised schema stays small;
 `discover(operation="run"|"fs"|"terminal")` returns the complete schema, and
 `discover(operation="jms_fs", query=<action>)` narrows it per action. Everything
