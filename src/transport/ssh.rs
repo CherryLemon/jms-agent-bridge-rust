@@ -246,6 +246,21 @@ impl ChannelWriter {
 }
 
 impl ChannelReader {
+    #[cfg(test)]
+    pub(crate) fn mock() -> (mpsc::Sender<ShellEvent>, Self) {
+        let (send, events) = mpsc::channel(16);
+        (
+            send,
+            Self {
+                events,
+                task: None,
+                exit_code: None,
+                closed: false,
+                rejected: false,
+            },
+        )
+    }
+
     /// Cancel-safe raw receive: the underlying channel receive is cancel safe, so a
     /// `select!` branch may drop this future without losing a packet.
     pub async fn recv(&mut self) -> Option<ShellEvent> {

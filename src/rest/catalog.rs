@@ -572,7 +572,7 @@ fn error_kind(error: &BridgeError) -> &'static str {
         BridgeError::Inventory(_) => "InventoryError",
         BridgeError::Rest(_) => "JumpServerError",
         BridgeError::Storage(_) => "OSError",
-        BridgeError::Ssh(_) => "SshError",
+        BridgeError::Ssh(_) | BridgeError::ShellStartupClosed => "SshError",
     }
 }
 

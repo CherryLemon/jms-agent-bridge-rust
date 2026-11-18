@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 
@@ -24,7 +25,9 @@ use crate::storage::results::{atomic_json, ResultStore};
 use crate::transport::session::{
     find, new_nonce, ready_marker, ready_packet, terminal_packet, MARKER_SUFFIX,
 };
-use crate::transport::ssh::{ChannelShell, ChannelWriter};
+use crate::transport::ssh::{ChannelShell, ChannelWriter, ShellEvent};
+
+pub const DEFAULT_TERMINAL_WAIT_MS: u64 = 15_000;
 
 const SHELL_GUARD: &str = "JMS_SCRIPT_PATTERN_GUARD: already-authorized action needs \
 allow_dangerous=true; this acknowledges only the local guard, never client or JumpServer policy";
@@ -192,38 +195,58 @@ impl CommandPlan {
 pub struct TerminalShell {
     writer: ChannelWriter,
     streams: AsyncMutex<Streams>,
-    lost: AtomicBool,
+    lost: Arc<AtomicBool>,
+    protection: Arc<crate::execution::TerminalProtection>,
     demux: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+async fn demux_terminal_output(
+    events: impl Stream<Item = ShellEvent>,
+    out_tx: mpsc::Sender<Bytes>,
+    err_tx: mpsc::Sender<Bytes>,
+    mark_lost: impl FnOnce(),
+) {
+    futures::pin_mut!(events);
+    while let Some(event) = events.next().await {
+        let (queue, data) = match event {
+            ShellEvent::Data(data) => (&out_tx, data),
+            ShellEvent::ExtData(data) => (&err_tx, data),
+            // Terminal completion is proved by shell markers, not SSH Exit.
+            // EOF means no more markers can arrive. Dropping the senders
+            // lets capture drain any data already queued before seeing closure.
+            ShellEvent::Eof | ShellEvent::Closed | ShellEvent::ExecRejected => break,
+            ShellEvent::Exit(_) => continue,
+        };
+        if queue.send(data).await.is_err() {
+            break;
+        }
+    }
+    mark_lost();
+}
+
 impl TerminalShell {
-    async fn open(runner: &Runner, host: &Host, command: &str) -> BridgeResult<Self> {
+    async fn open(
+        runner: &Runner,
+        host: &Host,
+        command: &str,
+        protection: Arc<crate::execution::TerminalProtection>,
+    ) -> BridgeResult<Self> {
         let (shell, _reconnected) = runner.pool.open_process(host, command).await?;
-        let ChannelShell { writer, mut reader } = shell;
+        let ChannelShell { writer, reader } = shell;
         let (out_tx, out_rx) = mpsc::channel(64);
         let (err_tx, err_rx) = mpsc::channel(64);
-        let demux = tokio::spawn(async move {
-            loop {
-                match reader.next().await {
-                    Some(crate::transport::ssh::ShellEvent::Data(data)) => {
-                        if out_tx.send(data).await.is_err() {
-                            return;
-                        }
-                    }
-                    Some(crate::transport::ssh::ShellEvent::ExtData(data)) => {
-                        if err_tx.send(data).await.is_err() {
-                            return;
-                        }
-                    }
-                    Some(crate::transport::ssh::ShellEvent::ExecRejected) | None => {
-                        drop(out_tx);
-                        drop(err_tx);
-                        return;
-                    }
-                    Some(_) => continue,
-                }
-            }
+        let lost = Arc::new(AtomicBool::new(false));
+        let lost_for_reader = lost.clone();
+        let protection_for_reader = Arc::downgrade(&protection);
+        let events = futures::stream::unfold(reader, |mut reader| async {
+            reader.next().await.map(|event| (event, reader))
         });
+        let demux = tokio::spawn(demux_terminal_output(events, out_tx, err_tx, move || {
+            lost_for_reader.store(true, Ordering::SeqCst);
+            if let Some(protection) = protection_for_reader.upgrade() {
+                protection.release();
+            }
+        }));
         let shell = Self {
             writer,
             streams: AsyncMutex::new(Streams {
@@ -238,10 +261,14 @@ impl TerminalShell {
                     closed: false,
                 },
             }),
-            lost: AtomicBool::new(false),
+            lost,
+            protection,
             demux: Mutex::new(Some(demux)),
         };
-        shell.prime(Duration::from_secs(10)).await?;
+        if let Err(error) = shell.prime(Duration::from_secs(10)).await {
+            shell.close().await;
+            return Err(error);
+        }
         Ok(shell)
     }
 
@@ -269,7 +296,7 @@ impl TerminalShell {
                     )
                 })?;
             if waited == StreamEvent::AllClosed {
-                self.lost.store(true, Ordering::SeqCst);
+                self.mark_lost();
                 return Err(BridgeError::ssh(
                     "remote shell closed during startup; script was not sent",
                 ));
@@ -291,7 +318,16 @@ impl TerminalShell {
     }
 
     fn is_closing(&self) -> bool {
-        self.lost.load(Ordering::SeqCst) || self.writer.is_closed()
+        let closing = self.lost.load(Ordering::SeqCst) || self.writer.is_closed();
+        if closing {
+            self.protection.release();
+        }
+        closing
+    }
+
+    fn mark_lost(&self) {
+        self.lost.store(true, Ordering::SeqCst);
+        self.protection.release();
     }
 
     async fn write_input(&self, text: &str) -> BridgeResult<()> {
@@ -307,7 +343,7 @@ impl TerminalShell {
     }
 
     async fn close(&self) {
-        self.lost.store(true, Ordering::SeqCst);
+        self.mark_lost();
         self.writer.close().await;
         if let Some(demux) = self.demux.lock().expect("demux lock").take() {
             demux.abort();
@@ -316,8 +352,8 @@ impl TerminalShell {
 
     /// Write the command packet.
     ///
-    /// Called while the caller holds the command lock, so `close` can never observe a
-    /// command as "not started" after these bytes were written.
+    /// The caller commits the send under the command lock before writing, so
+    /// `close` cannot report "not started" once a write may occur.
     async fn send_packet(&self, packet: &[u8]) -> BridgeResult<()> {
         let mut streams = self.streams.lock().await;
         streams.out.buffer.clear();
@@ -397,7 +433,7 @@ impl TerminalShell {
                 streams.err.is_closed(),
                 err_state.end_marker.is_some(),
             ) {
-                self.lost.store(true, Ordering::SeqCst);
+                self.mark_lost();
                 return Err(BridgeError::ssh(
                     "terminal stream closed before the completion marker; completion is unknown",
                 ));
@@ -410,7 +446,7 @@ impl TerminalShell {
                 // `completion_impossible` decide when evidence can no longer arrive.
                 Ok(StreamEvent::Data | StreamEvent::StreamClosed) => continue,
                 Ok(StreamEvent::AllClosed) => {
-                    self.lost.store(true, Ordering::SeqCst);
+                    self.mark_lost();
                     return Err(BridgeError::ssh(
                         "terminal shell closed before the completion marker; completion is unknown",
                     ));
@@ -458,12 +494,27 @@ fn clear_command(
     }
 }
 
-/// Whether a worker may take a command over and send it.
-///
-/// The transition happens under the command lock, together with the first write, so a
-/// `close` that ran first is honoured: the worker sees a final state and sends nothing.
-fn try_take_over(guard: &mut Command) -> bool {
+/// Check readiness and commit to sending under the command lock. If close
+/// won or the shell was already lost, nothing can reach the remote side.
+fn try_take_over(guard: &mut Command, shell_lost: bool, store: &ResultStore) -> bool {
     if guard.state != CmdState::Queued {
+        return false;
+    }
+    if shell_lost {
+        let error = "terminal shell was lost before sending";
+        guard.state = CmdState::NotStarted;
+        guard.error = Some(error.into());
+        let _ = store.finish(
+            &guard.result_id,
+            json!({
+                "ok": false, "executed": false, "execution_state": "not_started",
+                "completion_unknown": false, "error": error,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        guard.changed.notify_waiters();
         return false;
     }
     guard.state = CmdState::Running;
@@ -574,9 +625,6 @@ struct Binding {
     shell: Arc<TerminalShell>,
     command: Option<Arc<AsyncMutex<Command>>>,
     closed: bool,
-    /// Keeps the connection from being replaced while this terminal is open, so an
-    /// idle shell does not lose its cwd/environment to another target's reconnect.
-    _protection: crate::execution::TerminalProtection,
 }
 
 pub struct Interactive {
@@ -765,8 +813,8 @@ impl Interactive {
             })?;
         // Register the protection before the shell exists: the connection must not be
         // replaced between opening the channel and the binding becoming visible.
-        let protection = self.runner.protect_terminal(&key);
-        let shell = TerminalShell::open(&self.runner, &host, &command).await;
+        let protection = Arc::new(self.runner.protect_terminal(&key));
+        let shell = TerminalShell::open(&self.runner, &host, &command, protection.clone()).await;
         drop(slot);
         drop(lease);
         let shell = match shell {
@@ -790,7 +838,6 @@ impl Interactive {
             shell: Arc::new(shell),
             command: None,
             closed: false,
-            _protection: protection,
         }));
         self.bindings
             .lock()
@@ -808,9 +855,25 @@ impl Interactive {
         } else {
             setup.join(" && ")
         };
+        let setup_deadline = Instant::now() + Duration::from_secs(10);
         let value = self
-            .execute(&session, &script, false, 10_000, 4096, None, None)
-            .await?;
+            .execute_with_wait(
+                &session,
+                &script,
+                false,
+                ReadWait::Completion(setup_deadline),
+                4096,
+                None,
+                None,
+            )
+            .await;
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = self.close(&session).await;
+                return Err(error);
+            }
+        };
         if value.get("state").and_then(Value::as_str) != Some("completed")
             || value.get("exit_code").and_then(Value::as_i64) != Some(0)
         {
@@ -836,6 +899,29 @@ impl Interactive {
         script: &str,
         allow_dangerous: bool,
         wait_ms: u64,
+        max_bytes: usize,
+        cursor: Option<&Value>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
+    ) -> BridgeResult<Value> {
+        self.execute_with_wait(
+            session,
+            script,
+            allow_dangerous,
+            ReadWait::Output(wait_ms),
+            max_bytes,
+            cursor,
+            progress,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_with_wait(
+        &self,
+        session: &str,
+        script: &str,
+        allow_dangerous: bool,
+        wait: ReadWait,
         max_bytes: usize,
         cursor: Option<&Value>,
         progress: Option<&dyn crate::storage::journal::ProgressSink>,
@@ -964,13 +1050,9 @@ impl Interactive {
             command_guard.task = Some(task);
         }
         gate.notify_one();
-        if wait_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(wait_ms.min(30_000))).await;
-        }
         // Bound to our own command: reading "the session's current command" could return
         // a newer command's result id if ours finished in the meantime.
-        self.read_command(session, &command, 0, max_bytes, cursor)
-            .await
+        read_command_state(&self.store, session, &command, wait, max_bytes, cursor).await
     }
 
     pub async fn read(
@@ -982,12 +1064,7 @@ impl Interactive {
     ) -> BridgeResult<Value> {
         let binding = self.binding(session).await?;
         if binding.lock().await.shell.is_closing() {
-            binding
-                .lock()
-                .await
-                .shell
-                .lost
-                .store(true, Ordering::SeqCst);
+            binding.lock().await.shell.mark_lost();
         }
         let (command, closed, lost) = {
             let binding = binding.lock().await;
@@ -1017,8 +1094,22 @@ impl Interactive {
         max_bytes: usize,
         cursor: Option<&Value>,
     ) -> BridgeResult<Value> {
-        read_command_state(&self.store, session, command, wait_ms, max_bytes, cursor).await
+        read_command_state(
+            &self.store,
+            session,
+            command,
+            ReadWait::Output(wait_ms),
+            max_bytes,
+            cursor,
+        )
+        .await
     }
+}
+
+#[derive(Clone, Copy)]
+enum ReadWait {
+    Output(u64),
+    Completion(Instant),
 }
 
 /// The read path as a free function: it only needs the store and the command, which
@@ -1027,7 +1118,7 @@ async fn read_command_state(
     store: &ResultStore,
     session: &str,
     command: &Arc<AsyncMutex<Command>>,
-    wait_ms: u64,
+    wait: ReadWait,
     max_bytes: usize,
     cursor: Option<&Value>,
 ) -> BridgeResult<Value> {
@@ -1053,29 +1144,30 @@ async fn read_command_state(
                     .unwrap_or(false)
             })
         };
-        if guard.is_busy() && wait_ms > 0 && !has_output(store, &positions) {
-            // Never wait while holding the command lock: the worker needs it to publish
-            // its own state (queued -> running) and to append output.
+        let (deadline, stop_on_output) = match wait {
+            ReadWait::Output(ms) => (Instant::now() + Duration::from_millis(ms.min(30_000)), true),
+            ReadWait::Completion(deadline) => (deadline, false),
+        };
+        if guard.is_busy() {
             let changed = guard.changed.clone();
-            drop(guard);
-            let deadline = Instant::now() + Duration::from_millis(wait_ms.min(30_000));
             loop {
-                let slice = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(250));
-                if slice.is_zero() {
+                // Subscribe while holding the lock, before checking the state, so a
+                // completion or output notification cannot be lost between the check
+                // and the wait. Release the lock before awaiting the worker.
+                let notified = changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !guard.is_busy()
+                    || (stop_on_output && has_output(store, &positions))
+                    || remaining.is_zero()
+                {
                     break;
                 }
-                // Either the notification arrives, or the slice expires and we look again.
-                let _ = tokio::time::timeout(slice, changed.notified()).await;
-                let probe = command.lock().await;
-                let ready = !probe.is_busy() || has_output(store, &positions);
-                drop(probe);
-                if ready {
-                    break;
-                }
+                drop(guard);
+                let _ = tokio::time::timeout(remaining, &mut notified).await;
+                guard = command.lock().await;
             }
-            guard = command.lock().await;
         }
         let mut out = Map::new();
         out.insert("ok".into(), Value::Bool(true));
@@ -1237,7 +1329,10 @@ impl Interactive {
                 } else {
                     CmdState::Unknown
                 };
+                guard.error =
+                    Some("terminal closed by the caller before the command finished".to_string());
                 let result_id = guard.result_id.clone();
+                guard.changed.notify_waiters();
                 drop(guard);
                 let mut values = Map::new();
                 values.insert("ok".into(), Value::Bool(false));
@@ -1308,13 +1403,14 @@ async fn run_terminal_command(
     _session: String,
 ) -> BridgeResult<()> {
     let key = host.connection_key()?;
-    let lease = match runner.recovery.enter(&key, runner.queue_timeout).await {
+    let _lease = match runner.recovery.enter(&key, runner.queue_timeout).await {
         Ok(lease) => lease,
         Err(error) => {
             let mut guard = command.lock().await;
             guard.state = CmdState::NotStarted;
             guard.error = Some(error.message());
             let result_id = guard.result_id.clone();
+            guard.changed.notify_waiters();
             drop(guard);
             let mut values = Map::new();
             values.insert("ok".into(), Value::Bool(false));
@@ -1334,7 +1430,8 @@ async fn run_terminal_command(
             &mut timings,
         )
         .await;
-    drop(lease);
+    // Keep the lease through command completion, even if the reader observes EOF
+    // and releases the shell protection while we are recording an unknown result.
     let slot = match slot {
         Ok(slot) => slot,
         Err(wait) => {
@@ -1363,6 +1460,7 @@ async fn run_terminal_command(
             }
             let result_id = guard.result_id.clone();
             let rejection = guard.rejection.clone();
+            guard.changed.notify_waiters();
             drop(guard);
             let mut values = Map::new();
             values.insert("ok".into(), Value::Bool(false));
@@ -1376,19 +1474,14 @@ async fn run_terminal_command(
             return Ok(());
         }
     };
-    // Taking over the command and writing its first packet happen under the same lock:
-    // either `close` wins (the state is already final and nothing is sent), or this
-    // worker wins (sent=true, and close must report unknown instead of not_started).
+    // Commit to sending under the command lock only after scheduler admission
+    // and checking the shell. The send itself cannot hold the lock across await.
     let plan = CommandPlan::new(&script);
     let (result_id, changed, started) = {
-        // Irreversible decisions under the lock: if we win, the command may be sent and
-        // `close` must never report "not started" from now on.
         let mut guard = command.lock().await;
-        if !try_take_over(&mut guard) {
-            // Closed (or otherwise finished) between admission and this moment.
+        if !try_take_over(&mut guard, shell.is_closing(), &store) {
             return Ok(());
         }
-        guard.sent = true;
         (
             guard.result_id.clone(),
             guard.changed.clone(),
@@ -1467,7 +1560,7 @@ async fn run_terminal_command(
             };
             guard.error = Some(error.message());
             if guard.sent {
-                shell.lost.store(true, Ordering::SeqCst);
+                shell.mark_lost();
                 shell.close().await;
             }
         }
@@ -1570,7 +1663,8 @@ mod tests {
             let store = store.clone();
             let command = command.clone();
             tokio::spawn(async move {
-                read_command_state(&store, "s1", &command, 5_000, 4096, None).await
+                read_command_state(&store, "s1", &command, ReadWait::Output(5_000), 4096, None)
+                    .await
             })
         };
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1597,10 +1691,153 @@ mod tests {
         assert_eq!(page["state"], "completed");
     }
 
+    #[tokio::test]
+    async fn a_long_poll_returns_when_a_prompt_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap());
+        let result_id = store.create(Map::new()).unwrap();
+        let command = Arc::new(AsyncMutex::new(Command::new(result_id.clone())));
+        let producer = {
+            let store = store.clone();
+            let command = command.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                std::fs::write(store.path(&result_id, "stdout").unwrap(), b"Input?").unwrap();
+                command.lock().await.changed.notify_waiters();
+            })
+        };
+        let page = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_command_state(&store, "s1", &command, ReadWait::Output(5_000), 4096, None),
+        )
+        .await
+        .expect("prompt should wake reader promptly")
+        .unwrap();
+        producer.await.unwrap();
+        assert_eq!(page["stdout"], "Input?");
+        assert_eq!(page["state"], "queued");
+    }
+
+    #[tokio::test]
+    async fn setup_waits_past_output_for_a_separate_completion_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap());
+        let result_id = store.create(Map::new()).unwrap();
+        let command = Arc::new(AsyncMutex::new(Command::new(result_id.clone())));
+        let (events, mut input) = mpsc::channel(2);
+        let (observed, initial_output) = tokio::sync::oneshot::channel();
+        let producer = {
+            let store = store.clone();
+            let command = command.clone();
+            tokio::spawn(async move {
+                let output = input.recv().await.unwrap();
+                std::fs::write(store.path(&result_id, "stdout").unwrap(), output).unwrap();
+                command.lock().await.changed.notify_waiters();
+                observed.send(()).unwrap();
+                assert_eq!(input.recv().await, Some(b"<end>".as_slice()));
+                let mut guard = command.lock().await;
+                guard.state = CmdState::Completed;
+                guard.exit_code = Some(0);
+                guard.changed.notify_waiters();
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut setup = Box::pin(read_command_state(
+            &store,
+            "s1",
+            &command,
+            ReadWait::Completion(deadline),
+            4096,
+            None,
+        ));
+        events.send(b"init warning".as_slice()).await.unwrap();
+        tokio::select! {
+            _ = initial_output => {}
+            result = &mut setup => panic!("returned before observing setup output: {result:?}"),
+        }
+        assert!(futures::poll!(setup.as_mut()).is_pending());
+        events.send(b"<end>".as_slice()).await.unwrap();
+        let page = setup.await.unwrap();
+        assert_eq!(page["state"], "completed");
+        assert_eq!(page["exit_code"], 0);
+        assert_eq!(page["stdout"], "init warning");
+        producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_while_queued_is_unsent_in_live_and_durable_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let result_id = store.create(Map::new()).unwrap();
+        let command = Arc::new(AsyncMutex::new(Command::new(result_id.clone())));
+        {
+            let mut guard = command.lock().await;
+            assert!(!try_take_over(&mut guard, true, &store));
+            assert!(!guard.sent);
+        }
+        let live = read_command_state(&store, "s1", &command, ReadWait::Output(0), 4096, None)
+            .await
+            .unwrap();
+        let durable = store.metadata(&result_id).unwrap();
+        assert_eq!(live["state"], "not_started");
+        assert_eq!(durable["execution_state"], live["state"]);
+        assert_eq!(durable["executed"], live["executed"]);
+        assert_eq!(durable["completion_unknown"], live["completion_unknown"]);
+        assert_eq!(live["executed"], false);
+    }
+
+    #[tokio::test]
+    async fn ssh_eof_closes_terminal_output_queues_without_waiting_for_channel_close() {
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let (err_tx, mut err_rx) = mpsc::channel(4);
+        let lost = AtomicBool::new(false);
+        let events = futures::stream::iter([
+            ShellEvent::Data(Bytes::from_static(b"stdout marker")),
+            ShellEvent::ExtData(Bytes::from_static(b"stderr marker")),
+            ShellEvent::Eof,
+        ])
+        .chain(futures::stream::pending());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            demux_terminal_output(events, out_tx, err_tx, || {
+                lost.store(true, Ordering::SeqCst)
+            }),
+        )
+        .await
+        .expect("EOF should terminate terminal capture before channel close");
+        assert!(lost.load(Ordering::SeqCst));
+        assert_eq!(out_rx.recv().await.unwrap(), "stdout marker");
+        assert_eq!(err_rx.recv().await.unwrap(), "stderr marker");
+        assert_eq!(out_rx.recv().await, None);
+        assert_eq!(err_rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_long_poll_times_out_without_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let result_id = store.create(Map::new()).unwrap();
+        let command = Arc::new(AsyncMutex::new(Command::new(result_id)));
+        let started = Instant::now();
+        let page = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_command_state(&store, "s1", &command, ReadWait::Output(50), 4096, None),
+        )
+        .await
+        .expect("bounded wait must return")
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert_eq!(page["state"], "queued");
+    }
+
     /// The close/worker race, stated as a state machine: whoever gets the lock first
     /// decides, and the loser never sends and never overwrites the verdict.
     #[tokio::test]
     async fn closing_before_the_worker_takes_over_sends_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
         let command = Arc::new(AsyncMutex::new(Command::new("r1".to_string())));
 
         // `close` wins: it finalises the queued command as not_started.
@@ -1617,7 +1854,7 @@ mod tests {
         // The worker then reaches its takeover and must refuse.
         {
             let mut guard = command.lock().await;
-            assert!(!try_take_over(&mut guard));
+            assert!(!try_take_over(&mut guard, false, &store));
             assert_eq!(guard.state, CmdState::NotStarted);
             assert!(!guard.sent, "a closed command must never be marked sent");
         }
@@ -1625,10 +1862,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_worker_that_took_over_first_is_reported_as_unknown_when_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
         let command = Arc::new(AsyncMutex::new(Command::new("r2".to_string())));
         {
             let mut guard = command.lock().await;
-            assert!(try_take_over(&mut guard));
+            assert!(try_take_over(&mut guard, false, &store));
             assert_eq!(guard.state, CmdState::Running);
             assert!(guard.sent);
         }
@@ -1646,10 +1885,12 @@ mod tests {
     /// with `builtin eval`, so a partial write can still run the script.
     #[tokio::test]
     async fn a_failed_send_after_takeover_stays_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
         let command = Arc::new(AsyncMutex::new(Command::new("r3".to_string())));
         {
             let mut guard = command.lock().await;
-            assert!(try_take_over(&mut guard));
+            assert!(try_take_over(&mut guard, false, &store));
             guard.sent = true;
         }
         // The worker's failure path.
