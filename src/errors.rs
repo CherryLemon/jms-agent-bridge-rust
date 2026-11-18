@@ -19,6 +19,9 @@ pub enum BridgeError {
     Storage(String),
     #[error("{0}")]
     Ssh(String),
+    /// A newly opened, accepted shell silently closed before the ready handshake.
+    #[error("remote shell closed during startup; script was not sent. SSH authentication alone does not confirm remote execution is available; check the gateway execution policy and target connection")]
+    ShellStartupClosed,
 }
 
 impl BridgeError {

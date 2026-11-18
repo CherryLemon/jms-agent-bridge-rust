@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
 
 use crate::errors::{BridgeError, BridgeResult};
-use crate::execution::{ExecOutcome, ExecSpec, Runner};
+use crate::execution::{startup_failed, ExecOutcome, ExecSpec, Runner};
 use crate::fsprobe::{decode, remote_script, FsOptions, DEFAULT_BYTES, WIRE_LIMIT};
 use crate::inventory::Host;
 use crate::rest::AssetCatalog;
@@ -225,6 +225,46 @@ pub struct FilesystemWorkers {
     closing: std::sync::atomic::AtomicBool,
 }
 
+/// Retry a private worker once, then allow one target-level reset, only while
+/// every failed attempt has positive evidence that the payload was never sent.
+async fn run_with_startup_recovery<E, EF, R, RF>(
+    mut execute: E,
+    recover: R,
+) -> BridgeResult<(Map<String, Value>, Map<String, Value>)>
+where
+    E: FnMut() -> EF,
+    EF: std::future::Future<Output = BridgeResult<Map<String, Value>>>,
+    R: FnOnce(Map<String, Value>) -> RF,
+    RF: std::future::Future<Output = BridgeResult<Value>>,
+{
+    let first = execute().await?;
+    let mut annotations = Map::new();
+    if !startup_failed(&first) {
+        return Ok((first, annotations));
+    }
+
+    let mut result = execute().await?;
+    if let Some(id) = first.get("result_id") {
+        annotations.insert("startup_retry_result_id".into(), id.clone());
+    }
+    if startup_failed(&result) {
+        let mut recovery = recover(result.clone()).await?;
+        if let Some(map) = recovery.as_object_mut() {
+            if let Some(id) = result.get("result_id") {
+                map.insert("previous_result_id".into(), id.clone());
+            }
+        }
+        if matches!(
+            recovery.get("status").and_then(Value::as_str),
+            Some("reset" | "already_replaced")
+        ) {
+            result = execute().await?;
+        }
+        annotations.insert("connection_recovery".into(), recovery);
+    }
+    Ok((result, annotations))
+}
+
 impl FilesystemWorkers {
     pub fn new(
         runner: Arc<Runner>,
@@ -311,17 +351,37 @@ impl FilesystemWorkers {
         container: Option<&str>,
         progress: Option<&dyn crate::storage::journal::ProgressSink>,
     ) -> BridgeResult<Map<String, Value>> {
-        let first = self
-            .execute_once(host, script, timeout, container, progress)
-            .await?;
-        if !startup_failed(&first) {
-            return Ok(first);
+        let mut attempt_count = 0;
+        let (mut result, annotations) = run_with_startup_recovery(
+            || {
+                attempt_count += 1;
+                self.execute_once(host, script, timeout, container, progress)
+            },
+            // execute_once has already retired the broken shell and released its lease.
+            |meta| async move {
+                self.runner
+                    .recover_startup_connection(host, &meta, self.runner.queue_timeout)
+                    .await
+            },
+        )
+        .await?;
+        if attempt_count > 1 {
+            *self.startup_retries.lock().await += 1;
         }
-        *self.startup_retries.lock().await += 1;
-        let second = self
-            .execute_once(host, script, timeout, container, progress)
-            .await?;
-        Ok(second)
+        if annotations.is_empty() {
+            return Ok(result);
+        }
+        if let Some(result_id) = result.get("result_id").and_then(Value::as_str) {
+            // Do not turn a finished probe into a pre-send error if annotation fails.
+            match self.runner.store.annotate(result_id, annotations.clone()) {
+                Ok(updated) => return Ok(updated),
+                Err(error) => {
+                    tracing::warn!(result_id, error = %error, "could not persist Fs recovery metadata")
+                }
+            }
+        }
+        result.extend(annotations);
+        Ok(result)
     }
 
     async fn execute_once(
@@ -467,14 +527,6 @@ impl FilesystemWorkers {
     }
 }
 
-pub fn startup_failed(meta: &Map<String, Value>) -> bool {
-    meta.get("failure_stage").and_then(Value::as_str) == Some("shell_startup")
-        && meta.get("execution_state").and_then(Value::as_str) == Some("not_started")
-        && meta.get("completion_unknown") != Some(&Value::Bool(true))
-        && meta.get("timed_out") != Some(&Value::Bool(true))
-        && meta.get("exit_code").and_then(Value::as_i64) == Some(75)
-}
-
 pub struct Filesystem {
     catalog: Arc<AssetCatalog>,
     runner: Arc<Runner>,
@@ -505,30 +557,36 @@ impl Filesystem {
             .map(|meta| meta.len())
     }
 
-    /// Size of one remote file, or `None` when it cannot be determined cheaply.
-    async fn remote_size(
+    /// Establish the SSH transport before spawning either side of rsync. A download
+    /// also obtains its progress size hint without an extra channel. A subsequent
+    /// transfer failure is never replayed automatically, even if it occurs at setup.
+    async fn transfer_preflight(
         &self,
         host: &Host,
-        remote: &str,
+        remote: Option<&str>,
         container: Option<&str>,
+        timeout: f64,
         progress: Option<&dyn crate::storage::journal::ProgressSink>,
-    ) -> Option<u64> {
-        // Only a regular file has a meaningful transfer size. A directory's own size is
-        // its inode size, not the sum of what will be transferred, and using it would
-        // report 100% immediately.
-        let script = format!(
-            "if [ -f {path} ]; then stat -c %s -- {path} 2>/dev/null; fi; true",
-            path = crate::fsprobe::shlex_quote(remote)
-        );
+    ) -> BridgeResult<(Map<String, Value>, Option<u64>)> {
+        let script = remote
+            .map(|path| {
+                format!(
+                    "if [ -f {path} ]; then stat -c %s -- {path} 2>/dev/null; fi; true",
+                    path = crate::fsprobe::shlex_quote(path)
+                )
+            })
+            .unwrap_or_else(|| "true".into());
         let meta = self
             .workers
-            .execute(host, &script, 15.0, container, progress)
-            .await
-            .ok()?;
-        let result_id = meta.get("result_id")?.as_str()?.to_string();
-        let path = self.store.path(&result_id, "stdout").ok()?;
-        let text = std::fs::read_to_string(path).ok()?;
-        text.trim().parse::<u64>().ok().filter(|size| *size > 0)
+            .execute(host, &script, timeout.min(15.0), container, progress)
+            .await?;
+        let size = remote.and_then(|_| {
+            let result_id = meta.get("result_id")?.as_str()?;
+            let path = self.store.path(result_id, "stdout").ok()?;
+            let text = std::fs::read_to_string(path).ok()?;
+            text.trim().parse::<u64>().ok().filter(|size| *size > 0)
+        });
+        Ok((meta, size))
     }
 
     pub async fn execute(
@@ -565,14 +623,61 @@ impl Filesystem {
             let local = options.local_path.clone().unwrap_or_default();
             let remote = options.path.clone();
             let timeout = options.timeout.unwrap_or(900) as f64;
-            // A known size makes progress and ETA available from the first byte: the
-            // local file for an upload, one `stat` for a download.
+            let started = Instant::now();
+            let (preflight, remote_size) = self
+                .transfer_preflight(
+                    &host,
+                    (action == "download").then_some(remote.as_str()),
+                    options.container.as_deref(),
+                    timeout,
+                    progress,
+                )
+                .await?;
+            if preflight.get("ok") != Some(&Value::Bool(true)) {
+                let mut row = Map::new();
+                for key in [
+                    "host",
+                    "result_id",
+                    "exit_code",
+                    "timing",
+                    "warning",
+                    "failure_stage",
+                    "startup_retry_result_id",
+                    "connection_recovery",
+                ] {
+                    if let Some(value) = preflight.get(key) {
+                        row.insert(key.into(), value.clone());
+                    }
+                }
+                if let Some(id) = preflight.get("result_id").and_then(Value::as_str) {
+                    row.insert("preflight_result_id".into(), json!(id));
+                    if let Ok(preview) = self.store.preview(id, 2048) {
+                        row.extend(preview);
+                    }
+                }
+                if let Some(state) = preflight.get("execution_state") {
+                    row.insert("preflight_execution_state".into(), state.clone());
+                }
+                row.extend(queue_rejection(&preflight));
+                row.insert("ok".into(), json!(false));
+                row.insert("action".into(), json!(action));
+                row.insert("path".into(), json!(remote));
+                row.insert("execution_state".into(), json!("not_started"));
+                // No transfer was launched, even if the read-only probe was inconclusive.
+                row.insert("completion_unknown".into(), json!(false));
+                return Ok(Value::Object(row));
+            }
             let expected_total = if action == "upload" {
                 Self::upload_size_hint(&local)
             } else {
-                self.remote_size(&host, &remote, options.container.as_deref(), progress)
-                    .await
+                remote_size
             };
+            let timeout = timeout - started.elapsed().as_secs_f64();
+            if timeout <= 0.0 {
+                return Err(BridgeError::config(
+                    "Fs preflight exhausted the transfer timeout; transfer not started",
+                ));
+            }
             let outcome = self
                 .runner
                 .rsync(
@@ -623,6 +728,14 @@ impl Filesystem {
             }
             for (key, value) in queue_rejection(&meta) {
                 row.insert(key, value);
+            }
+            for key in ["startup_retry_result_id", "connection_recovery"] {
+                if let Some(value) = preflight.get(key) {
+                    row.insert(key.into(), value.clone());
+                }
+            }
+            if let Some(id) = preflight.get("result_id") {
+                row.insert("preflight_result_id".into(), id.clone());
             }
             row.insert("action".into(), Value::from(action));
             row.insert("local_path".into(), Value::from(local));
@@ -870,10 +983,96 @@ mod tests {
         .is_err());
     }
 
+    fn maps(rows: Vec<Value>) -> std::collections::VecDeque<Map<String, Value>> {
+        rows.into_iter()
+            .map(|row| row.as_object().unwrap().clone())
+            .collect()
+    }
+
+    fn closed(id: &str) -> Value {
+        json!({
+            "result_id": id, "failure_stage": "shell_startup", "exit_code": 75,
+            "startup_transport_closed": true, "execution_state": "not_started",
+            "executed": false, "completion_unknown": false, "timed_out": false,
+        })
+    }
+
+    #[tokio::test]
+    async fn stale_worker_resets_once_and_keeps_attempt_receipts() {
+        let mut attempts = maps(vec![
+            closed("first"),
+            closed("second"),
+            json!({"result_id":"third", "ok": true}),
+        ]);
+        let (meta, recovery) = run_with_startup_recovery(
+            || std::future::ready(Ok(attempts.pop_front().expect("one allowed replay"))),
+            |before| async move {
+                assert_eq!(before["result_id"], "second");
+                Ok(json!({"status":"reset", "generation": 8}))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(attempts.is_empty());
+        assert_eq!(meta["result_id"], "third");
+        assert_eq!(recovery["startup_retry_result_id"], "first");
+        assert_eq!(
+            recovery["connection_recovery"]["previous_result_id"],
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_connection_is_not_replayed() {
+        let mut attempts = maps(vec![closed("first"), closed("second")]);
+        let (meta, recovery) = run_with_startup_recovery(
+            || {
+                std::future::ready(Ok(attempts
+                    .pop_front()
+                    .expect("no replay under protection")))
+            },
+            |_| async { Ok(json!({"status":"pending_sessions"})) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta["result_id"], "second");
+        assert_eq!(
+            recovery["connection_recovery"]["status"],
+            "pending_sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn never_retries_possibly_sent_or_explicitly_rejected_work() {
+        for (key, value) in [
+            ("execution_state", json!("unknown")),
+            ("completion_unknown", json!(true)),
+            ("executed", json!(true)),
+            ("timed_out", json!(true)),
+            ("startup_transport_closed", json!(false)), // explicit startup rejection or exit
+            ("failure_stage", json!("connection")),     // auth / host key failure
+            ("failure_stage", json!("validation")),     // policy denial
+        ] {
+            let mut row = closed("original");
+            row[key] = value;
+            let mut attempts = maps(vec![row]);
+            let (meta, annotations) = run_with_startup_recovery(
+                || std::future::ready(Ok(attempts.pop_front().expect("work must not replay"))),
+                |_| async { panic!("target must not be reset for this result") },
+            )
+            .await
+            .unwrap();
+            assert_eq!(meta["result_id"], "original");
+            assert!(annotations.is_empty());
+        }
+    }
+
     #[test]
     fn startup_failure_predicate_matches_the_transmission_boundary() {
         let mut meta = Map::new();
         meta.insert("failure_stage".into(), json!("shell_startup"));
+        meta.insert("startup_transport_closed".into(), json!(true));
+        meta.insert("executed".into(), json!(false));
         meta.insert("execution_state".into(), json!("not_started"));
         meta.insert("completion_unknown".into(), json!(false));
         meta.insert("timed_out".into(), json!(false));

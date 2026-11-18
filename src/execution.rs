@@ -189,6 +189,17 @@ struct Attempt {
 }
 
 impl Attempt {
+    fn shell_startup(error: BridgeError) -> Self {
+        let closed = matches!(&error, BridgeError::ShellStartupClosed);
+        let mut attempt = Self::not_started(Some(error.message()), "shell_startup");
+        if closed {
+            attempt
+                .rejection
+                .insert("startup_transport_closed".into(), json!(true));
+        }
+        attempt
+    }
+
     fn not_started(warning: Option<String>, stage: &'static str) -> Self {
         Self {
             code: 75,
@@ -598,38 +609,9 @@ impl Runner {
             annotations.insert("startup_retry_result_id".into(), Value::from(first.clone()));
         }
         if startup_failed(&meta) {
-            let generation = meta
-                .get("connection_generation")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let key = host.connection_key()?;
-            let pool = self.pool.clone();
-            let host_for_replace = host.clone();
-            // A connection that still carries named shells or interactive terminals must
-            // not be replaced underneath them: those sessions would be lost silently.
-            let shells = self.shells.clone();
-            let terminals = self.terminal_protections.clone();
-            let protect_key = key.clone();
-            let protected = std::sync::Arc::new(move || {
-                connection_protected(&shells, &terminals, &protect_key)
-            });
             let recovery = self
-                .recovery
-                .clone()
-                .request(
-                    &key,
-                    generation,
-                    Box::new(move || {
-                        Box::pin(async move {
-                            pool.replace(&host_for_replace).await?;
-                            Ok(())
-                        })
-                    }),
-                    protected,
-                    false,
-                    queue_timeout,
-                )
-                .await;
+                .recover_startup_connection(host, &meta, queue_timeout)
+                .await?;
             let status = recovery.get("status").and_then(Value::as_str).unwrap_or("");
             if matches!(status, "reset" | "already_replaced") {
                 let previous = meta.get("result_id").cloned().unwrap_or(Value::Null);
@@ -667,6 +649,43 @@ impl Runner {
             }
         }
         Ok(meta)
+    }
+
+    /// All callers must first prove the payload was never sent. The same recovery
+    /// coordinator protects active leases and user-bound shells for run and Fs.
+    pub(crate) async fn recover_startup_connection(
+        &self,
+        host: &Host,
+        meta: &Map<String, Value>,
+        queue_timeout: f64,
+    ) -> BridgeResult<Value> {
+        let Some(generation) = meta.get("connection_generation").and_then(Value::as_u64) else {
+            return Ok(json!({"status": "unavailable", "reason": "no_connection_generation"}));
+        };
+        let key = host.connection_key()?;
+        let pool = self.pool.clone();
+        let host_for_replace = host.clone();
+        let shells = self.shells.clone();
+        let terminals = self.terminal_protections.clone();
+        let protect_key = key.clone();
+        let protected = Arc::new(move || connection_protected(&shells, &terminals, &protect_key));
+        Ok(self
+            .recovery
+            .clone()
+            .request(
+                &key,
+                generation,
+                Box::new(move || {
+                    Box::pin(async move {
+                        pool.replace(&host_for_replace).await?;
+                        Ok(())
+                    })
+                }),
+                protected,
+                false,
+                queue_timeout,
+            )
+            .await)
     }
 
     async fn attempt_to_store(
@@ -1109,7 +1128,7 @@ impl Runner {
             session.lost = true;
             session.close().await;
             timings.channel_seconds += channel_started.elapsed().as_secs_f64();
-            return Attempt::not_started(Some(error.message()), "shell_startup");
+            return Attempt::shell_startup(error);
         }
         timings.channel_seconds += channel_started.elapsed().as_secs_f64();
         let nonce = new_nonce();
@@ -1365,7 +1384,7 @@ close it or use a new session_id"
                     shells.remove(&session_key);
                 }
                 timings.channel_seconds += prime_started.elapsed().as_secs_f64();
-                return Attempt::not_started(Some(error.message()), "shell_startup");
+                return Attempt::shell_startup(error);
             }
             timings.channel_seconds += prime_started.elapsed().as_secs_f64();
         }
@@ -1611,14 +1630,23 @@ closed and must not be reused. Inspect before rerunning."
                 }
             }
             Err(error) => {
-                // A local capability failure happened before any byte was sent.
+                // Setup errors usually happen before transfer, but an I/O wait
+                // can also fail after protocol traffic began. Never claim that such
+                // a transfer did not run or invite automatic replay.
+                let sent = sent_flag.load(Ordering::SeqCst);
                 values.insert("ok".into(), Value::Bool(false));
                 values.insert("exit_code".into(), json!(1));
-                values.insert("executed".into(), Value::Bool(false));
+                values.insert("executed".into(), Value::Bool(sent));
                 values.insert("timed_out".into(), Value::Bool(false));
-                values.insert("completion_unknown".into(), Value::Bool(false));
-                values.insert("execution_state".into(), Value::from("not_started"));
-                values.insert("failure_stage".into(), Value::from("transfer_setup"));
+                values.insert("completion_unknown".into(), Value::Bool(sent));
+                values.insert(
+                    "execution_state".into(),
+                    json!(if sent { "unknown" } else { "not_started" }),
+                );
+                values.insert(
+                    "failure_stage".into(),
+                    json!(if sent { "transfer" } else { "transfer_setup" }),
+                );
                 values.insert("warning".into(), Value::from(error.message()));
             }
         }
@@ -1805,9 +1833,14 @@ fn valid_env_name(name: &str) -> bool {
 
 pub fn startup_failed(meta: &Map<String, Value>) -> bool {
     meta.get("failure_stage").and_then(Value::as_str) == Some("shell_startup")
+        && meta
+            .get("startup_transport_closed")
+            .and_then(Value::as_bool)
+            == Some(true)
         && meta.get("execution_state").and_then(Value::as_str) == Some("not_started")
-        && meta.get("completion_unknown") != Some(&Value::Bool(true))
-        && meta.get("timed_out") != Some(&Value::Bool(true))
+        && meta.get("executed").and_then(Value::as_bool) == Some(false)
+        && meta.get("completion_unknown").and_then(Value::as_bool) == Some(false)
+        && meta.get("timed_out").and_then(Value::as_bool) == Some(false)
         && meta.get("exit_code").and_then(Value::as_i64) == Some(75)
 }
 
@@ -2074,6 +2107,8 @@ mod tests {
     fn startup_failure_requires_the_full_evidence_set() {
         let mut meta = Map::new();
         meta.insert("failure_stage".into(), json!("shell_startup"));
+        meta.insert("startup_transport_closed".into(), json!(true));
+        meta.insert("executed".into(), json!(false));
         meta.insert("execution_state".into(), json!("not_started"));
         meta.insert("completion_unknown".into(), json!(false));
         meta.insert("timed_out".into(), json!(false));

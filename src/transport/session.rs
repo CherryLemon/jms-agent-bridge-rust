@@ -167,11 +167,20 @@ impl ShellSession {
                         trim_head(&mut self.err, marker.len());
                     }
                 }
-                _ => return Err(BridgeError::ssh(
-                    "remote shell closed during startup; script was not sent. SSH authentication \
-alone does not confirm remote execution is available; check the gateway execution policy and \
-target connection",
-                )),
+                // EOF can precede the exit status. Wait for actual closure so an
+                // explicit denial or failed startup is never mistaken for stale transport.
+                Some(ShellEvent::Eof) => continue,
+                None if self.reader.exit_code().is_none()
+                    && self.startup_out.is_empty()
+                    && self.startup_err.is_empty() =>
+                {
+                    return Err(BridgeError::ShellStartupClosed);
+                }
+                _ => {
+                    return Err(BridgeError::ssh(
+                        "remote shell closed during startup; script was not sent",
+                    ));
+                }
             }
         }
         self.ready = true;
