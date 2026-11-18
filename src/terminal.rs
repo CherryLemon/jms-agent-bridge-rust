@@ -57,7 +57,7 @@ pub struct Command {
     pub result_id: String,
     state: CmdState,
     sent: bool,
-    started: bool,
+    started: Arc<AtomicBool>,
     exit_code: Option<i32>,
     error: Option<String>,
     rejection: Map<String, Value>,
@@ -75,7 +75,7 @@ impl Command {
             result_id,
             state: CmdState::Queued,
             sent: false,
-            started: false,
+            started: Arc::new(AtomicBool::new(false)),
             exit_code: None,
             error: None,
             rejection: Map::new(),
@@ -83,6 +83,46 @@ impl Command {
             changed: Arc::new(Notify::new()),
             task: None,
         }
+    }
+
+    /// The same verdict is used for the live command and its retained result.
+    fn evidence(&self) -> Map<String, Value> {
+        let mut values = self.rejection.clone();
+        let completed = self.state == CmdState::Completed;
+        values.insert("ok".into(), json!(completed && self.exit_code == Some(0)));
+        values.insert("execution_state".into(), json!(self.state.as_str()));
+        values.insert(
+            "completion_unknown".into(),
+            json!(self.state == CmdState::Unknown),
+        );
+        values.insert(
+            "executed".into(),
+            if completed || self.started.load(Ordering::SeqCst) {
+                Value::Bool(true)
+            } else if self.sent {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            },
+        );
+        if completed {
+            values.insert("exit_code".into(), json!(self.exit_code.unwrap_or(255)));
+        }
+        if let Some(error) = &self.error {
+            values.insert("error".into(), json!(error));
+        }
+        values
+    }
+
+    /// Called under the command lock, before a new command can replace this one.
+    fn persist_verdict(&self, store: &ResultStore, timings: Option<&Timings>) -> BridgeResult<()> {
+        let mut values = self.evidence();
+        if let Some(timings) = timings {
+            values.insert("timing".into(), timings.snapshot());
+        }
+        let stored = store.finish(&self.result_id, values).map(|_| ());
+        self.changed.notify_waiters();
+        stored
     }
 
     /// A command occupies the terminal from the moment it is admitted.
@@ -504,17 +544,7 @@ fn try_take_over(guard: &mut Command, shell_lost: bool, store: &ResultStore) -> 
         let error = "terminal shell was lost before sending";
         guard.state = CmdState::NotStarted;
         guard.error = Some(error.into());
-        let _ = store.finish(
-            &guard.result_id,
-            json!({
-                "ok": false, "executed": false, "execution_state": "not_started",
-                "completion_unknown": false, "error": error,
-            })
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
-        );
-        guard.changed.notify_waiters();
+        let _ = guard.persist_verdict(store, None);
         return false;
     }
     guard.state = CmdState::Running;
@@ -526,12 +556,10 @@ fn try_take_over(guard: &mut Command, shell_lost: bool, store: &ResultStore) -> 
 ///
 /// `None` means "leave the stored result alone": a command that already reached a
 /// terminal state keeps it.
-fn close_final_state(state: CmdState) -> Option<(&'static str, bool, bool, &'static str)> {
+fn close_final_state(state: CmdState) -> Option<(CmdState, &'static str)> {
     match state {
-        // Never transmitted: nothing ran, and saying so is exact.
-        CmdState::Queued => Some(("not_started", false, false, "not_started")),
-        // Aborted in flight: the bytes may have reached the remote side.
-        CmdState::Running => Some(("unknown", true, true, "closed_by_caller")),
+        CmdState::Queued => Some((CmdState::NotStarted, "not_started")),
+        CmdState::Running => Some((CmdState::Unknown, "closed_by_caller")),
         CmdState::NotStarted | CmdState::Completed | CmdState::Unknown => None,
     }
 }
@@ -1203,33 +1231,8 @@ async fn read_command_state(
         if cursor.is_none() {
             guard.cursor = positions;
         }
-        if guard.state == CmdState::Completed {
-            let exit_code = guard.exit_code.unwrap_or(255);
-            out.insert("ok".into(), Value::Bool(exit_code == 0));
-            out.insert("exit_code".into(), json!(exit_code));
-        } else if matches!(guard.state, CmdState::Unknown | CmdState::NotStarted) {
-            out.insert("ok".into(), Value::Bool(false));
-            out.insert(
-                "executed".into(),
-                if guard.started {
-                    Value::Bool(true)
-                } else if guard.sent {
-                    Value::Null
-                } else {
-                    Value::Bool(false)
-                },
-            );
-            out.insert(
-                "completion_unknown".into(),
-                Value::Bool(guard.state == CmdState::Unknown),
-            );
-            out.insert(
-                "error".into(),
-                guard.error.clone().map(Value::from).unwrap_or(Value::Null),
-            );
-            for (key, value) in &guard.rejection {
-                out.insert(key.clone(), value.clone());
-            }
+        if !guard.is_busy() {
+            out.extend(guard.evidence());
         }
         Ok(Value::Object(out))
     }
@@ -1313,7 +1316,16 @@ fn read_saved_terminal_result(
         "completion_unknown": state == "unknown",
     });
     let out = result.as_object_mut().expect("object");
-    for key in ["exit_code", "executed", "error", "failure_stage"] {
+    for key in [
+        "exit_code",
+        "executed",
+        "error",
+        "failure_stage",
+        "reason",
+        "retryable",
+        "queue",
+        "queue_timed_out",
+    ] {
         if let Some(value) = meta.get(key) {
             out.insert(key.to_string(), value.clone());
         }
@@ -1405,28 +1417,14 @@ impl Interactive {
             // running one has no completion evidence, and a finished one keeps its
             // verdict. Without this the saved result would stay `running` forever.
             let final_state = close_final_state(guard.state);
-            if let Some((state, executed, unknown, failure_stage)) = final_state {
-                guard.state = if state == "not_started" {
-                    CmdState::NotStarted
-                } else {
-                    CmdState::Unknown
-                };
+            if let Some((state, failure_stage)) = final_state {
+                guard.state = state;
                 guard.error =
-                    Some("terminal closed by the caller before the command finished".to_string());
-                let result_id = guard.result_id.clone();
-                guard.changed.notify_waiters();
-                drop(guard);
-                let mut values = Map::new();
-                values.insert("ok".into(), Value::Bool(false));
-                values.insert("executed".into(), Value::Bool(executed));
-                values.insert("execution_state".into(), Value::from(state));
-                values.insert("completion_unknown".into(), Value::Bool(unknown));
-                values.insert("failure_stage".into(), Value::from(failure_stage));
-                values.insert(
-                    "error".into(),
-                    Value::from("terminal closed by the caller before the command finished"),
-                );
-                self.store.finish(&result_id, values)?;
+                    Some("terminal closed by the caller before the command finished".into());
+                guard
+                    .rejection
+                    .insert("failure_stage".into(), json!(failure_stage));
+                guard.persist_verdict(&self.store, None)?;
             }
         }
         shell.close().await;
@@ -1489,17 +1487,11 @@ async fn run_terminal_command(
         Ok(lease) => lease,
         Err(error) => {
             let mut guard = command.lock().await;
-            guard.state = CmdState::NotStarted;
-            guard.error = Some(error.message());
-            let result_id = guard.result_id.clone();
-            guard.changed.notify_waiters();
-            drop(guard);
-            let mut values = Map::new();
-            values.insert("ok".into(), Value::Bool(false));
-            values.insert("executed".into(), Value::Bool(false));
-            values.insert("execution_state".into(), Value::from("not_started"));
-            values.insert("completion_unknown".into(), Value::Bool(false));
-            let _ = store.finish(&result_id, values);
+            if guard.state == CmdState::Queued {
+                guard.state = CmdState::NotStarted;
+                guard.error = Some(error.message());
+                guard.persist_verdict(&store, None)?;
+            }
             return Ok(());
         }
     };
@@ -1518,41 +1510,7 @@ async fn run_terminal_command(
         Ok(slot) => slot,
         Err(wait) => {
             let mut guard = command.lock().await;
-            guard.state = CmdState::NotStarted;
-            match wait {
-                SlotWait::Full(full) => {
-                    guard.error = Some(full.message());
-                    guard.rejection = full.response();
-                    guard
-                        .rejection
-                        .insert("failure_stage".into(), Value::from(QueueFail::QUEUE));
-                    guard
-                        .rejection
-                        .insert("queue_timed_out".into(), Value::Bool(false));
-                }
-                SlotWait::Timeout(timeout) => {
-                    guard.error = Some(timeout.message());
-                    guard
-                        .rejection
-                        .insert("failure_stage".into(), Value::from(timeout.stage));
-                    guard
-                        .rejection
-                        .insert("queue_timed_out".into(), Value::Bool(true));
-                }
-            }
-            let result_id = guard.result_id.clone();
-            let rejection = guard.rejection.clone();
-            guard.changed.notify_waiters();
-            drop(guard);
-            let mut values = Map::new();
-            values.insert("ok".into(), Value::Bool(false));
-            values.insert("executed".into(), Value::Bool(false));
-            values.insert("execution_state".into(), Value::from("not_started"));
-            values.insert("completion_unknown".into(), Value::Bool(false));
-            for (key, value) in rejection {
-                values.insert(key, value);
-            }
-            let _ = store.finish(&result_id, values);
+            persist_queue_rejection(&mut guard, &store, wait, &timings)?;
             return Ok(());
         }
     };
@@ -1567,52 +1525,24 @@ async fn run_terminal_command(
         (
             guard.result_id.clone(),
             guard.changed.clone(),
-            Arc::new(AtomicBool::new(false)),
+            guard.started.clone(),
         )
     };
     // The write itself happens outside the lock: a channel that stops consuming must not
     // keep `close` from taking the lock and aborting this task.
-    let sent = match tokio::time::timeout(Duration::from_secs(120), shell.send_packet(&plan.packet))
-        .await
-    {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            // Part of the packet may already have reached the shell, and the packet
-            // starts with `builtin eval`, so a write error is not proof of "not run".
-            let mut guard = command.lock().await;
-            if guard.state == CmdState::Running {
-                guard.state = CmdState::Unknown;
-                guard.error = Some(format!(
-                    "the command could not be written completely: {}",
-                    error.message()
-                ));
-            }
-            false
-        }
-        Err(_) => {
-            let mut guard = command.lock().await;
-            if guard.state == CmdState::Running {
-                guard.state = CmdState::Unknown;
-                guard.error = Some("writing the command to the terminal timed out".to_string());
-            }
-            false
-        }
-    };
-    if !sent {
-        let mut values = Map::new();
-        values.insert("ok".into(), Value::Bool(false));
-        values.insert("executed".into(), Value::Bool(true));
-        values.insert("execution_state".into(), Value::from("unknown"));
-        values.insert("completion_unknown".into(), Value::Bool(true));
-        values.insert("failure_stage".into(), Value::from("channel"));
-        values.insert(
-            "error".into(),
-            Value::from(
-                "the command may have reached the terminal only partially; check the session before retrying",
-            ),
-        );
-        let _ = store.finish(&result_id, values);
-        changed.notify_waiters();
+    let send_error =
+        match tokio::time::timeout(Duration::from_secs(120), shell.send_packet(&plan.packet)).await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!(
+                "the command could not be written completely: {}",
+                error.message()
+            )),
+            Err(_) => Some("writing the command to the terminal timed out".to_string()),
+        };
+    if let Some(error) = send_error {
+        let mut guard = command.lock().await;
+        persist_incomplete_send(&mut guard, &store, error, Some(&timings))?;
         return Ok(());
     }
     let out_path = store.path(&result_id, "stdout")?;
@@ -1628,7 +1558,10 @@ async fn run_terminal_command(
         )
         .await;
     let mut guard = command.lock().await;
-    guard.started = started.load(Ordering::SeqCst);
+    // A caller close that published first owns the verdict.
+    if guard.state != CmdState::Running {
+        return Ok(());
+    }
     match outcome {
         Ok(code) => {
             guard.state = CmdState::Completed;
@@ -1647,48 +1580,62 @@ async fn run_terminal_command(
             }
         }
     }
-    let mut values = Map::new();
-    values.insert(
-        "ok".into(),
-        Value::Bool(guard.state == CmdState::Completed && guard.exit_code == Some(0)),
-    );
-    values.insert(
-        "exit_code".into(),
-        guard.exit_code.map_or(Value::Null, |code| json!(code)),
-    );
-    values.insert(
-        "executed".into(),
-        if guard.started {
-            Value::Bool(true)
-        } else if guard.sent {
-            Value::Null
-        } else {
-            Value::Bool(false)
-        },
-    );
-    values.insert("execution_state".into(), Value::from(guard.state.as_str()));
-    values.insert(
-        "completion_unknown".into(),
-        Value::Bool(guard.state == CmdState::Unknown),
-    );
-    if let Some(error) = &guard.error {
-        values.insert("error".into(), Value::from(error.clone()));
-    }
-    values.insert("timing".into(), timings.snapshot());
-    for (key, value) in guard.rejection.clone() {
-        values.insert(key, value);
-    }
-    // Publish historical evidence before another command can replace this one.
-    let _ = store.finish(&guard.result_id, values);
-    guard.changed.notify_waiters();
+    guard.persist_verdict(&store, Some(&timings))?;
     drop(guard);
     drop(slot);
     Ok(())
 }
 
-struct QueueFail;
-impl QueueFail {
-    const QUEUE: &'static str = "execution_queue";
+fn persist_queue_rejection(
+    guard: &mut Command,
+    store: &ResultStore,
+    wait: SlotWait,
+    timings: &Timings,
+) -> BridgeResult<()> {
+    if guard.state != CmdState::Queued {
+        return Ok(());
+    }
+    guard.state = CmdState::NotStarted;
+    match wait {
+        SlotWait::Full(full) => {
+            guard.error = Some(full.message());
+            guard.rejection = full.response();
+            guard
+                .rejection
+                .insert("failure_stage".into(), json!("execution_queue"));
+            guard
+                .rejection
+                .insert("queue_timed_out".into(), json!(false));
+        }
+        SlotWait::Timeout(timeout) => {
+            guard.error = Some(timeout.message());
+            guard
+                .rejection
+                .insert("failure_stage".into(), json!(timeout.stage));
+            guard
+                .rejection
+                .insert("queue_timed_out".into(), json!(true));
+        }
+    }
+    guard.persist_verdict(store, Some(timings))
+}
+
+/// A partial write is not a START marker, and never overrides a caller close.
+fn persist_incomplete_send(
+    guard: &mut Command,
+    store: &ResultStore,
+    error: String,
+    timings: Option<&Timings>,
+) -> BridgeResult<()> {
+    if guard.state == CmdState::Running {
+        guard.state = CmdState::Unknown;
+        guard.error = Some(error);
+        guard
+            .rejection
+            .insert("failure_stage".into(), json!("channel"));
+        guard.persist_verdict(store, timings)?;
+    }
+    Ok(())
 }
 
 /// Evidence copied from a finished terminal command into fan-out style rows.
@@ -2014,13 +1961,11 @@ mod tests {
         // `close` wins: it finalises the queued command as not_started.
         {
             let mut guard = command.lock().await;
-            let (state, executed, unknown, stage) =
+            let (state, stage) =
                 close_final_state(guard.state).expect("queued command is finalised");
-            guard.state = CmdState::NotStarted;
-            assert_eq!(
-                (state, executed, unknown, stage),
-                ("not_started", false, false, "not_started")
-            );
+            guard.state = state;
+            assert_eq!(stage, "not_started");
+            assert_eq!(guard.evidence()["executed"], false);
         }
         // The worker then reaches its takeover and must refuse.
         {
@@ -2043,38 +1988,104 @@ mod tests {
             assert!(guard.sent);
         }
         let mut guard = command.lock().await;
-        let (state, executed, unknown, stage) =
-            close_final_state(guard.state).expect("running command is finalised");
-        guard.state = CmdState::Unknown;
-        assert_eq!(
-            (state, executed, unknown, stage),
-            ("unknown", true, true, "closed_by_caller")
-        );
+        let (state, stage) = close_final_state(guard.state).expect("running command is finalised");
+        guard.state = state;
+        assert_eq!(stage, "closed_by_caller");
+        assert_eq!(guard.evidence()["executed"], Value::Null);
+        assert_eq!(guard.evidence()["completion_unknown"], true);
+        guard.started.store(true, Ordering::SeqCst);
+        assert_eq!(guard.evidence()["executed"], true);
     }
 
-    /// A write that fails midway is not proof that nothing was sent: the packet starts
-    /// with `builtin eval`, so a partial write can still run the script.
     #[tokio::test]
-    async fn a_failed_send_after_takeover_stays_unknown() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
-        let command = Arc::new(AsyncMutex::new(Command::new("r3".to_string())));
+    async fn partial_send_evidence_matches_live_archived_and_restarted_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let id = test_command(&store, "terminal", "s", b"");
+        let command = Arc::new(AsyncMutex::new(Command::new(id.clone())));
         {
             let mut guard = command.lock().await;
             assert!(try_take_over(&mut guard, false, &store));
-            guard.sent = true;
+            persist_incomplete_send(&mut guard, &store, "partial write".into(), None).unwrap();
+            assert!(!guard.is_busy());
+            assert_eq!(store.metadata(&id).unwrap()["execution_state"], "unknown");
         }
-        // The worker's failure path.
+        let live = read_command_state(&store, "s", &command, ReadWait::Output(0), 4096, None)
+            .await
+            .unwrap();
+        assert_eq!(live["executed"], Value::Null);
+        assert_eq!(live["completion_unknown"], true);
+        assert_eq!(live["error"], "partial write");
+        let mut current = Some(command.clone());
+        assert!(clear_command(&mut current, &command));
+        let next_id = test_command(&store, "terminal", "s", b"command B");
+        current = Some(Arc::new(AsyncMutex::new(Command::new(next_id))));
+        assert_ne!(current.unwrap().lock().await.result_id, id);
+        let archived = read_saved_terminal_result(&store, "s", &id, 4096, None).unwrap();
+        drop(store);
+        let restarted = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let replay = read_saved_terminal_result(&restarted, "s", &id, 4096, None).unwrap();
+        for key in [
+            "state",
+            "executed",
+            "completion_unknown",
+            "failure_stage",
+            "error",
+        ] {
+            assert_eq!(live[key], archived[key], "{key}");
+            assert_eq!(archived[key], replay[key], "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_rejection_is_persisted_before_slot_release_and_survives_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let id = test_command(&store, "terminal", "s", b"");
+        let command = Arc::new(AsyncMutex::new(Command::new(id.clone())));
+        let scheduler = crate::scheduler::ExecutionSlots::new(1, 0, 0, 0).unwrap();
+        let mut timing = Timings::default();
+        let active = scheduler
+            .acquire(Lane::General, Duration::from_secs(1), &mut timing)
+            .await
+            .unwrap();
+        let rejection = match scheduler
+            .acquire(Lane::General, Duration::from_secs(1), &mut timing)
+            .await
+        {
+            Err(rejected @ SlotWait::Full(_)) => rejected,
+            _ => panic!("the occupied lane has no queue slots"),
+        };
         {
             let mut guard = command.lock().await;
-            if guard.state == CmdState::Running {
-                guard.state = CmdState::Unknown;
-                guard.error = Some("partial write".to_string());
-            }
+            persist_queue_rejection(&mut guard, &store, rejection, &timing).unwrap();
+            assert!(!guard.is_busy());
+            assert_eq!(
+                store.metadata(&id).unwrap()["execution_state"],
+                "not_started"
+            );
         }
-        let guard = command.lock().await;
-        assert_eq!(guard.state, CmdState::Unknown);
-        assert!(guard.sent, "the send evidence must not be reversed");
+        drop(active);
+        let live = read_command_state(&store, "s", &command, ReadWait::Output(0), 4096, None)
+            .await
+            .unwrap();
+        let archived = read_saved_terminal_result(&store, "s", &id, 4096, None).unwrap();
+        for key in [
+            "state",
+            "executed",
+            "completion_unknown",
+            "failure_stage",
+            "error",
+            "reason",
+            "queue",
+            "retryable",
+            "queue_timed_out",
+        ] {
+            assert_eq!(live[key], archived[key], "{key}");
+        }
+        assert_eq!(archived["reason"], "queue_full");
+        assert_eq!(archived["retryable"], true);
+        assert_eq!(archived["queue_timed_out"], false);
     }
 
     #[test]
@@ -2157,12 +2168,12 @@ mod tests {
         // A queued command never left the machine.
         assert_eq!(
             close_final_state(CmdState::Queued),
-            Some(("not_started", false, false, "not_started"))
+            Some((CmdState::NotStarted, "not_started"))
         );
         // A running command was already sent, so its completion is unknown.
         assert_eq!(
             close_final_state(CmdState::Running),
-            Some(("unknown", true, true, "closed_by_caller"))
+            Some((CmdState::Unknown, "closed_by_caller"))
         );
         // Finished work keeps its verdict.
         assert_eq!(close_final_state(CmdState::Completed), None);
