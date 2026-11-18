@@ -9,7 +9,9 @@ use tokio::sync::Mutex;
 
 use crate::errors::{BridgeError, BridgeResult};
 use crate::execution::{startup_failed, ExecOutcome, ExecSpec, Runner};
-use crate::fsprobe::{decode, remote_script, FsOptions, DEFAULT_BYTES, WIRE_LIMIT};
+use crate::fsprobe::{
+    decode, fs_timeout_limits, remote_script, FsOptions, DEFAULT_BYTES, FS_TIMEOUT_MIN, WIRE_LIMIT,
+};
 use crate::inventory::Host;
 use crate::rest::AssetCatalog;
 use crate::scheduler::queue_rejection;
@@ -88,10 +90,21 @@ pub fn validate(arguments: &Map<String, Value>) -> BridgeResult<()> {
             "read_many max_bytes must allow at least 256 bytes per file",
         ));
     }
+    let (timeout_max, timeout_default) = fs_timeout_limits(action);
     let timeout = arguments
         .get("timeout")
         .and_then(Value::as_u64)
-        .unwrap_or(30);
+        .unwrap_or(timeout_default);
+    if !(FS_TIMEOUT_MIN..=timeout_max).contains(&timeout) {
+        let kind = if matches!(action, "upload" | "download") {
+            "transfer"
+        } else {
+            "exploration"
+        };
+        return Err(BridgeError::invalid(format!(
+            "{kind} timeout must be {FS_TIMEOUT_MIN}..={timeout_max} seconds"
+        )));
+    }
     if matches!(action, "upload" | "download") {
         let local = arguments
             .get("local_path")
@@ -107,10 +120,6 @@ pub fn validate(arguments: &Map<String, Value>) -> BridgeResult<()> {
                 "upload local_path does not exist on the MCP server machine",
             ));
         }
-    } else if timeout > 120 {
-        return Err(BridgeError::invalid(
-            "exploration timeout must be <=120 seconds",
-        ));
     }
     let mut allowed: Vec<&str> = vec![
         "target",
@@ -630,11 +639,14 @@ impl Filesystem {
             .unwrap_or("")
             .to_string();
         let options = options_from(&arguments);
+        let (_, timeout_default) = fs_timeout_limits(&action);
         if matches!(action.as_str(), "upload" | "download") {
             let local = options.local_path.clone().unwrap_or_default();
             let remote = options.path.clone();
             let deadline = deadline_started
-                .checked_add(Duration::from_secs(options.timeout.unwrap_or(900)))
+                .checked_add(Duration::from_secs(
+                    options.timeout.unwrap_or(timeout_default),
+                ))
                 .ok_or_else(|| BridgeError::invalid("transfer timeout out of range"))?;
             let expected_total = if action == "upload" {
                 Self::upload_size_hint(&local)
@@ -729,7 +741,7 @@ impl Filesystem {
             return Ok(Value::Object(row));
         }
         let script = remote_script(&options, "rg").map_err(BridgeError::invalid)?;
-        let timeout = options.timeout.unwrap_or(30) as f64 + 5.0;
+        let timeout = options.timeout.unwrap_or(timeout_default) as f64 + 5.0;
         let meta = self
             .workers
             .execute(
