@@ -10,6 +10,8 @@
 * Terminal requests wait up to 15 seconds by default, returning earlier when
   output or completion is available. Tool descriptions recommend reusing a
   terminal for repeated work on one target.
+* Transfers no longer report success when remote rsync fails or its exit
+  status cannot be confirmed.
 
 ## 0.4.5
 

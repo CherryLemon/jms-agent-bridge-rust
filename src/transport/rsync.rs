@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -597,6 +597,29 @@ fn outcome_of(end: &WaitEnd, sent: bool) -> Option<TransferOutcome> {
     }
 }
 
+async fn wait_remote_exit(exit: &AtomicI32, done: &AtomicBool, budget: Duration) {
+    let _ = tokio::time::timeout(budget, async {
+        while exit.load(Ordering::SeqCst) == i32::MIN && !done.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+/// Success needs both processes to agree; a lost remote status is not success.
+fn with_remote_exit(mut local: TransferOutcome, remote: Option<i32>) -> TransferOutcome {
+    if local.completed && local.exit_code == 0 {
+        match remote {
+            Some(code) => local.exit_code = code,
+            None => {
+                local.exit_code = 255;
+                local.completed = false;
+            }
+        }
+    }
+    local
+}
+
 /// Why the transfer wait ended.
 #[derive(Debug)]
 enum WaitEnd {
@@ -779,6 +802,8 @@ pub async fn transfer(
     let sent = evidence;
     progress.start();
     let stop = Arc::new(AtomicBool::new(false));
+    let remote_exit = Arc::new(AtomicI32::new(i32::MIN));
+    let remote_done = Arc::new(AtomicBool::new(false));
     let pumps: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let channel_slot: Arc<std::sync::Mutex<Option<ChannelHandle>>> =
@@ -789,6 +814,8 @@ pub async fn transfer(
         let host = host.clone();
         let asset_id = asset_id.clone();
         let container = container.map(str::to_string);
+        let remote_exit = remote_exit.clone();
+        let remote_done = remote_done.clone();
         let sent = sent.clone();
         let stop = stop.clone();
         let err_path = err_path.to_path_buf();
@@ -806,6 +833,8 @@ pub async fn transfer(
                     &host,
                     &asset_id,
                     container.as_deref(),
+                    &remote_exit,
+                    &remote_done,
                     stream,
                     &err_path,
                     &sent,
@@ -996,6 +1025,7 @@ pub async fn transfer(
     // Why the wait ended is tracked explicitly. A stalled transfer used to be reported as
     // `Ok(124)`, which the teardown below read as "the child exited with 124" - it then
     // skipped termination and recorded a completed transfer.
+    let wait_started = Instant::now();
     let happened = wait_for_child(
         &mut child,
         &stalled,
@@ -1006,6 +1036,15 @@ pub async fn transfer(
         WaitEnd::WaitError(error) => Some(format!("rsync failed: {error}")),
         _ => None,
     };
+    // The relay's EOF is not the remote process's exit status. In particular a
+    // newer sender may report a file error on stderr and exit 23 while the older
+    // local receiver exits 0. Drain the SSH exit status before closing the channel.
+    if matches!(happened, WaitEnd::Exited(0)) && sent.load(Ordering::SeqCst) {
+        let remaining = Duration::from_secs_f64(timeout.max(0.5))
+            .saturating_sub(wait_started.elapsed())
+            .min(Duration::from_secs(5));
+        wait_remote_exit(&remote_exit, &remote_done, remaining).await;
+    }
     // Ordered teardown: stop accepting new work, end the child, then reap the pumps and
     // only then read the evidence. Terminating before reaping matters: the stderr and
     // stdout watchers are blocking reads that cannot be aborted early, and they finish
@@ -1015,7 +1054,29 @@ pub async fn transfer(
         return Err(BridgeError::storage(error));
     }
     let sent_evidence = sent.load(Ordering::SeqCst);
-    let outcome = outcome_of(&happened, sent_evidence).expect("wait errors return above");
+    let local_outcome = outcome_of(&happened, sent_evidence).expect("wait errors return above");
+    let remote_code = remote_exit.load(Ordering::SeqCst);
+    let outcome = with_remote_exit(
+        local_outcome,
+        (remote_code != i32::MIN).then_some(remote_code),
+    );
+    if outcome.exit_code != 0 && matches!(happened, WaitEnd::Exited(0)) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(err_path)
+        {
+            let _ = writeln!(
+                file,
+                "Remote rsync exit status: {}; transfer is not successful.",
+                if remote_code == i32::MIN {
+                    "unconfirmed".into()
+                } else {
+                    remote_code.to_string()
+                }
+            );
+        }
+    }
     drop(owner);
     Ok(outcome)
 }
@@ -1025,6 +1086,8 @@ async fn serve_stream(
     host: &Host,
     asset_id: &str,
     container: Option<&str>,
+    remote_exit: &Arc<AtomicI32>,
+    remote_done: &Arc<AtomicBool>,
     mut stream: UnixStream,
     err_path: &Path,
     sent: &Arc<AtomicBool>,
@@ -1175,6 +1238,8 @@ async fn serve_stream(
             channel_writer.close().await;
         }
     });
+    let remote_exit = remote_exit.clone();
+    let remote_done = remote_done.clone();
     let downlink = tokio::spawn(async move {
         let mut socket_write = socket_write;
         let mut reader = reader;
@@ -1184,6 +1249,7 @@ async fn serve_stream(
                 Some(ShellEvent::Data(data)) => {
                     let count = data.len();
                     if socket_write.write_all(&data).await.is_err() {
+                        remote_done.store(true, Ordering::SeqCst);
                         return;
                     }
                     progress_down.add_bytes(count);
@@ -1197,10 +1263,16 @@ async fn serve_stream(
                         let _ = file.write_all(&data);
                     }
                 }
-                Some(ShellEvent::ExecRejected) | None => channel_open = false,
+                Some(ShellEvent::Exit(code)) => {
+                    remote_exit.store(code, Ordering::SeqCst);
+                }
+                Some(ShellEvent::ExecRejected) | Some(ShellEvent::Closed) | None => {
+                    channel_open = false
+                }
                 Some(_) => {}
             }
         }
+        remote_done.store(true, Ordering::SeqCst);
         // The remote side is gone: close the local socket so rsync's own write path
         // fails and it exits instead of waiting for a peer that will never answer.
         let _ = socket_write.shutdown().await;
@@ -1452,6 +1524,51 @@ pub(crate) fn write_all_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_status_wait_handles_delayed_exit_closed_channel_and_deadline() {
+        let exit = Arc::new(AtomicI32::new(i32::MIN));
+        let done = Arc::new(AtomicBool::new(false));
+        let delayed = exit.clone();
+        let task = tokio::spawn(async move {
+            // EOF can precede Exit; only final close or the status ends the wait.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            delayed.store(23, Ordering::SeqCst);
+        });
+        wait_remote_exit(&exit, &done, Duration::from_secs(1)).await;
+        task.await.unwrap();
+        assert_eq!(exit.load(Ordering::SeqCst), 23);
+        exit.store(i32::MIN, Ordering::SeqCst);
+        done.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        wait_remote_exit(&exit, &done, Duration::from_secs(1)).await;
+        assert!(started.elapsed() < Duration::from_millis(100));
+        done.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        wait_remote_exit(&exit, &done, Duration::from_millis(25)).await;
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(exit.load(Ordering::SeqCst), i32::MIN);
+    }
+
+    #[test]
+    fn local_success_cannot_hide_a_remote_failure_or_unknown_exit() {
+        let local = || TransferOutcome {
+            exit_code: 0,
+            sent: true,
+            completed: true,
+            timed_out: false,
+        };
+        assert_eq!(with_remote_exit(local(), Some(0)).exit_code, 0);
+        let failed = with_remote_exit(local(), Some(23));
+        assert_eq!(failed.exit_code, 23);
+        assert!(failed.completed);
+        let unknown = with_remote_exit(local(), None);
+        assert_eq!(unknown.exit_code, 255);
+        assert!(!unknown.completed);
+        let mut failed_local = local();
+        failed_local.exit_code = 12;
+        assert_eq!(with_remote_exit(failed_local, Some(0)).exit_code, 12);
+    }
 
     /// The idle ticker flags a quiet transfer and leaves a moving one alone.
     #[tokio::test]
