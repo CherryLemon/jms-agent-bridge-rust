@@ -883,6 +883,7 @@ fn public_view(name: &str, schema: Value) -> Value {
             "targets",
             "target",
             "command",
+            "allow_dangerous",
             "job_id",
             "jobs",
             "timeout",
@@ -938,6 +939,29 @@ fn public_view(name: &str, schema: Value) -> Value {
 mod tests {
     use super::*;
     use crate::schema::validate;
+
+    #[test]
+    fn job_submit_accepts_existing_explicit_boolean_in_both_schemas() {
+        let public = advertised()
+            .into_iter()
+            .find(|spec| spec.name == "job")
+            .unwrap();
+        let full = full_specs()
+            .into_iter()
+            .find(|spec| spec.name == "job")
+            .unwrap();
+        for schema in [&public.input_schema, &full.input_schema] {
+            for value in [json!(true), json!(false), json!("true")] {
+                let valid = value.is_boolean();
+                let args = json!({
+                    "action": "submit", "request_id": "test-id",
+                    "targets": ["test-machine"], "command": "printf hello",
+                    "allow_dangerous": value,
+                });
+                assert_eq!(validate(schema, &args).is_ok(), valid);
+            }
+        }
+    }
 
     #[test]
     fn descriptions_steer_repeated_container_work_to_terminal() {
