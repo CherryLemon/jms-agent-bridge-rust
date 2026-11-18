@@ -1,0 +1,12 @@
+{
+  "result_id": "aaaa1111bbbb2222cccc3333dddd4444",
+  "stdout": "alpha\nbeta\ngamma\n",
+  "request_id": "offline-lost-reply",
+  "steps": [
+    {"name":"job_status_schema","tool":"discover","arguments":{"operation":"jms_job_status"},"expect":{"name":"jms_job_status"}},
+    {"name":"job_logs_schema","tool":"discover","arguments":{"operation":"jms_job_logs"},"expect":{"name":"jms_job_logs"}},
+    {"name":"saved_log_page","tool":"read_result","arguments":{"result_id":"aaaa1111bbbb2222cccc3333dddd4444","offset":6,"limit":5},"expect":{"text":"beta\n","next_offset":11}},
+    {"name":"lost_reply_receipt","tool":"meta","arguments":{"ref":"request:offline-lost-reply","section":"all"},"expect":{"request_state":"interrupted","completion_unknown":true,"execution_replayed":false}},
+    {"name":"missing_terminal","tool":"terminal","arguments":{"action":"read","session":"offline-terminal"},"error_contains":"unknown terminal session"}
+  ]
+}
