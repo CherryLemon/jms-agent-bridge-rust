@@ -58,8 +58,18 @@ preferred_account = "root"   # required when assets permit several accounts
 
 ```toml
 [credentials]
-session_token = "..."     # or private_token, or access_key_id/access_key_secret
+access_key_id = "..."
+access_key_secret = "..."
+# Alternatively use session_token or private_token.
 ```
+
+Access keys use JumpServer's HTTP Signature (HMAC-SHA256), signing the exact
+request path and query plus `Date` and `Accept` (`X-JMS-Org` when configured).
+A complete access-key pair takes precedence over session/private tokens. Keep
+credentials outside the repository; never include them in logs or command-line
+arguments. The resident process reads credentials at startup: updating the file
+or calling `jms_inventory_reload` does not reload credentials. Coordinate a
+service restart after active work and persistent terminals have been reconciled.
 
 Every value can also come from the environment: `JMS_BRIDGE_URL`,
 `JMS_BRIDGE_SSH_PORT`, `JMS_BRIDGE_LOGIN_USER`, `JMS_BRIDGE_SESSION_TOKEN`,

@@ -470,4 +470,65 @@ mod tests {
             "https://bastion.example/api/v1/perms/users/my/assets/"
         );
     }
+
+    #[tokio::test]
+    async fn access_key_signs_wire_target_and_takes_precedence_over_tokens() {
+        crate::tls::install_default_provider();
+        use axum::extract::OriginalUri;
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/api/v1/perms/users/my/assets/",
+            get(
+                |OriginalUri(uri): OriginalUri, headers: HeaderMap| async move {
+                    let target = uri.path_and_query().unwrap().as_str();
+                    assert_eq!(
+                        target,
+                        "/api/v1/perms/users/my/assets/?limit=200&offset=0&q=a%20b"
+                    );
+                    let date = headers.get("date").unwrap().to_str().unwrap();
+                    assert!(httpdate::parse_http_date(date).is_ok());
+                    let (expected, _) = sign_access_key(
+                        "test-access-id",
+                        "test-access-secret",
+                        "GET",
+                        target,
+                        date,
+                        "application/json",
+                        Some("test-org"),
+                    );
+                    assert_eq!(
+                        headers.get("authorization").unwrap().to_str().unwrap(),
+                        expected
+                    );
+                    assert_eq!(headers.get("accept").unwrap(), "application/json");
+                    assert_eq!(headers.get("x-jms-org").unwrap(), "test-org");
+                    Json(serde_json::json!({"count": 0, "next": null, "results": []}))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // Keep this test independent of process proxy variables and production credentials.
+        let api = ApiClient {
+            cfg: BastionConfig {
+                url: format!("http://{address}"),
+                access_key_id: Some("test-access-id".into()),
+                access_key_secret: Some("test-access-secret".into()),
+                private_token: Some("stale-private-token".into()),
+                session_token: Some("stale-session-token".into()),
+                org_id: Some("test-org".into()),
+                ..Default::default()
+            },
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            token: Mutex::new(Some("stale-runtime-token".into())),
+        };
+        let (assets, truncated) = api.list_assets(Some("a b"), 200, 1).await.unwrap();
+        assert!(assets.is_empty());
+        assert!(!truncated);
+        server.abort();
+    }
 }
