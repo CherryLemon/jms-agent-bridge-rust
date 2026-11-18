@@ -626,14 +626,13 @@ require allow_dangerous=true",
             limit,
         ]);
         let etag = schemas::operation_discovery_etag(&scope, &body);
-        let mut result = if arguments.get("if_none_match").and_then(Value::as_str) == Some(&etag) {
-            json!({"unchanged": true})
-        } else {
-            body
-        };
-        result["catalog_version"] = Value::from(schemas::operation_catalog_version());
-        result["etag"] = Value::from(etag);
-        Ok(result)
+        if arguments.get("if_none_match").and_then(Value::as_str) == Some(&etag) {
+            return Ok(json!({"unchanged": true}));
+        }
+        let mut body = body;
+        body["catalog_version"] = Value::from(schemas::operation_catalog_version());
+        body["etag"] = Value::from(etag);
+        Ok(body)
     }
 
     fn discover_operations(

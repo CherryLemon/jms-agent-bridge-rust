@@ -146,9 +146,12 @@ schema of an exact operation or filesystem action.
 
 `topic="operations"` responses include a static `catalog_version` and an
 `etag` scoped to that bridge instance, query, operation, view, limit and offset.
-Send that `etag` as `if_none_match` on the same request; an unchanged response
-carries only `unchanged: true`, `etag` and `catalog_version`. If the cached
-body is unavailable, omit `if_none_match` to retrieve it. Asset inventory and
+Conditional discovery is optional. Send that `etag` as `if_none_match` on the
+same request; a hit returns only `{"unchanged":true}`. A miss returns the full
+requested representation with a fresh tag. If the cached body is unavailable,
+omit `if_none_match` to retrieve it. The tag and version add about 180 bytes to
+an uncached response, which can outweigh the payload of a one-line lookup;
+caching is most useful for repeated lists and full schemas. Asset inventory and
 live status keep their normal responses, including refresh errors, without
 operation catalog etags.
 

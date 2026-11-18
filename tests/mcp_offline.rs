@@ -225,6 +225,56 @@ max_parallel = 2\n",
     assert_ne!(signature["etag"], schema["etag"]);
     assert_eq!(signature["catalog_version"], schema["catalog_version"]);
 
+    // Action-specific discovery must match the pre-connection runtime validator.
+    for (action, max, default) in [
+        ("read", 120, 30),
+        ("upload", 900, 900),
+        ("download", 900, 900),
+    ] {
+        let full = server
+            .dispatch(
+                "discover",
+                object(json!({"operation": "jms_fs", "query": action})),
+            )
+            .await
+            .unwrap();
+        let timeout = &full["inputSchema"]["properties"]["timeout"];
+        assert_eq!(timeout["maximum"], max, "{action}");
+        assert_eq!(timeout["default"], default, "{action}");
+
+        let compact = server
+            .dispatch(
+                "discover",
+                object(json!({
+                    "operation": "jms_fs", "query": action, "view": "signature",
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(compact["signature"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("timeout?[1..{max}]")));
+
+        let mut fs_args = json!({"target": "mock", "path": "/remote", "action": action});
+        if action != "read" {
+            fs_args["local_path"] = json!(config_path);
+        }
+        for (seconds, allowed) in [(max, true), (max + 1, false)] {
+            fs_args["timeout"] = json!(seconds);
+            assert_eq!(
+                jms_bridge::schema::validate(&full["inputSchema"], &fs_args).is_ok(),
+                allowed,
+                "schema {action} {seconds}",
+            );
+            assert_eq!(
+                jms_bridge::filesystem::validate(&object(fs_args.clone())).is_ok(),
+                allowed,
+                "runtime {action} {seconds}",
+            );
+        }
+    }
+
     let resident = server
         .dispatch("discover", object(json!({"operation": "run"})))
         .await
@@ -247,12 +297,7 @@ max_parallel = 2\n",
     let mut cached = page_args;
     cached["if_none_match"] = tag.clone();
     let reply = server.dispatch("discover", object(cached)).await.unwrap();
-    assert_eq!(
-        reply,
-        json!({
-            "unchanged": true, "etag": tag, "catalog_version": page["catalog_version"],
-        })
-    );
+    assert_eq!(reply, json!({"unchanged": true}));
 
     for different in [
         json!({"query": "jobs", "view": "signature", "limit": 1, "offset": 1}),
@@ -372,6 +417,9 @@ max_parallel = 2\n",
         )
         .unwrap();
         assert!(body.get(field).is_some(), "{body}");
+        if field == "unchanged" {
+            assert_eq!(body, json!({"unchanged": true}));
+        }
     }
     http.abort();
 

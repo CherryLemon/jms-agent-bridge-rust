@@ -10,6 +10,10 @@ use std::sync::OnceLock;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::fsprobe::{
+    fs_timeout_limits, FS_EXPLORATION_TIMEOUT_DEFAULT, FS_EXPLORATION_TIMEOUT_MAX, FS_TIMEOUT_MIN,
+    FS_TRANSFER_TIMEOUT_MAX,
+};
 use crate::schema::strip_titles;
 
 pub const DANGEROUS_FLAG_DESCRIPTION: &str = "Acknowledges the local guard for this authorized \
@@ -146,7 +150,7 @@ Put advanced fields in options; discover(operation='jms_fs', query=action) lists
                             "respect_ignore": boolean(true, "glob/search: honour ignore files."),
                             "context_lines": integer(0, 5, 0, "search: context lines per match."),
                             "max_file_bytes": integer(1024, 67108864, 8388608, "search/checksum: per-file cap."),
-                            "timeout": integer(1, 900, 30, "Exploration 1..120s; transfers 1..900s."),
+                            "timeout": fs_general_timeout_schema(),
                         }},
                 },
             }),
@@ -700,6 +704,17 @@ refresh report status=unknown with watch_timeout=true.",
     ]
 }
 
+fn fs_general_timeout_schema() -> Value {
+    json!({
+        "type": "integer",
+        "minimum": FS_TIMEOUT_MIN,
+        "maximum": FS_TRANSFER_TIMEOUT_MAX,
+        "description": format!(
+            "Exploration {FS_TIMEOUT_MIN}..{FS_EXPLORATION_TIMEOUT_MAX}s (default {FS_EXPLORATION_TIMEOUT_DEFAULT}); transfers {FS_TIMEOUT_MIN}..{FS_TRANSFER_TIMEOUT_MAX}s (default {FS_TRANSFER_TIMEOUT_MAX})."
+        ),
+    })
+}
+
 fn fs_schema() -> Value {
     json!({
         "name": "jms_fs",
@@ -737,7 +752,7 @@ fn fs_schema() -> Value {
                 "max_bytes": integer(256, 65536, 4096, "Content budget per response."),
                 "context_lines": integer(0, 5, 0, "search: context lines per match."),
                 "max_file_bytes": integer(1024, 67108864, 8388608, "search/checksum: per-file cap."),
-                "timeout": integer(1, 900, 30, "Exploration 1..120s; transfers 1..900s."),
+                "timeout": fs_general_timeout_schema(),
             },
         },
         "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": true},
@@ -869,6 +884,16 @@ pub fn fs_action_schema(action: &str) -> Result<Value, String> {
         }
     }
     kept.insert("action".into(), json!({"type": "string", "const": action}));
+    let (timeout_max, timeout_default) = fs_timeout_limits(action);
+    kept.insert(
+        "timeout".into(),
+        integer(
+            FS_TIMEOUT_MIN,
+            timeout_max,
+            timeout_default,
+            "Timeout in seconds.",
+        ),
+    );
     let mut required = vec!["target".to_string(), "action".to_string()];
     required.push(
         if action == "read_many" {
