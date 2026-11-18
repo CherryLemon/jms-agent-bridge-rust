@@ -129,6 +129,40 @@ impl Inventory {
         map
     }
 
+    /// Resolve literal inventory assets or unique aliases, excluding selectors
+    /// that could expand to multiple hosts. Preserve the request's order.
+    pub(crate) fn resolve_job_targets(
+        &self,
+        targets: &[(String, String)],
+    ) -> BridgeResult<Vec<(Host, String)>> {
+        let hosts = self.index();
+        let assets: HashMap<_, _> = self
+            .hosts
+            .iter()
+            .filter_map(|host| Some((host.asset_id.as_deref()?, host)))
+            .collect();
+        targets
+            .iter()
+            .map(|(target, id)| {
+                if target.eq_ignore_ascii_case("all") || target.contains(['*', '?', '[', ']']) {
+                    return Err(BridgeError::invalid(
+                        "job handles require an exact permitted target",
+                    ));
+                }
+                let host = assets
+                    .get(target.as_str())
+                    .copied()
+                    .or_else(|| hosts.get(target.as_str()).copied())
+                    .or_else(|| match self.groups.get(target).map(Vec::as_slice) {
+                        Some([alias]) => hosts.get(alias.as_str()).copied(),
+                        _ => None,
+                    })
+                    .ok_or_else(|| self.no_match(target))?;
+                Ok((host.clone(), id.clone()))
+            })
+            .collect()
+    }
+
     /// Resolve names, unique aliases, groups, tags, or `all`/`*` into hosts.
     pub fn resolve(&self, selectors: &[String]) -> BridgeResult<Vec<Host>> {
         let by_name = self.index();
@@ -425,6 +459,44 @@ mod tests {
             groups,
             excluded: BTreeMap::new(),
             metadata_warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn job_pairs_accept_exact_aliases_and_reject_expansions() {
+        let mut inventory = Inventory::default();
+        inventory.hosts.push(Host {
+            name: "one".into(),
+            ..Default::default()
+        });
+        inventory.hosts.push(Host {
+            name: "two".into(),
+            ..Default::default()
+        });
+        inventory
+            .groups
+            .insert("ip-for-one".into(), vec!["one".into()]);
+        inventory
+            .groups
+            .insert("both".into(), vec!["one".into(), "two".into()]);
+        let ordered = inventory
+            .resolve_job_targets(&[
+                ("two".into(), "bbbb2222".into()),
+                ("ip-for-one".into(), "aaaa1111".into()),
+                ("one".into(), "aaaa1111".into()),
+            ])
+            .unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(host, _)| host.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["two", "one", "one"]
+        );
+        for denied in ["*", "all", "both", "unlisted"] {
+            assert!(inventory
+                .resolve_job_targets(&[(denied.into(), "aaaa1111".into())])
+                .is_err());
         }
     }
 

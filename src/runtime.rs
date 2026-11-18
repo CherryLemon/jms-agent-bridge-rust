@@ -702,9 +702,110 @@ require allow_dangerous=true",
 
     // --- call ----------------------------------------------------------------
 
+    pub async fn tool_job(
+        self: &Arc<Self>,
+        mut payload: Map<String, Value>,
+    ) -> BridgeResult<Value> {
+        let action = used_string(&payload, "action")?;
+        payload.remove("action");
+        let request_id = payload.remove("request_id");
+        if action != "submit" && request_id.is_some() {
+            return Err(BridgeError::invalid(
+                "job request_id applies only to submit",
+            ));
+        }
+        if action == "wait" && payload.contains_key("jobs") {
+            return self.wait_job_handles(payload).await;
+        }
+        let operation = match action.as_str() {
+            "submit" => {
+                if request_id.as_ref().and_then(Value::as_str).is_none() {
+                    return Err(BridgeError::invalid("job submit requires request_id"));
+                }
+                "jms_submit_job"
+            }
+            "wait" => "jms_job_wait",
+            "logs" => "jms_job_logs",
+            "status" => "jms_job_status",
+            "cancel" => "jms_job_cancel",
+            "list" => "jms_job_list",
+            _ => return Err(BridgeError::invalid("unknown job action")),
+        };
+        if matches!(action.as_str(), "logs" | "cancel") {
+            if let Some(target) = payload.remove("target") {
+                payload.insert("host".into(), target);
+            }
+        }
+        let mut call = Map::new();
+        call.insert("operation".into(), json!(operation));
+        call.insert("arguments".into(), Value::Object(payload));
+        if let Some(request_id) = request_id {
+            call.insert("request_id".into(), request_id);
+        }
+        self.tool_call_impl(call, action == "submit").await
+    }
+
+    async fn wait_job_handles(&self, payload: Map<String, Value>) -> BridgeResult<Value> {
+        if payload
+            .keys()
+            .any(|key| !matches!(key.as_str(), "jobs" | "timeout" | "interval"))
+        {
+            return Err(BridgeError::invalid(
+                "job wait takes jobs or targets/job_id, not both",
+            ));
+        }
+        let jobs = payload
+            .get("jobs")
+            .and_then(Value::as_array)
+            .filter(|jobs| !jobs.is_empty())
+            .ok_or_else(|| BridgeError::invalid("job wait requires nonempty jobs"))?;
+        let timeout = payload
+            .get("timeout")
+            .and_then(Value::as_f64)
+            .unwrap_or(50.0);
+        let interval = payload
+            .get("interval")
+            .and_then(Value::as_f64)
+            .unwrap_or(2.0);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout);
+        let inventory = tokio::time::timeout_at(deadline, self.inventory())
+            .await
+            .map_err(|_| {
+                BridgeError::invalid(
+                    "job wait timed out resolving permitted targets; no probe started",
+                )
+            })??;
+        let mut handles = Vec::with_capacity(jobs.len());
+        for handle in jobs {
+            let handle = handle
+                .as_object()
+                .ok_or_else(|| BridgeError::invalid("job handle must be an object"))?;
+            let target = used_string(handle, "target")?;
+            let id = used_string(handle, "job_id")?;
+            if let Some(error) = validate_job_id(&id) {
+                return Err(BridgeError::invalid(error));
+            }
+            handles.push((target, id));
+        }
+        let pairs = inventory.resolve_job_targets(&handles)?;
+        let (status, finished) = self.jobs.wait_until(&pairs, deadline, interval).await;
+        self.stage_operation_result(
+            "jms_job_wait",
+            project_job_wait(jobs, &pairs, status, finished),
+        )
+    }
+
     pub async fn tool_call(self: &Arc<Self>, arguments: Map<String, Value>) -> BridgeResult<Value> {
+        self.tool_call_impl(arguments, false).await
+    }
+
+    async fn tool_call_impl(
+        self: &Arc<Self>,
+        arguments: Map<String, Value>,
+        job_submit_facade: bool,
+    ) -> BridgeResult<Value> {
         let operation = used_string(&arguments, "operation")?;
-        let mut payload = match arguments.get("arguments") {
+        let payload = match arguments.get("arguments") {
             Some(Value::Object(map)) => map.clone(),
             Some(Value::Null) | None => Map::new(),
             Some(_) => {
@@ -753,9 +854,11 @@ require allow_dangerous=true",
             if let Some(map) = value.as_object_mut() {
                 map.insert("request_id".into(), Value::from(request_id.clone()));
             }
+            if job_submit_facade {
+                value = project_job_submission(value);
+            }
             return self.stage_operation_result(&operation_for_task, value);
         }
-        let _ = &mut payload;
         let value = self.dispatch_operation(&operation, payload).await?;
         // Bounded response: a large operation payload is saved whole and the model gets
         // a summary plus a result id instead of the entire object in context.
@@ -1026,18 +1129,19 @@ require allow_dangerous=true",
             set.spawn(async move {
                 let _permit = permit.acquire_owned().await;
                 let name = host.name.clone();
+                let asset_id = host.asset_id.clone();
                 let submitted = runtime
                     .jobs
                     .submit(&host, command.as_ref(), progress.as_deref())
                     .await;
-                (index, name, submitted)
+                (index, name, asset_id, submitted)
             });
         }
         let mut launched: Vec<(usize, Value)> = Vec::new();
         let mut all_launched = true;
         let mut any_unknown = false;
         while let Some(joined) = set.join_next().await {
-            let (index, name, submitted) = match joined {
+            let (index, name, asset_id, submitted) = match joined {
                 Ok(entry) => entry,
                 Err(error) => {
                     all_launched = false;
@@ -1051,7 +1155,7 @@ require allow_dangerous=true",
                     continue;
                 }
             };
-            let row = match submitted {
+            let mut row = match submitted {
                 Ok((handle, outcome)) => {
                     all_launched &= handle.state == crate::jobs::LaunchState::Acknowledged;
                     any_unknown |= handle.state == crate::jobs::LaunchState::Unknown;
@@ -1071,6 +1175,9 @@ require allow_dangerous=true",
                     })
                 }
             };
+            if let Some(asset_id) = asset_id {
+                row["asset_id"] = json!(asset_id);
+            }
             launched.push((index, row));
         }
         launched.sort_by_key(|(index, _)| *index);
@@ -1382,6 +1489,81 @@ fn unknown_row(host: &str, message: &str) -> Map<String, Value> {
     .unwrap_or_default()
 }
 
+fn project_job_wait(
+    jobs: &[Value],
+    pairs: &[(Host, String)],
+    mut status: Vec<Value>,
+    finished: bool,
+) -> Value {
+    let mut pending = Vec::new();
+    for ((row, handle), (host, _)) in status.iter_mut().zip(jobs).zip(pairs) {
+        let known = crate::jobs::is_terminal_status(row);
+        row["target"] = handle["target"].clone();
+        row["host"] = json!(host.name);
+        row["job_id"] = handle["job_id"].clone();
+        if !known {
+            pending.push(handle.clone());
+        }
+    }
+    json!({"ok":finished,"finished":finished,"status":status,"pending":pending})
+}
+
+/// Present directly reusable handles without changing the durable legacy response.
+fn project_job_submission(mut value: Value) -> Value {
+    let Some(map) = value.as_object_mut() else {
+        return value;
+    };
+    let running = map.get("request_state").and_then(Value::as_str) == Some("running");
+    let rows = map
+        .remove("jobs")
+        .and_then(|value| value.as_array().cloned());
+    let receipts = map
+        .remove("submission_receipts")
+        .and_then(|value| value.as_array().cloned());
+    let mut submissions = rows.unwrap_or_default();
+    if submissions.is_empty() {
+        submissions = receipts.unwrap_or_default();
+    }
+    let mut jobs = Vec::new();
+    for row in &mut submissions {
+        let Some(row) = row.as_object_mut() else {
+            continue;
+        };
+        let Some(target) = row
+            .get("asset_id")
+            .and_then(Value::as_str)
+            .or_else(|| row.get("host").and_then(Value::as_str))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        row.insert("target".into(), json!(target));
+        let confirmed_or_unknown = match row.get("launch_state").and_then(Value::as_str) {
+            Some("acknowledged" | "unknown") => true,
+            Some(_) => false,
+            None => {
+                // A live request can still launch this prepared ID. Do not offer an
+                // immediately watchable handle that might falsely report missing.
+                row.insert(
+                    "launch_state".into(),
+                    json!(if running { "pending" } else { "unknown" }),
+                );
+                !running
+            }
+        };
+        let Some(id) = row.get("job_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if confirmed_or_unknown && validate_job_id(id).is_none() {
+            jobs.push(json!({"target":target,"job_id":id}));
+        }
+    }
+    map.remove("execution_results");
+    map.insert("jobs".into(), json!(jobs));
+    map.insert("submissions".into(), json!(submissions));
+    value
+}
+
 /// One job row: the id is always reported, `launched` only when the launcher said so.
 fn job_row(handle: &crate::jobs::JobHandle, outcome: &crate::execution::ExecOutcome) -> Value {
     let acknowledged = handle.state == crate::jobs::LaunchState::Acknowledged;
@@ -1468,6 +1650,7 @@ pub fn stage_if_large(
         "matched",
         "returned",
         "next_offset",
+        "finished",
         "status",
     ] {
         if let Some(item) = value.get(key) {
@@ -1633,6 +1816,41 @@ fn meta_section_keys(section: &str) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_wait_returns_only_unfinished_handles_for_followup() {
+        let jobs = [
+            json!({"target":"asset-a","job_id":"aaaaaaaa"}),
+            json!({"target":"asset-b","job_id":"bbbbbbbb"}),
+            json!({"target":"asset-c","job_id":"cccccccc"}),
+        ];
+        let pairs: Vec<_> = jobs
+            .iter()
+            .map(|row| {
+                (
+                    Host {
+                        name: row["target"].as_str().unwrap().into(),
+                        ..Host::default()
+                    },
+                    row["job_id"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        let value = project_job_wait(
+            &jobs,
+            &pairs,
+            vec![
+                json!({"status":"done","exit_code":"0"}),
+                json!({"status":"failed","exit_code":"7"}),
+                json!({"status":"running","watch_timeout":true}),
+            ],
+            false,
+        );
+        assert_eq!(value["pending"], json!([jobs[2]]));
+        assert_eq!(value["status"][1]["exit_code"], "7");
+        assert_eq!(value["status"][1]["job_id"], "bbbbbbbb");
+        assert_eq!(value["status"][2]["target"], "asset-c");
+    }
 
     #[test]
     fn terminal_page_wait_defaults_to_fifteen_seconds() {

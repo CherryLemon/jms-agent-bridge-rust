@@ -266,6 +266,17 @@ pub fn derive_launch_state(acknowledged: bool, meta: &Map<String, Value>) -> Lau
     LaunchState::Unknown
 }
 
+/// Address observations by permitted asset/connection identity, not display name.
+fn pair_key(host: &Host, id: &str) -> (String, String) {
+    let identity = host
+        .connection_key()
+        .unwrap_or_else(|_| match host.asset_id.as_deref() {
+            Some(asset) => format!("asset:{asset}"),
+            None => format!("name:{}", host.name),
+        });
+    (identity, id.to_string())
+}
+
 /// One row per requested pair, using the latest observation and marking the pairs that
 /// were never observed (`watch_timeout`) instead of inventing a status for them.
 fn collect_rows(
@@ -275,46 +286,109 @@ fn collect_rows(
 ) -> Vec<Value> {
     pairs
         .iter()
-        .map(
-            |(host, job_id)| match last.get(&(host.name.clone(), job_id.clone())) {
-                Some(row) => {
-                    let mut row = row.clone();
-                    if watch_timeout && !is_terminal_status(&row) && is_unfinished_status(&row) {
-                        if let Some(map) = row.as_object_mut() {
-                            map.insert("watch_timeout".into(), Value::Bool(true));
-                        }
+        .map(|(host, job_id)| match last.get(&pair_key(host, job_id)) {
+            Some(row) => {
+                let mut row = row.clone();
+                if watch_timeout && !is_terminal_status(&row) {
+                    if let Some(map) = row.as_object_mut() {
+                        map.insert("watch_timeout".into(), Value::Bool(true));
                     }
-                    row
                 }
-                None => json!({
-                    "host": host.name,
-                    "job_id": job_id,
-                    "status": "unknown",
-                    "ok": false,
-                    "watch_timeout": true,
-                    "note": "the status scan ran out of budget before this host answered",
-                }),
-            },
-        )
+                row
+            }
+            None => json!({
+                "host": host.name,
+                "job_id": job_id,
+                "status": "unknown",
+                "ok": false,
+                "watch_timeout": true,
+                "note": "the status scan ran out of budget before this host answered",
+            }),
+        })
         .collect()
-}
-
-/// A row that may still change (as opposed to a terminal one).
-fn is_unfinished_status(row: &Value) -> bool {
-    row.get("status")
-        .and_then(Value::as_str)
-        .map(|status| status != "missing")
-        .unwrap_or(true)
 }
 
 /// Terminal job states for `wait`: nothing may change after them.
 const TERMINAL_STATUSES: [&str; 4] = ["done", "failed", "cancelled", "missing"];
 
-fn is_terminal_status(row: &Value) -> bool {
+pub(crate) fn is_terminal_status(row: &Value) -> bool {
+    if row.get("ok") == Some(&Value::Bool(false)) {
+        return false;
+    }
     row.get("status")
         .and_then(Value::as_str)
         .map(|status| TERMINAL_STATUSES.contains(&status))
         .unwrap_or(false)
+}
+
+/// Watch read-only probes with task ownership scoped to this operation. Dropping
+/// the stream at the deadline also drops queued/in-flight probes: nothing detached
+/// can consume another permit or start later. Rows are keyed on input identity,
+/// never on the order or contents of a remote response.
+async fn watch_pairs<F, Fut>(
+    pairs: &[(Host, String)],
+    deadline: tokio::time::Instant,
+    interval: std::time::Duration,
+    probe: F,
+) -> (Vec<Value>, bool)
+where
+    F: Fn(Host, String) -> Fut + Sync,
+    Fut: std::future::Future<Output = BridgeResult<Value>>,
+{
+    use futures::{stream, StreamExt};
+    const MAX_IN_FLIGHT: usize = 4;
+    let mut seen = std::collections::HashSet::new();
+    let mut pending: Vec<_> = pairs
+        .iter()
+        .filter(|(host, id)| seen.insert(pair_key(host, id)))
+        .cloned()
+        .collect();
+    let mut last = std::collections::HashMap::new();
+    while !pending.is_empty() && tokio::time::Instant::now() < deadline {
+        let work = stream::iter(pending.clone()).map(|(host, id)| {
+            let probe = &probe;
+            async move {
+                if tokio::time::Instant::now() >= deadline {
+                    return None;
+                }
+                let key = pair_key(&host, &id);
+                let name = host.name.clone();
+                let row = match probe(host, id).await {
+                    Ok(row) => row,
+                    Err(error) => json!({"host":name,"job_id":key.1,"ok":false,
+                                         "error":error.message()}),
+                };
+                Some((key, row))
+            }
+        });
+        let mut work = std::pin::pin!(work.buffer_unordered(MAX_IN_FLIGHT));
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    let finished = pending.iter().all(|(host, id)|
+                        last.get(&pair_key(host, id)).is_some_and(is_terminal_status)
+                    );
+                    return (collect_rows(pairs, &last, !finished), finished);
+                }
+                observed = work.next() => match observed {
+                    Some(Some((key,row))) => { last.insert(key, row); },
+                    Some(None) => {},
+                    None => break,
+                },
+            }
+        }
+        pending.retain(|(host, id)| {
+            !last
+                .get(&pair_key(host, id))
+                .is_some_and(is_terminal_status)
+        });
+        if !pending.is_empty() {
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)).await;
+        }
+    }
+    let finished = pending.is_empty();
+    (collect_rows(pairs, &last, !finished), finished)
 }
 
 pub struct Jobs {
@@ -345,6 +419,9 @@ impl Jobs {
         );
         let mut receipt = Map::new();
         receipt.insert("host".into(), Value::from(host.name.clone()));
+        if let Some(asset_id) = &host.asset_id {
+            receipt.insert("asset_id".into(), json!(asset_id));
+        }
         receipt.insert("job_id".into(), Value::from(job_id.clone()));
         receipt.insert("session".into(), Value::from(session.clone()));
         receipt.insert("launch_acknowledged".into(), Value::Bool(false));
@@ -483,38 +560,6 @@ else echo 'status=missing'; fi"
         rows.into_iter().map(|(_, row)| row).collect()
     }
 
-    /// Report each target's status as soon as it is known.
-    ///
-    /// `wait` uses this so a finished host is recorded even when another host never
-    /// answers and the overall scan has to be abandoned.
-    async fn status_incremental(
-        &self,
-        pairs: &[(Host, String)],
-    ) -> tokio::sync::mpsc::Receiver<(usize, Value)> {
-        const MAX_IN_FLIGHT: usize = 4;
-        let limit = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
-        let (sender, receiver) = tokio::sync::mpsc::channel(pairs.len().max(1));
-        for (index, (host, job_id)) in pairs.iter().enumerate() {
-            let runner = self.runner.clone();
-            let host = host.clone();
-            let job_id = job_id.clone();
-            let permit = limit.clone();
-            let sender = sender.clone();
-            tokio::spawn(async move {
-                let _permit = permit.acquire_owned().await;
-                let jobs = Jobs { runner };
-                let row = match jobs.status(&host, &job_id).await {
-                    Ok(value) => value,
-                    Err(error) => json!({"host": host.name, "job_id": job_id,
-                                         "ok": false, "error": error.message()}),
-                };
-                let _ = sender.send((index, row)).await;
-            });
-        }
-        drop(sender);
-        receiver
-    }
-
     pub async fn logs(
         &self,
         host: &Host,
@@ -628,61 +673,22 @@ echo \"status_before=$status_before\""
     ) -> (Vec<Value>, bool) {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
-        // Rows are recorded the moment they arrive, so a host that answered in the current
-        // round keeps its verdict even if another host never answers.
-        let mut last: std::collections::HashMap<(String, String), Value> =
-            std::collections::HashMap::new();
-        // Targets that reached a terminal state are not probed again.
-        let mut pending: Vec<(Host, String)> = pairs.to_vec();
-        loop {
-            if pending.is_empty() {
-                return (collect_rows(pairs, &last, false), true);
-            }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return (collect_rows(pairs, &last, true), false);
-            }
-            let mut stream = self.status_incremental(&pending).await;
-            let scan_deadline = tokio::time::Instant::now() + remaining;
-            let mut answered: Vec<(String, String, bool)> = Vec::new();
-            loop {
-                match tokio::time::timeout_at(scan_deadline, stream.recv()).await {
-                    Ok(Some((_, row))) => {
-                        let key = (
-                            row.get("host")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            row.get("job_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                        );
-                        let terminal = is_terminal_status(&row);
-                        answered.push((key.0.clone(), key.1.clone(), terminal));
-                        last.insert(key, row);
-                    }
-                    // Every answer of this round arrived.
-                    Ok(None) => break,
-                    // Out of budget: keep what was already recorded, flag the rest.
-                    Err(_) => return (collect_rows(pairs, &last, true), false),
-                }
-            }
-            pending.retain(|(host, job_id)| {
-                !answered
-                    .iter()
-                    .any(|(name, id, terminal)| *terminal && name == &host.name && id == job_id)
-            });
-            if pending.is_empty() {
-                return (collect_rows(pairs, &last, false), true);
-            }
-            let sleep = std::time::Duration::from_secs_f64(interval.max(0.1));
-            let sleep = sleep.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-            if sleep.is_zero() {
-                return (collect_rows(pairs, &last, true), false);
-            }
-            tokio::time::sleep(sleep).await;
-        }
+        self.wait_until(pairs, deadline, interval).await
+    }
+
+    pub(crate) async fn wait_until(
+        &self,
+        pairs: &[(Host, String)],
+        deadline: tokio::time::Instant,
+        interval: f64,
+    ) -> (Vec<Value>, bool) {
+        watch_pairs(
+            pairs,
+            deadline,
+            std::time::Duration::from_secs_f64(interval.max(0.1)),
+            |host, id| async move { self.status(&host, &id).await },
+        )
+        .await
     }
 
     pub async fn cancel_many(&self, pairs: &[(Host, String)]) -> Vec<Value> {
@@ -899,6 +905,141 @@ mod tests {
         assert_eq!(derive_launch_state(true, &meta), LaunchState::Acknowledged);
     }
 
+    #[tokio::test]
+    async fn wait_deadline_keeps_known_rows_and_never_starts_queued_jobs_later() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{Duration, Instant};
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let probes = observations.clone();
+        let names = [
+            "done", "failed", "slow-1", "done", "slow-2", "slow-3", "slow-4", "queued",
+        ];
+        let pairs: Vec<_> = names
+            .iter()
+            .map(|name| {
+                (
+                    Host {
+                        name: name.to_string(),
+                        ..Host::default()
+                    },
+                    "aaaa1111".to_string(),
+                )
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_millis(70);
+        let (rows, finished) = watch_pairs(&pairs, deadline, Duration::from_millis(1), move |host, id| {
+            let probes = probes.clone();
+            async move {
+                probes.lock().unwrap().push((host.name.clone(), Instant::now()));
+                match host.name.as_str() {
+                    "done" => Ok(json!({"host":host.name,"job_id":id,"ok":true,"status":"done","exit_code":"0"})),
+                    "failed" => Ok(json!({"host":host.name,"job_id":id,"ok":true,"status":"failed","exit_code":"5"})),
+                    _ => std::future::pending().await,
+                }
+            }
+        }).await;
+        assert!(!finished);
+        assert_eq!(rows.len(), pairs.len());
+        assert_eq!(rows[1]["exit_code"], "5");
+        assert_eq!(rows[0], rows[3]);
+        assert_eq!(rows[2]["status"], "unknown");
+        assert_eq!(rows[7]["watch_timeout"], true);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|(host, _)| host == "done")
+                .count(),
+            1
+        );
+        assert!(observations
+            .iter()
+            .all(|(host, time)| host != "queued" && *time < deadline));
+    }
+
+    #[tokio::test]
+    async fn wait_does_not_merge_distinct_assets_with_the_same_display_name() {
+        let pair = |asset_id: &str| {
+            (
+                Host {
+                    name: "same-name".into(),
+                    asset_id: Some(asset_id.into()),
+                    ..Host::default()
+                },
+                "aaaa1111".to_string(),
+            )
+        };
+        let pairs = [pair("asset-a"), pair("asset-b"), pair("asset-a")];
+        let (rows, complete) = watch_pairs(
+            &pairs,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(2),
+            |host, id| async move {
+                let code = if host.asset_id.as_deref() == Some("asset-a") {
+                    "0"
+                } else {
+                    "5"
+                };
+                Ok(json!({"host":host.name,"job_id":id,"status":"done","exit_code":code}))
+            },
+        )
+        .await;
+        assert!(complete);
+        assert_eq!(rows[0]["exit_code"], "0");
+        assert_eq!(rows[1]["exit_code"], "5");
+        assert_eq!(rows[2], rows[0]);
+    }
+
+    #[tokio::test]
+    async fn wait_repolls_only_nonterminal_jobs() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{Duration, Instant};
+        let counters = Arc::new(Mutex::new(std::collections::HashMap::<String, u32>::new()));
+        let observed = counters.clone();
+        let pairs = [
+            (
+                Host {
+                    name: "once".into(),
+                    ..Host::default()
+                },
+                "aaaa1111".to_string(),
+            ),
+            (
+                Host {
+                    name: "changes".into(),
+                    ..Host::default()
+                },
+                "bbbb2222".to_string(),
+            ),
+        ];
+        let (rows, finished) = watch_pairs(
+            &pairs,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(2),
+            move |host, id| {
+                let observed = observed.clone();
+                async move {
+                    let mut observed = observed.lock().unwrap();
+                    let count = observed.entry(host.name.clone()).or_default();
+                    *count += 1;
+                    let state = if host.name == "once" || *count == 2 {
+                        "done"
+                    } else {
+                        "running"
+                    };
+                    Ok(json!({"host":host.name,"job_id":id,"status":state}))
+                }
+            },
+        )
+        .await;
+        assert!(finished);
+        assert_eq!(rows[1]["status"], "done");
+        let counters = counters.lock().unwrap();
+        assert_eq!(counters["once"], 1);
+        assert_eq!(counters["changes"], 2);
+    }
+
     #[test]
     fn wait_rows_keep_known_statuses_and_flag_only_the_unwatched_ones() {
         let pairs = vec![
@@ -907,7 +1048,7 @@ mod tests {
         ];
         let mut last = std::collections::HashMap::new();
         last.insert(
-            ("asset-1".to_string(), "aaaa1111".to_string()),
+            pair_key(&pairs[0].0, &pairs[0].1),
             json!({"host": "asset-1", "job_id": "aaaa1111", "status": "done", "exit_code": "0"}),
         );
         // A host that already answered keeps its verdict...

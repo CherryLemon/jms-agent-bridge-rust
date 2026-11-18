@@ -1,4 +1,4 @@
-//! The single compact MCP surface: seven tools over one resident runtime.
+//! The single compact MCP surface: compact tools over one resident runtime.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ pub struct ToolCatalog {
 impl ToolCatalog {
     pub fn build() -> Self {
         // Every full specification is built once: `dispatch` needs exactly one of them,
-        // and rebuilding all seven on each call was pure overhead.
+        // and rebuilding all tools on each call was pure overhead.
         let specs: Arc<HashMap<String, Arc<schemas::ToolSpec>>> = Arc::new(
             schemas::full_specs()
                 .into_iter()
@@ -130,6 +130,7 @@ impl BridgeServer {
         )?;
         let value = match name {
             "run" => self.runtime.tool_run(flat.clone()).await?,
+            "job" => self.runtime.tool_job(flat.clone()).await?,
             "fs" => self.runtime.tool_fs(flat.clone()).await?,
             "terminal" => {
                 let action = flat
@@ -247,6 +248,7 @@ pub fn compact_tools() -> Vec<&'static str> {
         "run",
         "fs",
         "terminal",
+        "job",
         "read_result",
         "discover",
         "call",
@@ -275,8 +277,8 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "the catalog must be built once, not per request"
         );
-        assert_eq!(first.tools.len(), 7);
-        assert_eq!(first.specs.len(), 7);
+        assert_eq!(first.tools.len(), 8);
+        assert_eq!(first.specs.len(), 8);
         // Every advertised tool has a validation spec under the same name.
         for tool in first.tools.iter() {
             assert!(

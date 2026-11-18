@@ -31,7 +31,7 @@ pub fn version() -> &'static str {
 
 /// The instruction line every MCP client sees once.
 pub const INSTRUCTIONS: &str =
-    "JumpServer: run, fs, terminal, read_result, discover, call, meta.\n\
+    "JumpServer: run, fs, terminal, job, read_result, discover, call, meta.\n\
 Repeated host/container work: prefer terminal; reuse its handle.\n\
 Use REST-authorized targets. Compact responses omit routine metadata; detail=full restores it.\n\
 After a lost reply, query request_status with the original request_id; never blindly replay\n\
