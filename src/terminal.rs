@@ -517,23 +517,6 @@ completion is unknown"
     }
 }
 
-/// Drop a binding's command slot, but only when it still holds this exact command.
-///
-/// Used when admission has to be rolled back (registry save failed): a newer command
-/// that replaced ours must never be cleared.
-fn clear_command(
-    slot: &mut Option<Arc<AsyncMutex<Command>>>,
-    expected: &Arc<AsyncMutex<Command>>,
-) -> bool {
-    match slot {
-        Some(current) if Arc::ptr_eq(current, expected) => {
-            *slot = None;
-            true
-        }
-        _ => false,
-    }
-}
-
 /// Check readiness and commit to sending under the command lock. If close
 /// won or the shell was already lost, nothing can reach the remote side.
 fn try_take_over(guard: &mut Command, shell_lost: bool, store: &ResultStore) -> bool {
@@ -653,6 +636,28 @@ struct Binding {
     shell: Arc<TerminalShell>,
     command: Option<Arc<AsyncMutex<Command>>>,
     closed: bool,
+}
+
+impl Binding {
+    async fn check_exec_admission(&self) -> BridgeResult<()> {
+        let busy = match &self.command {
+            Some(current) => current.lock().await.is_busy(),
+            None => false,
+        };
+        // A worker can mark the shell lost while admission waits for its command
+        // lock. Check liveness after observing whether that command ended.
+        if self.closed || self.shell.is_closing() {
+            return Err(BridgeError::invalid(
+                "terminal shell was closed/lost; open a new session explicitly",
+            ));
+        }
+        if busy {
+            return Err(BridgeError::invalid(
+                "terminal is busy; read/write its active command first",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub struct Interactive {
@@ -961,18 +966,7 @@ impl Interactive {
         let (host, command, result_id) = {
             let mut binding_guard = binding.lock().await;
             self.permitted(&binding_guard).await?;
-            if binding_guard.closed || binding_guard.shell.is_closing() {
-                return Err(BridgeError::invalid(
-                    "terminal shell was closed/lost; open a new session explicitly",
-                ));
-            }
-            if let Some(current) = &binding_guard.command {
-                if current.lock().await.is_busy() {
-                    return Err(BridgeError::invalid(
-                        "terminal is busy; read/write its active command first",
-                    ));
-                }
-            }
+            binding_guard.check_exec_admission().await?;
             let host = binding_guard.host.clone();
             let mut metadata = Map::new();
             metadata.insert("kind".into(), Value::from("terminal"));
@@ -1012,41 +1006,8 @@ impl Interactive {
             binding_guard.command = Some(command.clone());
             (host, command, result_id)
         };
-        if let Some(progress) = progress {
-            // The command is sent right after this point; without the mapping a crash
-            // would leave a result nobody can address.
-            if let Err(error) = progress.record(
-                "execution_results",
-                json!({"host": host.name, "result_id": result_id}),
-            ) {
-                let _ = self.store.fail_before_send(
-                    &result_id,
-                    &format!(
-                        "request progress could not be persisted: {}",
-                        error.message()
-                    ),
-                );
-                let mut guard = command.lock().await;
-                guard.state = CmdState::NotStarted;
-                guard.error = Some(error.message());
-                return Err(error);
-            }
-        }
-        if let Err(error) = self.save().await {
-            // The command is installed but no worker exists yet: without this rollback the
-            // terminal would report "busy" forever and the result would stay active.
-            let mut guard = command.lock().await;
-            guard.state = CmdState::NotStarted;
-            guard.error = Some(error.message());
-            drop(guard);
-            let _ = self.store.fail_before_send(
-                &result_id,
-                &format!("terminal registry could not be saved: {}", error.message()),
-            );
-            let mut binding_guard = binding.lock().await;
-            clear_command(&mut binding_guard.command, &command);
-            return Err(error);
-        }
+        self.persist_admission(&host, &result_id, &command, progress)
+            .await?;
         // The worker owns the shell for the duration of the command; the caller only
         // polls its files, so an MCP disconnect cannot cancel accepted work.
         let runner = self.runner.clone();
@@ -1081,6 +1042,56 @@ impl Interactive {
         // Bound to our own command: reading "the session's current command" could return
         // a newer command's result id if ours finished in the meantime.
         read_command_state(&self.store, session, &command, wait, max_bytes, cursor).await
+    }
+
+    async fn persist_admission(
+        &self,
+        host: &Host,
+        result_id: &str,
+        command: &Arc<AsyncMutex<Command>>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
+    ) -> BridgeResult<()> {
+        // No worker is started until both mappings exist; without them a crash
+        // could leave a result nobody can address.
+        if let Some(progress) = progress {
+            if let Err(error) = progress.record(
+                "execution_results",
+                json!({"host": host.name, "result_id": result_id}),
+            ) {
+                self.reject_admission(command, "request progress could not be persisted", &error)
+                    .await;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.save().await {
+            self.reject_admission(command, "terminal registry could not be saved", &error)
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn reject_admission(
+        &self,
+        command: &Arc<AsyncMutex<Command>>,
+        reason: &str,
+        error: &BridgeError,
+    ) {
+        let mut guard = command.lock().await;
+        if guard.state != CmdState::Queued {
+            // An explicit close that published first keeps its verdict.
+            return;
+        }
+        guard.state = CmdState::NotStarted;
+        guard.error = Some(format!("{reason}: {}", error.message()));
+        guard
+            .rejection
+            .insert("failure_stage".into(), json!("sender"));
+        // Keep the failed command attached until a successful admission replaces it.
+        // The command lock serializes publication with readers and that replacement.
+        if let Err(persist_error) = guard.persist_verdict(&self.store, None) {
+            tracing::warn!(result_id = %guard.result_id, %persist_error, "could not save terminal admission failure");
+        }
     }
 
     pub async fn read(
@@ -1368,6 +1379,11 @@ impl Interactive {
         };
         {
             let guard = command.lock().await;
+            if shell.is_closing() {
+                return Err(BridgeError::invalid(
+                    "terminal shell was closed/lost; open a new session explicitly",
+                ));
+            }
             if !guard.is_busy() || guard.state != CmdState::Running {
                 return Err(BridgeError::invalid(
                     "write needs an active foreground command; use exec for shell commands",
@@ -1404,9 +1420,10 @@ impl Interactive {
         let (shell, command) = {
             let mut guard = binding.lock().await;
             guard.closed = true;
+            guard.shell.mark_lost();
             (guard.shell.clone(), guard.command.clone())
         };
-        if let Some(command) = command {
+        let verdict = if let Some(command) = command {
             let mut guard = command.lock().await;
             if let Some(task) = guard.task.take() {
                 if !task.is_finished() {
@@ -1424,10 +1441,16 @@ impl Interactive {
                 guard
                     .rejection
                     .insert("failure_stage".into(), json!(failure_stage));
-                guard.persist_verdict(&self.store, None)?;
+                guard.persist_verdict(&self.store, None)
+            } else {
+                Ok(())
             }
-        }
+        } else {
+            Ok(())
+        };
+        // Closing the old channel must still happen if the result store is down.
         shell.close().await;
+        verdict?;
         self.bindings.lock().await.remove(session);
         self.save().await?;
         Ok(json!({"ok": true, "session": session, "state": "closed"}))
@@ -1528,21 +1551,16 @@ async fn run_terminal_command(
             guard.started.clone(),
         )
     };
-    // The write itself happens outside the lock: a channel that stops consuming must not
-    // keep `close` from taking the lock and aborting this task.
-    let send_error =
-        match tokio::time::timeout(Duration::from_secs(120), shell.send_packet(&plan.packet)).await
-        {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(format!(
-                "the command could not be written completely: {}",
-                error.message()
-            )),
-            Err(_) => Some("writing the command to the terminal timed out".to_string()),
-        };
-    if let Some(error) = send_error {
-        let mut guard = command.lock().await;
-        persist_incomplete_send(&mut guard, &store, error, Some(&timings))?;
+    if !send_terminal_packet(
+        &shell,
+        &command,
+        &store,
+        &plan.packet,
+        Duration::from_secs(120),
+        &timings,
+    )
+    .await?
+    {
         return Ok(());
     }
     let out_path = store.path(&result_id, "stdout")?;
@@ -1620,22 +1638,44 @@ fn persist_queue_rejection(
     guard.persist_verdict(store, Some(timings))
 }
 
-/// A partial write is not a START marker, and never overrides a caller close.
-fn persist_incomplete_send(
-    guard: &mut Command,
+async fn send_terminal_packet(
+    shell: &TerminalShell,
+    command: &AsyncMutex<Command>,
     store: &ResultStore,
-    error: String,
-    timings: Option<&Timings>,
-) -> BridgeResult<()> {
-    if guard.state == CmdState::Running {
-        guard.state = CmdState::Unknown;
-        guard.error = Some(error);
-        guard
-            .rejection
-            .insert("failure_stage".into(), json!("channel"));
-        guard.persist_verdict(store, timings)?;
-    }
-    Ok(())
+    packet: &[u8],
+    timeout: Duration,
+    timings: &Timings,
+) -> BridgeResult<bool> {
+    // Do not hold the command lock across the write; caller close may abort it.
+    let error = match tokio::time::timeout(timeout, shell.send_packet(packet)).await {
+        Ok(Ok(())) => return Ok(true),
+        Ok(Err(error)) => format!(
+            "the command could not be written completely: {}",
+            error.message()
+        ),
+        Err(_) => "writing the command to the terminal timed out".to_string(),
+    };
+    // A prefix may be buffered in the remote parser. Never admit another command to
+    // this shell once the current command can be observed as no longer busy.
+    shell.mark_lost();
+    let persisted = {
+        let mut guard = command.lock().await;
+        if guard.state == CmdState::Running {
+            // An incomplete write is not START evidence. Caller close, if it won,
+            // still owns the verdict.
+            guard.state = CmdState::Unknown;
+            guard.error = Some(error);
+            guard
+                .rejection
+                .insert("failure_stage".into(), json!("channel"));
+            guard.persist_verdict(store, Some(timings))
+        } else {
+            Ok(())
+        }
+    };
+    // Close even if recording the verdict fails. The binding remains readable.
+    shell.close().await;
+    persisted.map(|()| false)
 }
 
 /// Evidence copied from a finished terminal command into fan-out style rows.
@@ -1646,6 +1686,67 @@ pub fn command_rejection(meta: &Map<String, Value>) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn terminal_with_stalled_writer(
+        directory: &std::path::Path,
+        prefix_len: usize,
+    ) -> (Interactive, Host, mpsc::Receiver<Option<Bytes>>) {
+        use crate::config::{BastionConfig, BridgeSettings};
+        use sha2::{Digest, Sha256};
+
+        let settings = Arc::new(BridgeSettings {
+            state_dir: directory.to_path_buf(),
+            ..BridgeSettings::default()
+        });
+        let cfg = Arc::new(BastionConfig::default());
+        let mut identity_parts = cfg.credential_identity();
+        identity_parts.push(settings.preferred_account.clone());
+        atomic_json(
+            &directory.join("assets.json"),
+            &json!({
+                "identity": hex::encode(Sha256::digest(serde_json::to_vec(&identity_parts).unwrap())),
+                "refreshed_at": crate::storage::results::now(),
+                "assets": [{
+                    "id":"11111111-1111-1111-1111-111111111111", "name":"test-host",
+                    "active":true, "protocols":["ssh"], "login":"test", "account":"test"
+                }],
+            }),
+        )
+        .unwrap();
+        let store = Arc::new(ResultStore::new(directory.join("results"), 3600.0, 3600.0).unwrap());
+        let catalog = AssetCatalog::new(cfg.clone(), settings.clone()).unwrap();
+        let runner = Runner::new(cfg, settings, store.clone()).unwrap();
+        let host = catalog.inventory().hosts.pop().unwrap();
+        let protection = Arc::new(runner.protect_terminal(&host.connection_key().unwrap()));
+        let (frames, writer) = ChannelWriter::mock_stalled(prefix_len);
+        let stream = || StreamSource {
+            receiver: mpsc::channel(1).1,
+            buffer: Vec::new(),
+            closed: false,
+        };
+        let shell = Arc::new(TerminalShell {
+            writer,
+            streams: AsyncMutex::new(Streams {
+                out: stream(),
+                err: stream(),
+            }),
+            lost: Arc::new(AtomicBool::new(false)),
+            protection,
+            demux: Mutex::new(None),
+        });
+        let interactive = Interactive::new(catalog, runner, store);
+        interactive.bindings.lock().await.insert(
+            "s".into(),
+            Arc::new(AsyncMutex::new(Binding {
+                session: "s".into(),
+                host: host.clone(),
+                shell,
+                command: None,
+                closed: false,
+            })),
+        );
+        (interactive, host, frames)
+    }
 
     fn test_command(store: &ResultStore, kind: &str, session: &str, bytes: &[u8]) -> String {
         let id = store
@@ -1998,34 +2099,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_send_evidence_matches_live_archived_and_restarted_reads() {
+    async fn stalled_partial_send_closes_the_channel_without_replacing_its_result() {
         let dir = tempfile::tempdir().unwrap();
-        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
-        let id = test_command(&store, "terminal", "s", b"");
+        let (interactive, _, mut frames) = terminal_with_stalled_writer(dir.path(), 6).await;
+        let store = &interactive.store;
+        let id = test_command(store, "terminal", "s", b"");
         let command = Arc::new(AsyncMutex::new(Command::new(id.clone())));
+        let binding = interactive.binding("s").await.unwrap();
+        let shell = {
+            let mut binding = binding.lock().await;
+            binding.command = Some(command.clone());
+            binding.shell.clone()
+        };
+        interactive.save().await.unwrap();
         {
             let mut guard = command.lock().await;
-            assert!(try_take_over(&mut guard, false, &store));
-            persist_incomplete_send(&mut guard, &store, "partial write".into(), None).unwrap();
-            assert!(!guard.is_busy());
-            assert_eq!(store.metadata(&id).unwrap()["execution_state"], "unknown");
+            assert!(try_take_over(&mut guard, shell.is_closing(), store));
         }
-        let live = read_command_state(&store, "s", &command, ReadWait::Output(0), 4096, None)
+        let plan = CommandPlan::new(":");
+        let timings = Timings::default();
+        let mut sending = Box::pin(send_terminal_packet(
+            &shell,
+            &command,
+            store,
+            &plan.packet,
+            Duration::from_millis(50),
+            &timings,
+        ));
+        assert!(futures::poll!(sending.as_mut()).is_pending());
+        assert_eq!(frames.try_recv().unwrap().unwrap(), &b"printf"[..]);
+        assert!(
+            !shell.is_closing(),
+            "a stall does not itself flag the writer closed"
+        );
+        let mut reader = Box::pin(interactive.read("s", 30_000, 4096, None));
+        assert!(futures::poll!(reader.as_mut()).is_pending());
+        assert!(!sending.await.unwrap());
+        assert_eq!(frames.try_recv().unwrap(), None, "old channel was closed");
+        let live = tokio::time::timeout(Duration::from_secs(1), reader)
             .await
+            .unwrap()
             .unwrap();
+        assert_eq!(live["result_id"], id);
+        assert_eq!(live["state"], "unknown");
         assert_eq!(live["executed"], Value::Null);
         assert_eq!(live["completion_unknown"], true);
-        assert_eq!(live["error"], "partial write");
-        let mut current = Some(command.clone());
-        assert!(clear_command(&mut current, &command));
-        let next_id = test_command(&store, "terminal", "s", b"command B");
-        current = Some(Arc::new(AsyncMutex::new(Command::new(next_id))));
-        assert_ne!(current.unwrap().lock().await.result_id, id);
-        let archived = read_saved_terminal_result(&store, "s", &id, 4096, None).unwrap();
-        drop(store);
-        let restarted = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        assert_eq!(
+            live["error"],
+            "writing the command to the terminal timed out"
+        );
+        let refusal = interactive
+            .execute("s", ":", false, 0, 4096, None, None)
+            .await
+            .unwrap_err();
+        assert!(refusal.message().contains("closed/lost"));
+        assert_eq!(interactive.sessions().await["sessions"][0]["state"], "lost");
+        assert_eq!(
+            interactive.read("s", 0, 4096, None).await.unwrap()["result_id"],
+            id
+        );
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let archived = read_saved_terminal_result(store, "s", &id, 4096, None).unwrap();
+        let restarted = ResultStore::new(store.root.clone(), 3600.0, 3600.0).unwrap();
         let replay = read_saved_terminal_result(&restarted, "s", &id, 4096, None).unwrap();
         for key in [
+            "result_id",
             "state",
             "executed",
             "completion_unknown",
@@ -2034,6 +2175,105 @@ mod tests {
         ] {
             assert_eq!(live[key], archived[key], "{key}");
             assert_eq!(archived[key], replay[key], "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_checks_liveness_after_waiting_on_the_current_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let (interactive, _, _frames) = terminal_with_stalled_writer(dir.path(), 1).await;
+        let binding = interactive.binding("s").await.unwrap();
+        let mut binding = binding.lock().await;
+        let command = Arc::new(AsyncMutex::new(Command::new("a".into())));
+        binding.command = Some(command.clone());
+        let mut guard = command.lock().await;
+        guard.state = CmdState::Running;
+        let mut admission = Box::pin(binding.check_exec_admission());
+        assert!(futures::poll!(admission.as_mut()).is_pending());
+        binding.shell.mark_lost();
+        guard.state = CmdState::Unknown;
+        drop(guard);
+        assert!(admission
+            .await
+            .unwrap_err()
+            .message()
+            .contains("closed/lost"));
+    }
+
+    struct FailingProgress;
+
+    impl crate::storage::journal::ProgressSink for FailingProgress {
+        fn record(&self, field: &str, value: Value) -> BridgeResult<()> {
+            assert_eq!(field, "execution_results");
+            assert!(value.get("result_id").and_then(Value::as_str).is_some());
+            Err(BridgeError::storage("test receipt write failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_failures_wake_readers_and_archive_the_same_unsent_verdict() {
+        for (progress, phrase) in [
+            (None, "terminal registry could not be saved"),
+            (
+                Some(&FailingProgress as &dyn crate::storage::journal::ProgressSink),
+                "request progress could not be persisted",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (interactive, host, mut frames) = terminal_with_stalled_writer(dir.path(), 1).await;
+            let id = test_command(&interactive.store, "terminal", "s", b"");
+            let command = Arc::new(AsyncMutex::new(Command::new(id.clone())));
+            interactive.binding("s").await.unwrap().lock().await.command = Some(command.clone());
+            if progress.is_none() {
+                std::fs::create_dir(&interactive.registry).unwrap();
+            }
+            let mut reader = Box::pin(interactive.read("s", 30_000, 4096, None));
+            assert!(futures::poll!(reader.as_mut()).is_pending());
+            assert!(interactive
+                .persist_admission(&host, &id, &command, progress)
+                .await
+                .is_err());
+            let live = tokio::time::timeout(Duration::from_secs(1), reader)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(live["result_id"], id);
+            assert_eq!(live["state"], "not_started");
+            assert_eq!(live["executed"], false);
+            assert_eq!(live["completion_unknown"], false);
+            assert_eq!(live["failure_stage"], "sender");
+            assert!(live["error"].as_str().unwrap().starts_with(phrase));
+            assert_eq!(
+                interactive.store.metadata(&id).unwrap()["status"],
+                "complete"
+            );
+
+            // The terminal can accept a later command, without losing the first failure.
+            assert!(interactive
+                .execute("s", ":", false, 0, 4096, None, Some(&FailingProgress))
+                .await
+                .is_err());
+            assert_ne!(
+                interactive.read("s", 0, 4096, None).await.unwrap()["result_id"],
+                id
+            );
+            let archived = interactive
+                .read_result("s", &id, 0, 4096, None)
+                .await
+                .unwrap();
+            for key in [
+                "state",
+                "executed",
+                "completion_unknown",
+                "failure_stage",
+                "error",
+            ] {
+                assert_eq!(live[key], archived[key], "{key}");
+            }
+            assert!(matches!(
+                frames.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
         }
     }
 
@@ -2086,21 +2326,6 @@ mod tests {
         assert_eq!(archived["reason"], "queue_full");
         assert_eq!(archived["retryable"], true);
         assert_eq!(archived["queue_timed_out"], false);
-    }
-
-    #[test]
-    fn rolling_back_admission_only_clears_its_own_command() {
-        let mine = Arc::new(AsyncMutex::new(Command::new("mine".to_string())));
-        let other = Arc::new(AsyncMutex::new(Command::new("other".to_string())));
-        let mut slot = Some(mine.clone());
-        assert!(
-            !clear_command(&mut slot, &other),
-            "a different command is untouched"
-        );
-        assert!(slot.is_some());
-        assert!(clear_command(&mut slot, &mine));
-        assert!(slot.is_none());
-        assert!(!clear_command(&mut slot, &mine));
     }
 
     #[tokio::test]

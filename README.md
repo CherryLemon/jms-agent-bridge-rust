@@ -137,6 +137,9 @@ For a command's saved output, call
 new command owns the terminal or the server has restarted. Use the returned
 cursor for subsequent pages; explicit cursors do not move the implicit session
 cursor. Omit the result ID to read the session's current command as before.
+If sending a command fails or times out, that shell is marked lost and cannot
+accept another command. Keep the result ID to reconcile the uncertain outcome;
+open a new terminal explicitly rather than replaying the command automatically.
 
 Advanced fields live in an `options` object so the advertised schema stays small;
 `discover(operation="run"|"fs"|"terminal")` returns the complete schema, and
