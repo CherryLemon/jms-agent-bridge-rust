@@ -258,14 +258,19 @@ fn connection_protected(
     protections.get(key).copied().unwrap_or(0) > 0
 }
 
-/// Keeps an interactive terminal counted as a protection until it is dropped.
+/// Protects a live terminal until its shell is lost/closed or the guard is dropped.
 pub struct TerminalProtection {
     registry: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     key: String,
+    released: AtomicBool,
 }
 
-impl Drop for TerminalProtection {
-    fn drop(&mut self) {
+impl TerminalProtection {
+    /// Release a dead shell without discarding its durable session/result record.
+    pub fn release(&self) {
+        if self.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let mut protections = self.registry.lock().expect("terminal protection lock");
         if let Some(count) = protections.get_mut(&self.key) {
             *count = count.saturating_sub(1);
@@ -273,6 +278,12 @@ impl Drop for TerminalProtection {
                 protections.remove(&self.key);
             }
         }
+    }
+}
+
+impl Drop for TerminalProtection {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -426,6 +437,7 @@ impl Runner {
         TerminalProtection {
             registry: self.terminal_protections.clone(),
             key: key.to_string(),
+            released: AtomicBool::new(false),
         }
     }
 
@@ -1957,6 +1969,7 @@ mod tests {
             TerminalProtection {
                 registry: terminals.clone(),
                 key: "key-1".to_string(),
+                released: AtomicBool::new(false),
             }
         };
         assert!(connection_protected(&shells, &terminals, "key-1"));
@@ -1965,6 +1978,85 @@ mod tests {
 
         drop(guard);
         assert!(!connection_protected(&shells, &terminals, "key-1"));
+    }
+
+    #[test]
+    fn a_lost_terminal_releases_only_its_own_protection_once() {
+        let shells = Arc::new(AsyncMutex::new(HashMap::new()));
+        let registry = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            "key".to_string(),
+            2usize,
+        )])));
+        let lost = TerminalProtection {
+            registry: registry.clone(),
+            key: "key".to_string(),
+            released: AtomicBool::new(false),
+        };
+        let live = TerminalProtection {
+            registry: registry.clone(),
+            key: "key".to_string(),
+            released: AtomicBool::new(false),
+        };
+        lost.release();
+        lost.release();
+        assert_eq!(registry.lock().unwrap()["key"], 1);
+        assert!(connection_protected(&shells, &registry, "key"));
+        drop(lost);
+        assert_eq!(registry.lock().unwrap()["key"], 1);
+        live.release();
+        // A retained lost session record must not block a new connection.
+        assert!(!connection_protected(&shells, &registry, "key"));
+        drop(live);
+        assert!(registry.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lost_terminal_record_does_not_pin_recovery_but_inflight_command_does() {
+        let shells = Arc::new(AsyncMutex::new(HashMap::new()));
+        let registry = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            "key".to_string(),
+            1usize,
+        )])));
+        let protection = TerminalProtection {
+            registry: registry.clone(),
+            key: "key".to_string(),
+            released: AtomicBool::new(false),
+        };
+        let recovery = ConnectionRecovery::new(0.0);
+        recovery.set_generation("key", 1);
+        let command = recovery.enter("key", 0.1).await.unwrap();
+        let replaced = Arc::new(AtomicBool::new(false));
+        let flag = replaced.clone();
+        let result = recovery
+            .request(
+                "key",
+                1,
+                Box::new(move || {
+                    Box::pin(async move {
+                        flag.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+                Arc::new(move || connection_protected(&shells, &registry, "key")),
+                false,
+                0.1,
+            )
+            .await;
+        assert_eq!(result["reason"], "persistent_shells");
+        protection.release();
+        recovery.notify("key");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!replaced.load(Ordering::SeqCst));
+        drop(command);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !replaced.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("retained lost record must not pin recovery");
+        // The retained protection object represents the retained session record.
+        drop(protection);
     }
 
     use super::*;

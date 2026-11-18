@@ -1290,7 +1290,7 @@ impl PageOptions {
         let wait_ms = arguments
             .get("wait_ms")
             .and_then(Value::as_u64)
-            .unwrap_or(1000)
+            .unwrap_or(crate::terminal::DEFAULT_TERMINAL_WAIT_MS)
             .min(30_000);
         let max_bytes = arguments
             .get("max_bytes")
@@ -1632,6 +1632,15 @@ fn meta_section_keys(section: &str) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_page_wait_defaults_to_fifteen_seconds() {
+        assert_eq!(PageOptions::from(&Map::new()).wait_ms, 15_000);
+        assert_eq!(
+            PageOptions::from(json!({"wait_ms": 0}).as_object().unwrap()).wait_ms,
+            0
+        );
+    }
 
     /// Everything the transfer snapshot emits must survive the projection.
     ///

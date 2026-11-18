@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+* Connection recovery no longer blocks execution while waiting for persistent
+  sessions. Only the drain/reconnect phase stops new work; in-flight terminal
+  commands retain connection protection until completion.
+* Lost terminals release connection protection without discarding session or
+  unknown-result records. Recovery never replays a command.
+* Terminal requests wait up to 15 seconds by default, returning earlier when
+  output or completion is available. Tool descriptions recommend reusing a
+  terminal for repeated work on one target.
+
 ## 0.4.5
 
 Patch for the two non-blocking findings of the release review.

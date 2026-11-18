@@ -55,7 +55,8 @@ pub fn full_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "run",
-            description: "Run literal Bash on REST targets; session_id retains shell state. Use \
+            description: "Repeated host/container work: prefer terminal. Run Bash on REST targets; \
+session_id retains shell state. Use \
 request_id for writes, then reconcile lost replies. queue_full is an unsent per-target refusal. \
 Full output is saved; read_result fetches it. Advanced fields may also be passed in options.",
             input_schema: json!({
@@ -155,8 +156,8 @@ Put advanced fields in options; discover(operation='jms_fs', query=action) lists
         ToolSpec {
             name: "terminal",
             description:
-                "Open a bound shell on one target; use its handle for exec/read/write/close. \
-Running is not completion; reads honour cursors. Discover terminal_<action> for advanced options.",
+                "Prefer for repeated host/container work. Bind target and optional container (omit for host); \
+reuse handle. Running is not completion; reads honour cursors.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -176,7 +177,7 @@ Running is not completion; reads honour cursors. Discover terminal_<action> for 
                             "docker_args": {"type": "array", "items": {"type": "string"}},
                             "cwd": string("open: directory for the bound shell."),
                             "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                            "wait_ms": integer(0, 30000, 1000, "How long to watch before returning."),
+                            "wait_ms": integer(0, 30000, crate::terminal::DEFAULT_TERMINAL_WAIT_MS, "Maximum wait; returns earlier on output or completion."),
                             "max_bytes": integer(1, 16384, 4096, "Output budget per stream."),
                             "cursor": {"type": "object", "additionalProperties": false,
                                        "properties": {"stdout": {"type": "integer", "minimum": 0},
@@ -451,7 +452,7 @@ original ID after reply loss; reusing it never replays.",
 fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
     let pages = || {
         json!({
-            "wait_ms": int(0, 30000, 1000),
+            "wait_ms": int(0, 30000, crate::terminal::DEFAULT_TERMINAL_WAIT_MS),
             "max_bytes": int(1, 16384, 4096),
             "cursor": {"type": "object", "additionalProperties": false,
                        "properties": {"stdout": {"type": "integer", "minimum": 0},
@@ -871,6 +872,17 @@ fn public_view(name: &str, schema: Value) -> Value {
 mod tests {
     use super::*;
     use crate::schema::validate;
+
+    #[test]
+    fn descriptions_steer_repeated_container_work_to_terminal() {
+        assert!(crate::INSTRUCTIONS.contains("prefer terminal"));
+        let tools = advertised();
+        let terminal = tools.iter().find(|tool| tool.name == "terminal").unwrap();
+        assert!(terminal.description.contains("Prefer for repeated"));
+        assert!(terminal.description.contains("omit for host"));
+        let run = tools.iter().find(|tool| tool.name == "run").unwrap();
+        assert!(run.description.contains("prefer terminal"));
+    }
 
     /// One valid and one invalid sample per advertised tool. A sample that fails
     /// validation must fail loudly: swallowing the error proves nothing.

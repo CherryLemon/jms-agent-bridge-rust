@@ -132,7 +132,7 @@ impl ConnectionRecovery {
             // One lock for "is this target idle?" and "reserve it": a replacement that
             // starts draining can no longer be overtaken by a new operation.
             let admitted = self.with_state(key, |state| {
-                if state.phase == Phase::Idle {
+                if matches!(state.phase, Phase::Idle | Phase::PendingSessions) {
                     state.active += 1;
                     true
                 } else {
@@ -266,28 +266,29 @@ impl ConnectionRecovery {
         replace: ReplaceFn,
         protected: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Value {
-        // Wait until no operation holds a lease and no persistent shell protects it.
+        // Pending sessions retain their connection and remain usable. Once no shell
+        // protects it, close admission under the SAME lock as enter(), then drain
+        // existing leases. An admitted opener may still publish a new protection;
+        // in that case return to PendingSessions rather than strand its shell.
         loop {
-            let (generation, _active, should_wait) = self.with_state(&key, |state| {
-                (
-                    state.generation,
-                    state.active,
-                    state.active > 0 || protected(),
-                )
-            });
-            if generation != expected {
-                return json!({"status": "already_replaced", "generation": generation});
+            if self.closing.load(Ordering::SeqCst) {
+                return json!({"status": "unavailable", "reason": "runner_closing"});
             }
-            if !should_wait {
-                break;
-            }
-            self.with_state(&key, |state| {
-                state.phase = if protected() {
+            let (generation, ready) = self.with_state(&key, |state| {
+                let protected = protected();
+                state.phase = if protected {
                     Phase::PendingSessions
                 } else {
                     Phase::Draining
                 };
+                (state.generation, !protected && state.active == 0)
             });
+            if generation != expected {
+                return json!({"status": "already_replaced", "generation": generation});
+            }
+            if ready {
+                break;
+            }
             self.changed.notify_waiters();
             // Recheck periodically: a shell can close without sending a notification.
             let _ = tokio::time::timeout(Duration::from_secs(1), self.changed.notified()).await;
@@ -488,5 +489,99 @@ mod tests {
             .await;
         assert_eq!(outcome["status"], "deferred");
         assert_eq!(outcome["reason"], "persistent_shells");
+    }
+    async fn wait_phase(recovery: &ConnectionRecovery, phase: Phase) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if recovery.with_state("k", |state| state.phase) == phase {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("recovery phase did not progress");
+    }
+
+    #[tokio::test]
+    async fn pending_sessions_admit_work_then_atomically_drain() {
+        let recovery = ConnectionRecovery::new(0.0);
+        recovery.set_generation("k", 1);
+        let protected = Arc::new(AtomicBool::new(true));
+        let check = protected.clone();
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        let outcome = recovery
+            .request(
+                "k",
+                1,
+                Box::new(move || {
+                    Box::pin(async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+                Arc::new(move || check.load(Ordering::SeqCst)),
+                false,
+                0.1,
+            )
+            .await;
+        assert_eq!(outcome["reason"], "persistent_shells");
+        let lease = recovery
+            .enter("k", 0.1)
+            .await
+            .expect("existing shells must remain usable");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        protected.store(false, Ordering::SeqCst);
+        recovery.notify("k");
+        wait_phase(&recovery, Phase::Draining).await;
+        assert!(recovery.enter("k", 0.01).await.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "active command must prevent replacement"
+        );
+        // Another target is unaffected.
+        assert!(recovery.enter("other", 0.01).await.is_ok());
+        drop(lease);
+        wait_phase(&recovery, Phase::Idle).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(recovery.enter("k", 0.1).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_admitted_opener_can_publish_protection_while_draining() {
+        let recovery = ConnectionRecovery::new(0.0);
+        recovery.set_generation("k", 1);
+        let opening = recovery.enter("k", 0.1).await.unwrap();
+        let protected = Arc::new(AtomicBool::new(false));
+        let check = protected.clone();
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        recovery
+            .request(
+                "k",
+                1,
+                Box::new(move || {
+                    Box::pin(async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }),
+                Arc::new(move || check.load(Ordering::SeqCst)),
+                false,
+                0.01,
+            )
+            .await;
+        wait_phase(&recovery, Phase::Draining).await;
+        protected.store(true, Ordering::SeqCst);
+        drop(opening);
+        wait_phase(&recovery, Phase::PendingSessions).await;
+        assert!(recovery.enter("k", 0.1).await.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        protected.store(false, Ordering::SeqCst);
+        recovery.notify("k");
+        wait_phase(&recovery, Phase::Idle).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
