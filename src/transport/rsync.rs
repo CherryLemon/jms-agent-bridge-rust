@@ -606,14 +606,19 @@ async fn wait_remote_exit(exit: &AtomicI32, done: &AtomicBool, budget: Duration)
     .await;
 }
 
-/// Success needs both processes to agree; a lost remote status is not success.
+/// A local exit alone does not prove that the remote transfer completed.
 fn with_remote_exit(mut local: TransferOutcome, remote: Option<i32>) -> TransferOutcome {
-    if local.completed && local.exit_code == 0 {
-        match remote {
-            Some(code) => local.exit_code = code,
-            None => {
+    if !local.completed {
+        return local;
+    }
+    match remote.filter(|_| local.sent) {
+        Some(code) if local.exit_code == 0 => local.exit_code = code,
+        Some(_) => {}
+        None => {
+            // Preserve the local diagnostic (e.g. 12 for a protocol error).
+            local.completed = false;
+            if local.exit_code == 0 {
                 local.exit_code = 255;
-                local.completed = false;
             }
         }
     }
@@ -1038,8 +1043,10 @@ pub async fn transfer(
     };
     // The relay's EOF is not the remote process's exit status. In particular a
     // newer sender may report a file error on stderr and exit 23 while the older
-    // local receiver exits 0. Drain the SSH exit status before closing the channel.
-    if matches!(happened, WaitEnd::Exited(0)) && sent.load(Ordering::SeqCst) {
+    // local receiver exits 0. A local error (e.g. 12 after EOF) also needs a remote
+    // exit to distinguish a confirmed failure from unknown remote completion.
+    // Drain the SSH exit status before closing the channel.
+    if matches!(happened, WaitEnd::Exited(_)) && sent.load(Ordering::SeqCst) {
         let remaining = Duration::from_secs_f64(timeout.max(0.5))
             .saturating_sub(wait_started.elapsed())
             .min(Duration::from_secs(5));
@@ -1060,7 +1067,10 @@ pub async fn transfer(
         local_outcome,
         (remote_code != i32::MIN).then_some(remote_code),
     );
-    if outcome.exit_code != 0 && matches!(happened, WaitEnd::Exited(0)) {
+    if matches!(happened, WaitEnd::Exited(_))
+        && ((outcome.sent && !outcome.completed)
+            || (outcome.exit_code != 0 && matches!(happened, WaitEnd::Exited(0))))
+    {
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -1068,11 +1078,13 @@ pub async fn transfer(
         {
             let _ = writeln!(
                 file,
-                "Remote rsync exit status: {}; transfer is not successful.",
-                if remote_code == i32::MIN {
-                    "unconfirmed".into()
+                "{}",
+                if !outcome.sent {
+                    "Remote rsync transfer did not start.".into()
+                } else if !outcome.completed {
+                    "Remote rsync exit status unconfirmed; inspect before rerunning.".into()
                 } else {
-                    remote_code.to_string()
+                    format!("Remote rsync exit status: {remote_code}; transfer is not successful.")
                 }
             );
         }
@@ -1548,6 +1560,10 @@ mod tests {
         wait_remote_exit(&exit, &done, Duration::from_millis(25)).await;
         assert!(started.elapsed() < Duration::from_millis(250));
         assert_eq!(exit.load(Ordering::SeqCst), i32::MIN);
+        let local_eof = outcome_of(&WaitEnd::Exited(12), true).unwrap();
+        let outcome = with_remote_exit(local_eof, None);
+        assert_eq!(outcome.exit_code, 12);
+        assert!(outcome.sent && !outcome.completed && !outcome.timed_out);
     }
 
     #[test]
@@ -1567,7 +1583,35 @@ mod tests {
         assert!(!unknown.completed);
         let mut failed_local = local();
         failed_local.exit_code = 12;
-        assert_eq!(with_remote_exit(failed_local, Some(0)).exit_code, 12);
+        let failed_local = with_remote_exit(failed_local, Some(0));
+        assert_eq!(failed_local.exit_code, 12);
+        assert!(failed_local.completed);
+    }
+
+    #[test]
+    fn local_error_preserves_exit_code_but_needs_remote_status_to_confirm_completion() {
+        for code in [12, 23] {
+            let from_local_exit = || outcome_of(&WaitEnd::Exited(code), true).unwrap();
+            let lost_exit = with_remote_exit(from_local_exit(), None);
+            assert_eq!(lost_exit.exit_code, code);
+            assert!(lost_exit.sent && !lost_exit.completed && !lost_exit.timed_out);
+
+            let failed = with_remote_exit(from_local_exit(), Some(23));
+            assert_eq!(failed.exit_code, code);
+            assert!(failed.sent && failed.completed && !failed.timed_out);
+        }
+    }
+
+    #[test]
+    fn local_exit_before_send_is_not_started_even_if_an_exit_code_is_available() {
+        for (local_code, reported_code) in [(0, 255), (12, 12)] {
+            for remote in [None, Some(0), Some(23)] {
+                let local = outcome_of(&WaitEnd::Exited(local_code), false).unwrap();
+                let outcome = with_remote_exit(local, remote);
+                assert_eq!(outcome.exit_code, reported_code);
+                assert!(!outcome.sent && !outcome.completed && !outcome.timed_out);
+            }
+        }
     }
 
     /// The idle ticker flags a quiet transfer and leaves a moving one alone.
