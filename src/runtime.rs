@@ -244,6 +244,7 @@ impl BridgeRuntime {
             queue_timeout: None,
             internal_session: false,
             startup_probe: false,
+            fs_deadline: None,
         };
         let hosts = self.resolve_many(&targets).await?;
         let mut set = tokio::task::JoinSet::new();

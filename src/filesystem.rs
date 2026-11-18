@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
@@ -351,16 +351,27 @@ impl FilesystemWorkers {
         container: Option<&str>,
         progress: Option<&dyn crate::storage::journal::ProgressSink>,
     ) -> BridgeResult<Map<String, Value>> {
+        let deadline = Instant::now() + Duration::from_secs_f64(timeout);
         let mut attempt_count = 0;
         let (mut result, annotations) = run_with_startup_recovery(
             || {
                 attempt_count += 1;
-                self.execute_once(host, script, timeout, container, progress)
+                self.execute_once(host, script, deadline, container, progress)
             },
             // execute_once has already retired the broken shell and released its lease.
             |meta| async move {
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f64();
+                if remaining == 0.0 {
+                    return Ok(json!({"status":"deferred","reason":"filesystem_deadline"}));
+                }
                 self.runner
-                    .recover_startup_connection(host, &meta, self.runner.queue_timeout)
+                    .recover_startup_connection(
+                        host,
+                        &meta,
+                        self.runner.queue_timeout.min(remaining),
+                    )
                     .await
             },
         )
@@ -388,7 +399,7 @@ impl FilesystemWorkers {
         self: &Arc<Self>,
         host: &Host,
         script: &str,
-        timeout: f64,
+        deadline: Instant,
         container: Option<&str>,
         progress: Option<&dyn crate::storage::journal::ProgressSink>,
     ) -> BridgeResult<Map<String, Value>> {
@@ -398,7 +409,15 @@ impl FilesystemWorkers {
             host.connection_key()?,
             container.unwrap_or("")
         );
-        let entry = self.acquire_entry(host, &key, container).await?;
+        let entry = if Instant::now() < deadline {
+            self.acquire_entry(host, &key, container).await?
+        } else {
+            None
+        };
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f64();
+        let fs_deadline = Some(deadline);
         match entry {
             None => {
                 *self.fallbacks.lock().await += 1;
@@ -406,6 +425,7 @@ impl FilesystemWorkers {
                 let spec = ExecSpec {
                     container: container.map(str::to_string),
                     startup_probe: true,
+                    fs_deadline,
                     ..Default::default()
                 };
                 self.runner
@@ -418,6 +438,7 @@ impl FilesystemWorkers {
                     container: container.map(str::to_string),
                     session_id: Some(session_id.clone()),
                     internal_session: true,
+                    fs_deadline,
                     ..Default::default()
                 };
                 let result = self
@@ -504,6 +525,27 @@ impl FilesystemWorkers {
         Ok(chosen)
     }
 
+    async fn retire_idle_on_target(&self, host: &Host) -> BridgeResult<()> {
+        let target = host.connection_key()?;
+        let retired = {
+            let mut entries = self.entries.lock().await;
+            let mut retired = Vec::new();
+            entries.retain(|entry| {
+                if !entry.busy && entry.host.connection_key().as_ref().ok() == Some(&target) {
+                    retired.push((entry.host.clone(), entry.session_id.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            retired
+        };
+        for (host, session_id) in retired {
+            self.runner.close_session(&host, &session_id, true).await?;
+        }
+        Ok(())
+    }
+
     pub async fn close(self: &Arc<Self>) -> BridgeResult<()> {
         self.closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -557,43 +599,12 @@ impl Filesystem {
             .map(|meta| meta.len())
     }
 
-    /// Establish the SSH transport before spawning either side of rsync. A download
-    /// also obtains its progress size hint without an extra channel. A subsequent
-    /// transfer failure is never replayed automatically, even if it occurs at setup.
-    async fn transfer_preflight(
-        &self,
-        host: &Host,
-        remote: Option<&str>,
-        container: Option<&str>,
-        timeout: f64,
-        progress: Option<&dyn crate::storage::journal::ProgressSink>,
-    ) -> BridgeResult<(Map<String, Value>, Option<u64>)> {
-        let script = remote
-            .map(|path| {
-                format!(
-                    "if [ -f {path} ]; then stat -c %s -- {path} 2>/dev/null; fi; true",
-                    path = crate::fsprobe::shlex_quote(path)
-                )
-            })
-            .unwrap_or_else(|| "true".into());
-        let meta = self
-            .workers
-            .execute(host, &script, timeout.min(15.0), container, progress)
-            .await?;
-        let size = remote.and_then(|_| {
-            let result_id = meta.get("result_id")?.as_str()?;
-            let path = self.store.path(result_id, "stdout").ok()?;
-            let text = std::fs::read_to_string(path).ok()?;
-            text.trim().parse::<u64>().ok().filter(|size| *size > 0)
-        });
-        Ok((meta, size))
-    }
-
     pub async fn execute(
         &self,
         arguments: Map<String, Value>,
         progress: Option<&dyn crate::storage::journal::ProgressSink>,
     ) -> BridgeResult<Value> {
+        let deadline_started = Instant::now();
         validate(&arguments)?;
         let target = arguments
             .get("target")
@@ -622,62 +633,14 @@ impl Filesystem {
         if matches!(action.as_str(), "upload" | "download") {
             let local = options.local_path.clone().unwrap_or_default();
             let remote = options.path.clone();
-            let timeout = options.timeout.unwrap_or(900) as f64;
-            let started = Instant::now();
-            let (preflight, remote_size) = self
-                .transfer_preflight(
-                    &host,
-                    (action == "download").then_some(remote.as_str()),
-                    options.container.as_deref(),
-                    timeout,
-                    progress,
-                )
-                .await?;
-            if preflight.get("ok") != Some(&Value::Bool(true)) {
-                let mut row = Map::new();
-                for key in [
-                    "host",
-                    "result_id",
-                    "exit_code",
-                    "timing",
-                    "warning",
-                    "failure_stage",
-                    "startup_retry_result_id",
-                    "connection_recovery",
-                ] {
-                    if let Some(value) = preflight.get(key) {
-                        row.insert(key.into(), value.clone());
-                    }
-                }
-                if let Some(id) = preflight.get("result_id").and_then(Value::as_str) {
-                    row.insert("preflight_result_id".into(), json!(id));
-                    if let Ok(preview) = self.store.preview(id, 2048) {
-                        row.extend(preview);
-                    }
-                }
-                if let Some(state) = preflight.get("execution_state") {
-                    row.insert("preflight_execution_state".into(), state.clone());
-                }
-                row.extend(queue_rejection(&preflight));
-                row.insert("ok".into(), json!(false));
-                row.insert("action".into(), json!(action));
-                row.insert("path".into(), json!(remote));
-                row.insert("execution_state".into(), json!("not_started"));
-                // No transfer was launched, even if the read-only probe was inconclusive.
-                row.insert("completion_unknown".into(), json!(false));
-                return Ok(Value::Object(row));
-            }
+            let deadline = deadline_started
+                .checked_add(Duration::from_secs(options.timeout.unwrap_or(900)))
+                .ok_or_else(|| BridgeError::invalid("transfer timeout out of range"))?;
             let expected_total = if action == "upload" {
                 Self::upload_size_hint(&local)
             } else {
-                remote_size
+                None
             };
-            let timeout = timeout - started.elapsed().as_secs_f64();
-            if timeout <= 0.0 {
-                return Err(BridgeError::config(
-                    "Fs preflight exhausted the transfer timeout; transfer not started",
-                ));
-            }
             let outcome = self
                 .runner
                 .rsync(
@@ -687,11 +650,22 @@ impl Filesystem {
                     if action == "upload" { "push" } else { "pull" },
                     &options.exclude,
                     false,
-                    timeout,
+                    deadline,
                     options.container.as_deref(),
                     options.overwrite,
                     progress,
                     expected_total,
+                    async {
+                        let workers = self.workers.clone();
+                        let host = host.clone();
+                        // If the request times out while closing idle workers, still
+                        // finish releasing their channels before discarding them.
+                        tokio::spawn(async move { workers.retire_idle_on_target(&host).await })
+                            .await
+                            .map_err(|error| {
+                                BridgeError::storage(format!("Fs worker cleanup: {error}"))
+                            })?
+                    },
                 )
                 .await?;
             if let Some(progress) = progress {
@@ -717,7 +691,11 @@ impl Filesystem {
                 "completion_unknown",
                 "execution_state",
                 "queue_timed_out",
+                "timed_out",
+                "executed",
+                "warning",
                 "failure_stage",
+                "connection_recovery",
             ] {
                 if let Some(value) = meta.get(key) {
                     row.insert(key.to_string(), value.clone());
@@ -728,14 +706,6 @@ impl Filesystem {
             }
             for (key, value) in queue_rejection(&meta) {
                 row.insert(key, value);
-            }
-            for key in ["startup_retry_result_id", "connection_recovery"] {
-                if let Some(value) = preflight.get(key) {
-                    row.insert(key.into(), value.clone());
-                }
-            }
-            if let Some(id) = preflight.get("result_id") {
-                row.insert("preflight_result_id".into(), id.clone());
             }
             row.insert("action".into(), Value::from(action));
             row.insert("local_path".into(), Value::from(local));

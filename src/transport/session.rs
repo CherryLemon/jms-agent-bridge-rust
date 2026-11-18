@@ -91,6 +91,7 @@ pub struct ShellSession {
     pub last_used: Instant,
     /// Launch command the shell was created with; reused shells must match it.
     pub launch: Option<String>,
+    pub private_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -116,6 +117,7 @@ impl ShellSession {
             ready_marker: None,
             last_used: Instant::now(),
             launch: None,
+            private_generation: None,
         }
     }
 

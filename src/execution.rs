@@ -23,7 +23,7 @@ use crate::transport::recovery::ConnectionRecovery;
 use crate::transport::session::{
     exec_end_marker, exec_packet, exec_start_marker, new_nonce, ShellSession,
 };
-use crate::transport::ssh::SshPool;
+use crate::transport::ssh::{ShellEvent, SshPool};
 
 /// Everything that changes how one execution is launched.
 #[derive(Debug, Clone)]
@@ -41,6 +41,8 @@ pub struct ExecSpec {
     /// Private filesystem worker shells are never user sessions.
     pub internal_session: bool,
     pub startup_probe: bool,
+    /// Absolute budget shared by filesystem queue, handshake, and safe retries.
+    pub fs_deadline: Option<Instant>,
 }
 
 impl Default for ExecSpec {
@@ -57,6 +59,7 @@ impl Default for ExecSpec {
             queue_timeout: None,
             internal_session: false,
             startup_probe: false,
+            fs_deadline: None,
         }
     }
 }
@@ -251,14 +254,23 @@ fn persist_sessions_with<F: FnOnce()>(
     crate::storage::results::atomic_json(registry, &Value::Array(rows))
 }
 
-/// Whether a live shell or terminal still depends on this connection.
+fn named_shell_on_target<'a>(
+    keys: impl IntoIterator<Item = &'a (String, String)>,
+    key: &str,
+) -> bool {
+    keys.into_iter()
+        .any(|(target, session)| target == key && !session.starts_with("_fs:"))
+}
+
+/// A private worker never pins the connection while idle. Active workers hold
+/// the same operation lease as normal execution and rsync.
 fn connection_protected(
     shells: &Arc<AsyncMutex<HashMap<(String, String), Arc<AsyncMutex<ShellSession>>>>>,
     terminals: &Arc<std::sync::Mutex<HashMap<String, usize>>>,
     key: &str,
 ) -> bool {
     let shell_live = match shells.try_lock() {
-        Ok(shells) => shells.keys().any(|(shell_key, _)| shell_key == key),
+        Ok(shells) => named_shell_on_target(shells.keys(), key),
         // Busy means an operation is using the map right now: assume it is live.
         Err(_) => true,
     };
@@ -786,8 +798,8 @@ impl Runner {
             };
         }
         let mut timings = Timings::default();
-        let attempt = self
-            .attempt(
+        let attempt = {
+            let attempt = self.attempt(
                 host,
                 &command,
                 &body,
@@ -798,8 +810,40 @@ impl Runner {
                 &err_path,
                 &sent_flag,
                 &mut timings,
-            )
-            .await;
+            );
+            if let Some(deadline) = spec.fs_deadline {
+                let result = if Instant::now() >= deadline {
+                    Err(())
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(deadline.into()) => Err(()),
+                        result = attempt => Ok(result),
+                    }
+                };
+                match result {
+                    Ok(attempt) => attempt,
+                    Err(_) => {
+                        let sent = sent_flag.load(Ordering::SeqCst);
+                        let mut attempt = Attempt::not_started(
+                            Some("filesystem deadline expired".into()),
+                            if sent {
+                                "execution"
+                            } else {
+                                "filesystem_deadline"
+                            },
+                        );
+                        attempt.code = 124;
+                        attempt.timed_out = true;
+                        attempt.sent = sent;
+                        attempt.executed = Some(sent);
+                        attempt
+                    }
+                }
+            } else {
+                attempt.await
+            }
+        };
         let elapsed = started_at.elapsed().as_secs_f64();
         // Every stored stream must exist even when the attempt failed early.
         for path in [&out_path, &err_path] {
@@ -1263,19 +1307,14 @@ printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
         let session_key = (key.to_string(), session_id.to_string());
         if spec.internal_session {
             // A private worker whose shell died is replaced silently; user sessions are not.
-            let stale = {
-                let shells = self.shells.lock().await;
-                match shells.get(&session_key).cloned() {
-                    Some(shell) => {
-                        let guard = shell.lock().await;
-                        guard.is_closing()
-                    }
-                    None => false,
+            let existing = self.shells.lock().await.get(&session_key).cloned();
+            if let Some(shell) = existing {
+                let mut shell = shell.lock().await;
+                if shell.is_closing() || shell.private_generation != Some(self.pool.generation(key))
+                {
+                    self.shells.lock().await.remove(&session_key);
+                    shell.close().await;
                 }
-            };
-            if stale {
-                let mut shells = self.shells.lock().await;
-                shells.remove(&session_key);
             }
         }
         // A session that was already registered but has no live shell lost its state
@@ -1308,7 +1347,23 @@ printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
                     return attempt;
                 }
                 let channel_started = Instant::now();
-                let (shell, _reconnected) = match self.pool.open_process(host, command).await {
+                let opened = if spec.internal_session {
+                    // Capture the actual channel's generation rather than looking it up
+                    // after opening, which can race a transport-driven reconnection.
+                    match self.pool.connection(host).await {
+                        Ok(connection) => connection
+                            .open_shell(command)
+                            .await
+                            .map(|shell| (shell, Some(connection.generation))),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    self.pool
+                        .open_process(host, command)
+                        .await
+                        .map(|(shell, _)| (shell, None))
+                };
+                let (shell, generation) = match opened {
                     Ok(value) => value,
                     Err(error) => {
                         timings.channel_seconds += channel_started.elapsed().as_secs_f64();
@@ -1316,6 +1371,7 @@ printf '\\036END{nonce}:%s\\037' \"$__jms_exec_rc\" >&2\n"
                     }
                 };
                 let mut session_shell = ShellSession::new(shell);
+                session_shell.private_generation = generation;
                 session_shell.launch = Some(command.to_string());
                 let slot = Arc::new(AsyncMutex::new(session_shell));
                 {
@@ -1475,6 +1531,67 @@ closed and must not be reused. Inspect before rerunning."
 
     /// One rsync transfer through the pooled connection, stored like any execution.
     #[allow(clippy::too_many_arguments)]
+    /// Confirm the host POSIX shell used by the rsync relay, without opening a
+    /// worker or running anything in the selected container. Wait for peer close:
+    /// some servers permit only one channel on an SSH connection.
+    async fn rsync_readiness(&self, host: &Host, deadline: Instant) -> (BridgeResult<()>, u64) {
+        let budget = deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f64()
+            .min(self.queue_timeout);
+        if budget <= 0.0 {
+            return (
+                Err(BridgeError::ssh("transfer deadline expired before startup")),
+                0,
+            );
+        }
+        let key = match host.connection_key() {
+            Ok(key) => key,
+            Err(error) => return (Err(error), 0),
+        };
+        let lease = match self.recovery.enter(&key, budget).await {
+            Ok(lease) => lease,
+            Err(error) => return (Err(error), 0),
+        };
+        let probe_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
+        let mut generation = 0;
+        let opened = tokio::time::timeout_at(probe_deadline.into(), async {
+            let connection = self.pool.connection(host).await?;
+            generation = connection.generation;
+            self.recovery.set_generation(&key, generation);
+            let nonce = new_nonce();
+            let command = crate::fsprobe::shlex_join(&[
+                "sh".into(),
+                "-c".into(),
+                r#"printf '%s' "$1""#.into(),
+                "jms-rsync-probe".into(),
+                nonce.clone(),
+            ]);
+            Ok::<_, BridgeError>((connection.open_shell(&command).await?, nonce))
+        })
+        .await;
+        let result = match opened {
+            Ok(Ok((shell, nonce))) => {
+                let (writer, mut reader) = shell.split();
+                let observed = tokio::time::timeout_at(probe_deadline.into(), async {
+                    writer.write_eof().await;
+                    read_rsync_probe(&mut reader, nonce.as_bytes()).await
+                })
+                .await;
+                // Explicitly close even on timeout or rejection. On success the peer
+                // has already closed, so there can be no overlap with the relay.
+                writer.close().await;
+                reader.close().await;
+                observed
+                    .unwrap_or_else(|_| Err(BridgeError::ssh("rsync readiness probe timed out")))
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(BridgeError::ssh("rsync readiness probe timed out")),
+        };
+        drop(lease);
+        (result, generation)
+    }
+
     pub async fn rsync(
         &self,
         host: &Host,
@@ -1483,11 +1600,12 @@ closed and must not be reused. Inspect before rerunning."
         direction: &str,
         excludes: &[String],
         delete: bool,
-        timeout: f64,
+        deadline: Instant,
         container: Option<&str>,
         overwrite: bool,
         progress: Option<&dyn ProgressSink>,
         expected_total: Option<u64>,
+        retire_idle: impl std::future::Future<Output = BridgeResult<()>>,
     ) -> BridgeResult<ExecOutcome> {
         let direction = match direction {
             "push" => crate::transport::rsync::Direction::Push,
@@ -1499,12 +1617,6 @@ closed and must not be reused. Inspect before rerunning."
             }
         };
         let key = host.connection_key()?;
-        // The lease covers the transfer itself, not just the local preparation: a
-        // reconnect triggered elsewhere must not kill a running rsync.
-        let _lease = self.recovery.enter(&key, self.queue_timeout).await?;
-        let tool = self.rsync_binary.resolve().await?;
-        let binary = tool.path.clone();
-        let supports_info = tool.supports_info;
         let mut metadata = Map::new();
         metadata.insert("kind".into(), Value::from("rsync"));
         metadata.insert("host".into(), Value::from(host.name.clone()));
@@ -1546,6 +1658,71 @@ closed and must not be reused. Inspect before rerunning."
                 return Err(error);
             }
         }
+        let mut recovery_note = None;
+        let startup = async {
+            // Resolve local rsync before touching SSH. Evict only this target's
+            // idle private workers so they cannot monopolize a one-channel server.
+            let tool = self.rsync_binary.resolve().await?;
+            retire_idle.await?;
+            let (mut readiness, generation) = self.rsync_readiness(host, deadline).await;
+            if matches!(readiness, Err(BridgeError::ShellStartupClosed)) {
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs_f64();
+                if remaining > 0.0 {
+                    let candidate = [("connection_generation".into(), json!(generation))]
+                        .into_iter()
+                        .collect();
+                    let note = self
+                        .recover_startup_connection(
+                            host,
+                            &candidate,
+                            remaining.min(self.queue_timeout),
+                        )
+                        .await?;
+                    let retry =
+                        matches!(note["status"].as_str(), Some("reset" | "already_replaced"));
+                    recovery_note = Some(note);
+                    if retry {
+                        readiness = self.rsync_readiness(host, deadline).await.0;
+                    }
+                }
+            }
+            readiness?;
+            // Keep the lease for the entire rsync, not during reset.
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64();
+            if remaining <= 0.0 {
+                return Err(BridgeError::ssh("transfer deadline expired before launch"));
+            }
+            let active = self
+                .recovery
+                .enter(&key, remaining.min(self.queue_timeout))
+                .await?;
+            Ok((tool, active))
+        };
+        let (tool, _active) = match tokio::time::timeout_at(deadline.into(), startup).await {
+            Ok(Ok(value)) if Instant::now() < deadline => value,
+            failed => {
+                let (timed_out, warning) = match failed {
+                    Ok(Err(error)) if Instant::now() < deadline => (false, error.message()),
+                    _ => (
+                        true,
+                        "Fs transfer deadline expired before launch; no transfer was started"
+                            .into(),
+                    ),
+                };
+                let mut values = transfer_not_started(timed_out, warning);
+                if let Some(note) = recovery_note {
+                    values.insert("connection_recovery".into(), note);
+                }
+                let meta = lease.complete(values)?;
+                return Ok(self.outcome_from_meta(host, meta, true));
+            }
+        };
+        let binary = tool.path.clone();
+        let supports_info = tool.supports_info;
         // Publish live byte counts while the transfer runs, so a caller can watch
         // progress through `meta` instead of waiting for the final verdict.
         let progress_watch = {
@@ -1592,7 +1769,7 @@ closed and must not be reused. Inspect before rerunning."
             direction,
             excludes,
             delete,
-            timeout,
+            deadline,
             container,
             overwrite,
             &out_path,
@@ -1605,6 +1782,13 @@ closed and must not be reused. Inspect before rerunning."
         .await;
         let mut values = Map::new();
         match transfer {
+            Ok(outcome) if outcome.timed_out && !outcome.sent => {
+                values = transfer_not_started(
+                    true,
+                    "Fs transfer deadline expired before protocol startup; no transfer was started"
+                        .into(),
+                );
+            }
             Ok(outcome) => {
                 let unknown = outcome.sent && !outcome.completed;
                 values.insert("ok".into(), Value::Bool(outcome.exit_code == 0));
@@ -1655,6 +1839,9 @@ closed and must not be reused. Inspect before rerunning."
             json!(round(started.elapsed().as_secs_f64(), 3)),
         );
         values.insert("session_state".into(), Value::Null);
+        if let Some(note) = recovery_note {
+            values.insert("connection_recovery".into(), note);
+        }
         // Stop the reporter and wait for it before writing the final metadata: a late
         // annotation must not race the verdict.
         progress_watch.abort();
@@ -1831,6 +2018,71 @@ fn valid_env_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+async fn read_rsync_probe(
+    reader: &mut crate::transport::ssh::ChannelReader,
+    expected: &[u8],
+) -> BridgeResult<()> {
+    let mut output = Vec::new();
+    let mut saw_stderr = false;
+    while let Some(event) = reader.next().await {
+        match event {
+            ShellEvent::Data(bytes) => {
+                if output.len() + bytes.len() > 65536 {
+                    return Err(BridgeError::ssh(
+                        "unexpected output from rsync readiness probe",
+                    ));
+                }
+                output.extend_from_slice(&bytes);
+            }
+            ShellEvent::ExtData(bytes) => saw_stderr |= !bytes.is_empty(),
+            ShellEvent::ExecRejected => {
+                return Err(BridgeError::ssh(
+                    "SSH exec rejected the rsync readiness probe",
+                ))
+            }
+            _ => (),
+        }
+    }
+    rsync_probe_result(&output, expected, saw_stderr, reader.exit_code())
+}
+
+fn rsync_probe_result(
+    output: &[u8],
+    expected: &[u8],
+    saw_stderr: bool,
+    exit: Option<i32>,
+) -> BridgeResult<()> {
+    if output
+        .windows(expected.len())
+        .any(|window| window == expected)
+        && matches!(exit, None | Some(0))
+    {
+        Ok(())
+    } else if output.is_empty() && !saw_stderr && exit.is_none() {
+        Err(BridgeError::ShellStartupClosed)
+    } else {
+        Err(BridgeError::ssh(
+            "rsync readiness probe did not acknowledge a usable host shell",
+        ))
+    }
+}
+
+fn transfer_not_started(timed_out: bool, warning: String) -> Map<String, Value> {
+    [
+        ("ok", json!(false)),
+        ("executed", json!(false)),
+        ("timed_out", json!(timed_out)),
+        ("completion_unknown", json!(false)),
+        ("execution_state", json!("not_started")),
+        ("failure_stage", json!("transfer_setup")),
+        ("exit_code", json!(if timed_out { 124 } else { 1 })),
+        ("warning", json!(warning)),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value))
+    .collect()
+}
+
 pub fn startup_failed(meta: &Map<String, Value>) -> bool {
     meta.get("failure_stage").and_then(Value::as_str) == Some("shell_startup")
         && meta
@@ -1925,6 +2177,74 @@ pub fn age_seconds(meta: &Map<String, Value>) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_user_named_shells_pin_their_connection() {
+        let idle = ("target".to_string(), "_fs:worker".to_string());
+        let elsewhere = ("other".to_string(), "named".to_string());
+        assert!(!named_shell_on_target([&idle, &elsewhere], "target"));
+        let named = ("target".to_string(), "named".to_string());
+        assert!(named_shell_on_target([&idle, &named], "target"));
+    }
+
+    #[tokio::test]
+    async fn rsync_waits_for_first_channel_to_close_before_opening_second() {
+        use crate::transport::ssh::{ChannelReader, ShellEvent};
+        let (tx, mut reader) = ChannelReader::mock();
+        let channels = Arc::new(tokio::sync::Semaphore::new(1));
+        let first_channel = channels.clone().acquire_owned().await.unwrap();
+        tx.send(ShellEvent::Data(bytes::Bytes::from_static(
+            b"banner\nreadiness",
+        )))
+        .await
+        .unwrap();
+        tx.send(ShellEvent::Eof).await.unwrap();
+        tx.send(ShellEvent::Exit(0)).await.unwrap();
+        let probe = read_rsync_probe(&mut reader, b"readiness");
+        tokio::pin!(probe);
+        assert!(matches!(
+            futures::poll!(&mut probe),
+            std::task::Poll::Pending
+        ));
+        assert!(channels.try_acquire().is_err());
+        // A max-one-channel server frees the permit when it sends SSH Close.
+        drop(first_channel);
+        tx.send(ShellEvent::Closed).await.unwrap();
+        probe.await.unwrap();
+        assert!(channels.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn only_silent_pre_ack_close_is_recoverable_for_rsync() {
+        use crate::transport::ssh::{ChannelReader, ShellEvent};
+        for event in [
+            Some(ShellEvent::Exit(126)),
+            Some(ShellEvent::ExecRejected),
+            None,
+        ] {
+            let silent = event.is_none();
+            let (tx, mut reader) = ChannelReader::mock();
+            if let Some(event) = event {
+                tx.send(event).await.unwrap();
+            }
+            tx.send(ShellEvent::Closed).await.unwrap_or(());
+            let result = read_rsync_probe(&mut reader, b"readiness").await;
+            assert_eq!(
+                matches!(result, Err(BridgeError::ShellStartupClosed)),
+                silent
+            );
+        }
+    }
+
+    #[test]
+    fn pre_launch_timeout_receipt_is_known_not_started() {
+        let meta = transfer_not_started(true, "test deadline".into());
+        assert_eq!(meta["execution_state"], "not_started");
+        assert_eq!(meta["executed"], false);
+        assert_eq!(meta["completion_unknown"], false);
+        assert_eq!(meta["timed_out"], true);
+        assert_eq!(meta["exit_code"], 124);
+    }
+
     /// Two saves racing in the "wrong" order must not leave the older snapshot behind.
     #[test]
     fn a_concurrent_save_cannot_overwrite_a_newer_snapshot() {

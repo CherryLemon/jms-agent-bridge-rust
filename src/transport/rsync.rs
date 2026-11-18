@@ -765,7 +765,7 @@ pub async fn transfer(
     direction: Direction,
     excludes: &[String],
     delete: bool,
-    timeout: f64,
+    deadline: Instant,
     container: Option<&str>,
     overwrite: bool,
     out_path: &Path,
@@ -934,6 +934,14 @@ pub async fn transfer(
         .open(err_path)?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command.stdin(Stdio::null());
+    if Instant::now() >= deadline {
+        return Ok(TransferOutcome {
+            exit_code: 124,
+            sent: false,
+            completed: false,
+            timed_out: true,
+        });
+    }
     let mut child = command
         .spawn()
         .map_err(|error| BridgeError::config(format!("cannot start local rsync: {error}")))?;
@@ -1013,8 +1021,8 @@ pub async fn transfer(
     // Idle watchdog: `--blocking-io` means a stalled peer blocks inside a syscall, so the
     // writer cannot enforce its own deadline. The owner watches the byte counters and
     // ends the transfer when nothing moves.
-    let idle_limit =
-        Duration::from_secs(idle_seconds.max(1)).min(Duration::from_secs_f64(timeout.max(1.0)));
+    let idle_limit = Duration::from_secs(idle_seconds.max(1))
+        .min(deadline.saturating_duration_since(Instant::now()));
     let stalled = Arc::new(AtomicBool::new(false));
     let watchdog = {
         let progress = progress.clone();
@@ -1030,11 +1038,10 @@ pub async fn transfer(
     // Why the wait ended is tracked explicitly. A stalled transfer used to be reported as
     // `Ok(124)`, which the teardown below read as "the child exited with 124" - it then
     // skipped termination and recorded a completed transfer.
-    let wait_started = Instant::now();
     let happened = wait_for_child(
         &mut child,
         &stalled,
-        Duration::from_secs_f64(timeout.max(0.5)),
+        deadline.saturating_duration_since(Instant::now()),
     )
     .await;
     let kill_reason = match &happened {
@@ -1047,8 +1054,8 @@ pub async fn transfer(
     // exit to distinguish a confirmed failure from unknown remote completion.
     // Drain the SSH exit status before closing the channel.
     if matches!(happened, WaitEnd::Exited(_)) && sent.load(Ordering::SeqCst) {
-        let remaining = Duration::from_secs_f64(timeout.max(0.5))
-            .saturating_sub(wait_started.elapsed())
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
             .min(Duration::from_secs(5));
         wait_remote_exit(&remote_exit, &remote_done, remaining).await;
     }
