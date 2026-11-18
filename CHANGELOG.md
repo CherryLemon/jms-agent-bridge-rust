@@ -10,8 +10,13 @@
 * Terminal requests wait up to 15 seconds by default, returning earlier when
   output or completion is available. Tool descriptions recommend reusing a
   terminal for repeated work on one target.
-* Transfers no longer report success when remote rsync fails or its exit
-  status cannot be confirmed.
+* Transfers require a confirmed remote rsync exit. If the transport has
+  already sent the transfer and remote exit cannot be confirmed, the result is
+  unknown even when local rsync exits nonzero; the local error code is retained.
+* Terminal initialization waits for the completion marker, while public
+  terminal commands can still return as soon as output arrives. Terminal EOF
+  preserves queued output and releases connection protection. Commands that
+  lose their shell before sending are reported consistently as not started.
 
 ## 0.4.5
 
