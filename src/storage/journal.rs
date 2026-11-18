@@ -222,7 +222,13 @@ impl RequestJournal {
             _ => Vec::new(),
         };
         let same = |row: &Value| {
-            row.get(identity) == value.get(identity) && row.get("host") == value.get("host")
+            let same_target = match (row.get("asset_id"), value.get("asset_id")) {
+                (Some(previous), Some(current)) if field == "submission_receipts" => {
+                    previous == current
+                }
+                _ => row.get("host") == value.get("host"),
+            };
+            row.get(identity) == value.get(identity) && same_target
         };
         if let Some(slot) = rows.iter_mut().find(|row| same(row)) {
             *slot = value;
@@ -242,7 +248,7 @@ impl RequestJournal {
         arguments: &Value,
     ) -> BridgeResult<(bool, Map<String, Value>)> {
         let directory = self.directory(request_id)?;
-        let fingerprint = fingerprint_of(operation, arguments);
+        let (fingerprint, legacy_fingerprint) = request_fingerprints(operation, arguments);
         {
             let _guard = self.fs.lock().expect("journal lock");
             match std::fs::create_dir(&directory) {
@@ -252,7 +258,12 @@ impl RequestJournal {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     drop(_guard);
                     let receipt = self.load(request_id)?;
-                    if receipt.get("fingerprint").and_then(Value::as_str) != Some(&fingerprint) {
+                    let previous = receipt.get("fingerprint").and_then(Value::as_str);
+                    if previous != Some(&fingerprint)
+                        && !legacy_fingerprint
+                            .as_deref()
+                            .is_some_and(|legacy| previous == Some(legacy))
+                    {
                         return Err(BridgeError::invalid(
                             "request_id already claimed; use request_status to reconcile it (arguments cannot change)",
                         ));
@@ -396,6 +407,27 @@ fn valid_request_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '_' | '-'))
 }
 
+/// For job submit, leaving the guard boolean unset and explicitly setting it to
+/// false mean the same request. Check older raw false fingerprints without
+/// invalidating saved receipts; true and all other business fields stay exact.
+fn request_fingerprints(operation: &str, arguments: &Value) -> (String, Option<String>) {
+    if operation == "jms_submit_job" {
+        if let Some(args) = arguments.as_object() {
+            if matches!(args.get("allow_dangerous"), None | Some(Value::Bool(false))) {
+                let mut canonical = args.clone();
+                canonical.remove("allow_dangerous");
+                let fingerprint = fingerprint_of(operation, &Value::Object(canonical.clone()));
+                canonical.insert("allow_dangerous".into(), Value::Bool(false));
+                return (
+                    fingerprint,
+                    Some(fingerprint_of(operation, &Value::Object(canonical))),
+                );
+            }
+        }
+    }
+    (fingerprint_of(operation, arguments), None)
+}
+
 /// Deterministic hash of the identity of a request: same id + same arguments only.
 pub fn fingerprint_of(operation: &str, arguments: &Value) -> String {
     let canonical = canonical_json(&Value::Array(vec![
@@ -463,6 +495,35 @@ mod tests {
         // Directory names are hashes, so no id can escape the journal root.
         let directory = journal.directory("a/b").unwrap_err();
         assert!(directory.message().contains("request_id"));
+    }
+
+    #[test]
+    fn historical_explicit_false_submit_receipt_reconciles_with_omitted_default() {
+        let (_tmp, journal) = journal();
+        let old =
+            serde_json::json!({"targets":["worker"],"command":"printf ok","allow_dangerous":false});
+        let current = serde_json::json!({"targets":["worker"],"command":"printf ok"});
+        let (created, mut receipt) = journal.claim("existing", "jms_submit_job", &old).unwrap();
+        assert!(created);
+        // Simulate the exact hash persisted by the version before normalization.
+        receipt.insert(
+            "fingerprint".into(),
+            fingerprint_of("jms_submit_job", &old).into(),
+        );
+        journal.save(&receipt).unwrap();
+        let (claimed, _) = journal
+            .claim("existing", "jms_submit_job", &current)
+            .unwrap();
+        assert!(!claimed);
+        assert!(journal
+            .claim(
+                "existing",
+                "jms_submit_job",
+                &serde_json::json!({
+                    "targets":["worker"],"command":"printf ok","allow_dangerous":true
+                })
+            )
+            .is_err());
     }
 
     #[test]

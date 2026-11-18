@@ -2,7 +2,7 @@
 
 A resident bridge between MCP clients and JumpServer: one process owns the REST
 inventory, the pooled SSH connections, the saved results and the background work,
-and exposes a deliberately small MCP surface — seven tools — so that an agent can
+and exposes a deliberately small MCP surface — eight tools — so that an agent can
 do everything without paying for a dozen tool descriptions on every turn.
 
 This is a Rust reimplementation of [`jms-agent-bridge`](https://github.com/lvyufeng/jms-agent-bridge)
@@ -112,13 +112,14 @@ directory; `serve` and `probe` take an exclusive lock, and `doctor` never touche
 a live state directory (it uses a throwaway one, so it cannot disturb a running
 service).
 
-## The seven tools
+## The eight tools
 
 | Tool | Purpose |
 | --- | --- |
 | `run` | Run literal Bash on REST-authorized targets, with `cwd`, `env`, container/image, named shells and per-target results. |
 | `fs` | Explore or transfer files on one exact asset: `list`, `stat`, `read`, `read_many`, `glob`, `search`, `tree`, `checksum`, `upload`, `download`. |
 | `terminal` | Bound interactive shells: `open`, `exec`, `read`, `write`, `close` — for REPLs and prompts that need stdin. |
+| `job` | Submit, wait, inspect, cancel or list detached jobs; pass submit handles to a batch wait. |
 | `read_result` | Page one saved stream by byte offset, `tail`, or literal `pattern` search. |
 | `discover` | List operation categories, search hidden operations, and read one operation's full schema. Also lists assets (`topic="assets"`) and live status (`topic="status"`). |
 | `call` | Execute one whitelisted operation by name (jobs, inspection, inventory, sessions, receipts). |
@@ -132,11 +133,11 @@ command, so status latency does not grow with command duration. A terminal accep
 one command at a time: a second `exec` is refused with "terminal is busy".
 
 Advanced fields live in an `options` object so the advertised schema stays small;
-`discover(operation="run"|"fs"|"terminal")` returns the complete schema, and
+`discover(operation="run"|"fs"|"terminal"|"job")` returns the complete schema, and
 `discover(operation="jms_fs", query=<action>)` narrows it per action. Everything
 that is accepted but not advertised is still validated before any side effect.
 
-Listings are paged (`offset`/`limit`, `next_offset` in the answer) and a `call`
+Listings are paged (`offset`/`limit`, `next_offset` in the answer) and a `call` or `job`
 response above 8 KiB is saved whole: the reply then carries `staged: true`, a
 business summary and a `result_id` that `read_result(stream="result")` reads back.
 
@@ -164,6 +165,26 @@ business summary and a `result_id` that `read_result(stream="result")` reads bac
   cannot be persisted, the operation stops before anything reaches the remote side.
   A write that fails *after* the work ran is reported next to the real verdict
   (`local_error: true`), never as `not_started`.
+
+### Detached jobs
+
+```text
+job(action="submit", targets=["worker-a", "worker-b"], command="…", request_id="build-42")
+job(action="wait", jobs=[{"target":"worker-a","job_id":"1a2b3c4d"},{"target":"worker-b","job_id":"5e6f7890"}])
+```
+
+Pass the returned `jobs` array directly to `wait`. `submissions` carries per-target
+launch evidence, including rejected launches that do not get a wait handle. A
+concurrent duplicate can report `request_state: "running"`; retry or reconcile
+the same ID to recover its final handles. An equivalent legacy
+`call(operation="jms_submit_job", request_id=...)` uses the same durable receipt.
+`wait` returns ordered `status` rows and a reusable `pending` array if the shared
+watch deadline expires. The timeout never cancels a job. Large diagnostics are saved
+under `result_id`; `jobs` or `pending` remains inline when it fits. If the
+handles themselves are too large, the same field contains `{"ref":"<id>"}`.
+Pass that object unchanged as `jobs` to continue; the bridge checks each target
+against the current permitted inventory before probing it. Legacy
+`call(operation="jms_job_wait")` with a single ID is unchanged.
 
 ## State
 
@@ -197,7 +218,7 @@ the same state directory can be reused when switching binaries — see
   `$'…'` quoting) instead of a named argv helper, so a foreground REPL read
   cannot swallow the completion marker while `import x` still works.
 * The advertised schema carries only the common fields plus an `options` entry
-  point (about 5.8 KB for all seven tools, down from 10.2 KB with every field
+  point (under 7 KiB for all eight tools, down from 10.2 KB with every field
   spelled out); validation always uses the complete definition, and
   `discover(operation=<tool>)` returns it. The `fs` action fields are documented
   per action through `discover(operation="jms_fs", query=<action>)`.

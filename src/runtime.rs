@@ -702,9 +702,97 @@ require allow_dangerous=true",
 
     // --- call ----------------------------------------------------------------
 
+    pub async fn tool_job(
+        self: &Arc<Self>,
+        mut payload: Map<String, Value>,
+    ) -> BridgeResult<Value> {
+        let action = used_string(&payload, "action")?;
+        payload.remove("action");
+        let request_id = payload.remove("request_id");
+        if action != "submit" && request_id.is_some() {
+            return Err(BridgeError::invalid(
+                "job request_id applies only to submit",
+            ));
+        }
+        if action == "wait" && payload.contains_key("jobs") {
+            return self.wait_job_handles(payload).await;
+        }
+        let operation = match action.as_str() {
+            "submit" => {
+                if request_id.as_ref().and_then(Value::as_str).is_none() {
+                    return Err(BridgeError::invalid("job submit requires request_id"));
+                }
+                "jms_submit_job"
+            }
+            "wait" => "jms_job_wait",
+            "logs" => "jms_job_logs",
+            "status" => "jms_job_status",
+            "cancel" => "jms_job_cancel",
+            "list" => "jms_job_list",
+            _ => return Err(BridgeError::invalid("unknown job action")),
+        };
+        if matches!(action.as_str(), "logs" | "cancel") {
+            if let Some(target) = payload.remove("target") {
+                payload.insert("host".into(), target);
+            }
+        }
+        let mut call = Map::new();
+        call.insert("operation".into(), json!(operation));
+        call.insert("arguments".into(), Value::Object(payload));
+        if let Some(request_id) = request_id {
+            call.insert("request_id".into(), request_id);
+        }
+        self.tool_call_impl(call, action == "submit").await
+    }
+
+    async fn wait_job_handles(&self, payload: Map<String, Value>) -> BridgeResult<Value> {
+        if payload
+            .keys()
+            .any(|key| !matches!(key.as_str(), "jobs" | "timeout" | "interval"))
+        {
+            return Err(BridgeError::invalid(
+                "job wait takes jobs or targets/job_id, not both",
+            ));
+        }
+        let input = payload
+            .get("jobs")
+            .ok_or_else(|| BridgeError::invalid("job wait requires jobs"))?;
+        let timeout = payload
+            .get("timeout")
+            .and_then(Value::as_f64)
+            .unwrap_or(50.0);
+        let interval = payload
+            .get("interval")
+            .and_then(Value::as_f64)
+            .unwrap_or(2.0);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout);
+        // Validate syntax and references before any inventory/gateway access. A
+        // typed local result is only a source of handles, never authorization.
+        let jobs = load_job_handles(&self.store, input)?;
+        let handles = validate_job_handles(&jobs)?;
+        let Some(inventory) = job_wait_inventory(deadline, self.inventory()).await? else {
+            return stage_job_batch(&self.store, JobBatch::Wait, inventory_timeout_rows(jobs));
+        };
+        let pairs = inventory.resolve_job_targets(&handles)?;
+        let (status, finished) = self.jobs.wait_until(&pairs, deadline, interval).await;
+        stage_job_batch(
+            &self.store,
+            JobBatch::Wait,
+            project_job_wait(&jobs, &pairs, status, finished),
+        )
+    }
+
     pub async fn tool_call(self: &Arc<Self>, arguments: Map<String, Value>) -> BridgeResult<Value> {
+        self.tool_call_impl(arguments, false).await
+    }
+
+    async fn tool_call_impl(
+        self: &Arc<Self>,
+        arguments: Map<String, Value>,
+        job_submit_facade: bool,
+    ) -> BridgeResult<Value> {
         let operation = used_string(&arguments, "operation")?;
-        let mut payload = match arguments.get("arguments") {
+        let payload = match arguments.get("arguments") {
             Some(Value::Object(map)) => map.clone(),
             Some(Value::Null) | None => Map::new(),
             Some(_) => {
@@ -753,9 +841,15 @@ require allow_dangerous=true",
             if let Some(map) = value.as_object_mut() {
                 map.insert("request_id".into(), Value::from(request_id.clone()));
             }
+            if job_submit_facade {
+                return stage_job_batch(
+                    &self.store,
+                    JobBatch::Submit,
+                    project_job_submission(value),
+                );
+            }
             return self.stage_operation_result(&operation_for_task, value);
         }
-        let _ = &mut payload;
         let value = self.dispatch_operation(&operation, payload).await?;
         // Bounded response: a large operation payload is saved whole and the model gets
         // a summary plus a result id instead of the entire object in context.
@@ -1026,18 +1120,19 @@ require allow_dangerous=true",
             set.spawn(async move {
                 let _permit = permit.acquire_owned().await;
                 let name = host.name.clone();
+                let asset_id = host.asset_id.clone();
                 let submitted = runtime
                     .jobs
                     .submit(&host, command.as_ref(), progress.as_deref())
                     .await;
-                (index, name, submitted)
+                (index, name, asset_id, submitted)
             });
         }
         let mut launched: Vec<(usize, Value)> = Vec::new();
         let mut all_launched = true;
         let mut any_unknown = false;
         while let Some(joined) = set.join_next().await {
-            let (index, name, submitted) = match joined {
+            let (index, name, asset_id, submitted) = match joined {
                 Ok(entry) => entry,
                 Err(error) => {
                     all_launched = false;
@@ -1051,7 +1146,7 @@ require allow_dangerous=true",
                     continue;
                 }
             };
-            let row = match submitted {
+            let mut row = match submitted {
                 Ok((handle, outcome)) => {
                     all_launched &= handle.state == crate::jobs::LaunchState::Acknowledged;
                     any_unknown |= handle.state == crate::jobs::LaunchState::Unknown;
@@ -1071,6 +1166,9 @@ require allow_dangerous=true",
                     })
                 }
             };
+            if let Some(asset_id) = asset_id {
+                row["asset_id"] = json!(asset_id);
+            }
             launched.push((index, row));
         }
         launched.sort_by_key(|(index, _)| *index);
@@ -1382,6 +1480,237 @@ fn unknown_row(host: &str, message: &str) -> Map<String, Value> {
     .unwrap_or_default()
 }
 
+#[derive(Clone, Copy)]
+enum JobBatch {
+    Submit,
+    Wait,
+}
+
+impl JobBatch {
+    fn scope(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Submit => ("jms_submit_job", "jobs"),
+            Self::Wait => ("jms_job_wait", "pending"),
+        }
+    }
+}
+
+const JOB_BATCH_RESULT: &str = "job_batch";
+
+/// Stage bulky diagnostic rows first. Pass the inline handles (or a typed
+/// continuation reference when the handles alone are too large) directly to wait.
+fn stage_job_batch(store: &ResultStore, scope: JobBatch, value: Value) -> BridgeResult<Value> {
+    let bytes = serde_json::to_vec(&value)?;
+    if bytes.len() <= OPERATION_BUDGET {
+        return Ok(value);
+    }
+    let (operation, section) = scope.scope();
+    let metadata = json!({"kind":JOB_BATCH_RESULT,"operation":operation,
+                          "handle_section":section,"bytes":bytes.len()})
+    .as_object()
+    .expect("object")
+    .clone();
+    let result_id = store.save_serialized(&value, &bytes, metadata)?;
+    let mut result = json!({
+        "staged": true,
+        "result_id": result_id,
+        "operation": operation,
+        "bytes": bytes.len(),
+        "note": "Full diagnostics: read_result with stream='result'."
+    });
+    for field in [
+        "ok",
+        "finished",
+        "request_id",
+        "request_state",
+        "duplicate",
+        "execution_replayed",
+        "completion_unknown",
+        "watch_timeout",
+        "inventory_timed_out",
+    ] {
+        if let Some(item) = value.get(field) {
+            result[field] = item.clone();
+        }
+    }
+    if let Some(handles) = value.get(section) {
+        result[section] = handles.clone();
+        if serde_json::to_vec(&result)?.len() > OPERATION_BUDGET {
+            result[section] = json!({"ref": result_id});
+        }
+    }
+    Ok(result)
+}
+
+fn load_job_handles(store: &ResultStore, input: &Value) -> BridgeResult<Vec<Value>> {
+    if let Some(handles) = input.as_array() {
+        return Ok(handles.clone());
+    }
+    crate::schema::validate(&schemas::job_batch_ref_schema(), input).map_err(|_| {
+        BridgeError::invalid("jobs must be a handle array or a job continuation ref")
+    })?;
+    let id = input["ref"].as_str().expect("validated reference");
+    let meta = store.metadata(id)?;
+    let scope = (
+        meta.get("operation").and_then(Value::as_str),
+        meta.get("handle_section").and_then(Value::as_str),
+    );
+    let section = match scope {
+        (Some("jms_submit_job"), Some("jobs")) => "jobs",
+        (Some("jms_job_wait"), Some("pending")) => "pending",
+        _ => {
+            return Err(BridgeError::invalid(
+                "result is not a reusable job continuation",
+            ))
+        }
+    };
+    if meta.get("kind").and_then(Value::as_str) != Some(JOB_BATCH_RESULT)
+        || meta.get("status").and_then(Value::as_str) != Some("complete")
+    {
+        return Err(BridgeError::invalid(
+            "result is not a reusable job continuation",
+        ));
+    }
+    let value: Value = serde_json::from_slice(&std::fs::read(store.path(id, "result")?)?)?;
+    value
+        .get(section)
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| BridgeError::invalid("job continuation has no saved handle array"))
+}
+
+fn validate_job_handles(jobs: &[Value]) -> BridgeResult<Vec<(String, String)>> {
+    if jobs.is_empty() {
+        return Err(BridgeError::invalid("job wait requires nonempty handles"));
+    }
+    jobs.iter()
+        .map(|handle| {
+            let fields = handle
+                .as_object()
+                .filter(|fields| fields.len() == 2)
+                .ok_or_else(|| BridgeError::invalid("job handle must contain target and job_id"))?;
+            let target = used_string(fields, "target")?;
+            let id = used_string(fields, "job_id")?;
+            if let Some(error) = validate_job_id(&id) {
+                return Err(BridgeError::invalid(error));
+            }
+            if target.trim().is_empty()
+                || target.eq_ignore_ascii_case("all")
+                || target.contains(['*', '?', '[', ']'])
+            {
+                return Err(BridgeError::invalid(
+                    "job handles require an exact permitted target",
+                ));
+            }
+            Ok((target, id))
+        })
+        .collect()
+}
+
+async fn job_wait_inventory(
+    deadline: tokio::time::Instant,
+    inventory: impl std::future::Future<Output = BridgeResult<crate::inventory::Inventory>>,
+) -> BridgeResult<Option<crate::inventory::Inventory>> {
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(None);
+    }
+    match tokio::time::timeout_at(deadline, inventory).await {
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(inventory)) if tokio::time::Instant::now() < deadline => Ok(Some(inventory)),
+        Ok(Ok(_)) | Err(_) => Ok(None),
+    }
+}
+
+fn inventory_timeout_rows(jobs: Vec<Value>) -> Value {
+    let status: Vec<_> = jobs
+        .iter()
+        .map(|handle| {
+            json!({
+                "target":handle["target"], "job_id":handle["job_id"],
+                "status":"unknown", "ok":false, "watch_timeout":true, "probed":false,
+                "reason":"inventory_timeout",
+            })
+        })
+        .collect();
+    json!({"ok":false,"finished":false,"watch_timeout":true,"inventory_timed_out":true,
+           "status":status,"pending":jobs})
+}
+
+fn project_job_wait(
+    jobs: &[Value],
+    pairs: &[(Host, String)],
+    mut status: Vec<Value>,
+    finished: bool,
+) -> Value {
+    let mut pending = Vec::new();
+    for ((row, handle), (host, _)) in status.iter_mut().zip(jobs).zip(pairs) {
+        let known = crate::jobs::is_terminal_status(row);
+        row["target"] = handle["target"].clone();
+        row["host"] = json!(host.name);
+        row["job_id"] = handle["job_id"].clone();
+        if !known {
+            pending.push(handle.clone());
+        }
+    }
+    json!({"ok":finished,"finished":finished,"status":status,"pending":pending})
+}
+
+/// Present directly reusable handles without changing the durable legacy response.
+fn project_job_submission(mut value: Value) -> Value {
+    let Some(map) = value.as_object_mut() else {
+        return value;
+    };
+    let running = map.get("request_state").and_then(Value::as_str) == Some("running");
+    let rows = map
+        .remove("jobs")
+        .and_then(|value| value.as_array().cloned());
+    let receipts = map
+        .remove("submission_receipts")
+        .and_then(|value| value.as_array().cloned());
+    let mut submissions = rows.unwrap_or_default();
+    if submissions.is_empty() {
+        submissions = receipts.unwrap_or_default();
+    }
+    let mut jobs = Vec::new();
+    for row in &mut submissions {
+        let Some(row) = row.as_object_mut() else {
+            continue;
+        };
+        let Some(target) = row
+            .get("asset_id")
+            .and_then(Value::as_str)
+            .or_else(|| row.get("host").and_then(Value::as_str))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        row.insert("target".into(), json!(target));
+        let confirmed_or_unknown = match row.get("launch_state").and_then(Value::as_str) {
+            Some("acknowledged" | "unknown") => true,
+            Some(_) => false,
+            None => {
+                // A live request can still launch this prepared ID. Do not offer an
+                // immediately watchable handle that might falsely report missing.
+                row.insert(
+                    "launch_state".into(),
+                    json!(if running { "pending" } else { "unknown" }),
+                );
+                !running
+            }
+        };
+        let Some(id) = row.get("job_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if confirmed_or_unknown && validate_job_id(id).is_none() {
+            jobs.push(json!({"target":target,"job_id":id}));
+        }
+    }
+    map.remove("execution_results");
+    map.insert("jobs".into(), json!(jobs));
+    map.insert("submissions".into(), json!(submissions));
+    value
+}
+
 /// One job row: the id is always reported, `launched` only when the launcher said so.
 fn job_row(handle: &crate::jobs::JobHandle, outcome: &crate::execution::ExecOutcome) -> Value {
     let acknowledged = handle.state == crate::jobs::LaunchState::Acknowledged;
@@ -1419,16 +1748,18 @@ fn job_row(handle: &crate::jobs::JobHandle, outcome: &crate::execution::ExecOutc
     Value::Object(row)
 }
 
+const OPERATION_BUDGET: usize = 8 * 1024;
+
 /// Save an oversized operation payload and return a bounded summary of it.
 pub fn stage_if_large(
     store: &crate::storage::results::ResultStore,
     operation: &str,
     value: Value,
 ) -> BridgeResult<Value> {
-    const BUDGET: usize = 8 * 1024;
+    let budget = OPERATION_BUDGET;
     // Serialize once: the same bytes decide the budget, feed the preview and get saved.
     let bytes = serde_json::to_vec(&value)?;
-    if bytes.len() <= BUDGET {
+    if bytes.len() <= budget {
         return Ok(value);
     }
     // `serde_json` output is UTF-8; borrow it instead of copying the whole payload.
@@ -1468,6 +1799,7 @@ pub fn stage_if_large(
         "matched",
         "returned",
         "next_offset",
+        "finished",
         "status",
     ] {
         if let Some(item) = value.get(key) {
@@ -1483,7 +1815,7 @@ pub fn stage_if_large(
     summary.insert(
         "note".into(),
         Value::from(format!(
-            "response exceeded {BUDGET} bytes; full payload saved as {result_id} (read_result with stream='result')"
+            "response exceeded {budget} bytes; full payload saved as {result_id} (read_result with stream='result')"
         )),
     );
     Ok(Value::Object(summary))
@@ -1633,6 +1965,152 @@ fn meta_section_keys(section: &str) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job_test_store() -> (tempfile::TempDir, ResultStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        (dir, store)
+    }
+
+    fn job_test_handles(count: u32) -> Vec<Value> {
+        (0..count)
+            .map(|i| json!({"target":format!("asset-{i:012}"),"job_id":format!("{i:08x}")}))
+            .collect()
+    }
+
+    #[test]
+    fn stage_keeps_large_submit_handles_inline_when_only_diagnostics_overflow() {
+        let (_dir, store) = job_test_store();
+        let handles = job_test_handles(30);
+        let submissions: Vec<_> = handles.iter().map(|h| json!({
+            "host": h["target"], "job_id":h["job_id"], "launch_state":"acknowledged", "diagnostic":"x".repeat(500),
+        })).collect();
+        let raw =
+            json!({"ok":true,"request_id":"original","jobs":handles,"submissions":submissions});
+        let staged = stage_job_batch(&store, JobBatch::Submit, raw.clone()).unwrap();
+        assert_eq!(staged["staged"], true);
+        assert_eq!(staged["request_id"], "original");
+        assert_eq!(staged["jobs"], raw["jobs"]);
+        assert!(staged.get("submissions").is_none());
+        assert!(staged.to_string().len() <= OPERATION_BUDGET);
+        let full: Value = serde_json::from_slice(
+            &std::fs::read(
+                store
+                    .path(staged["result_id"].as_str().unwrap(), "result")
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(full, raw);
+    }
+
+    #[test]
+    fn stage_keeps_single_pending_handle_when_many_rows_finish() {
+        let (_dir, store) = job_test_store();
+        let handles = job_test_handles(200);
+        let pending = json!([handles.last().unwrap()]);
+        let status: Vec<_> = handles
+            .iter()
+            .map(|h| {
+                json!({
+                    "target":h["target"],"job_id":h["job_id"],"status":"done","exit_code":"0",
+                })
+            })
+            .collect();
+        let staged = stage_job_batch(
+            &store,
+            JobBatch::Wait,
+            json!({
+                "ok":false,"finished":false,"pending":pending,"status":status,
+            }),
+        )
+        .unwrap();
+        assert_eq!(staged["staged"], true);
+        assert_eq!(staged["pending"], pending);
+        assert_eq!(staged["finished"], false);
+    }
+
+    #[test]
+    fn oversized_handles_roundtrip_only_through_typed_job_continuations() {
+        let (_dir, store) = job_test_store();
+        let handles = job_test_handles(220);
+        for scope in [JobBatch::Submit, JobBatch::Wait] {
+            let (operation, field) = scope.scope();
+            let mut raw = json!({"ok":true});
+            raw[field] = json!(handles);
+            let staged = stage_job_batch(&store, scope, raw.clone()).unwrap();
+            assert!(staged.to_string().len() <= OPERATION_BUDGET);
+            assert_eq!(staged[field]["ref"], staged["result_id"]);
+            let restored = load_job_handles(&store, &staged[field]).unwrap();
+            assert_eq!(restored, handles);
+            assert!(validate_job_handles(&restored).is_ok());
+            let reconstructed: Value = json!({"action":"wait","jobs":staged[field]});
+            let schema = schemas::full_specs()
+                .into_iter()
+                .find(|s| s.name == "job")
+                .unwrap();
+            assert!(crate::schema::validate(&schema.input_schema, &reconstructed).is_ok());
+            let arbitrary = stage_if_large(&store, operation, raw).unwrap();
+            assert!(load_job_handles(&store, &json!({"ref":arbitrary["result_id"]})).is_err());
+        }
+        assert!(validate_job_handles(&[json!({"target":"*","job_id":"aabbccdd"})]).is_err());
+        assert!(validate_job_handles(&[json!({"target":"asset","job_id":"bad"})]).is_err());
+    }
+
+    #[tokio::test]
+    async fn inventory_timeout_keeps_original_handles_but_real_errors_are_not_timeouts() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+        let found = job_wait_inventory(deadline, std::future::pending())
+            .await
+            .unwrap();
+        assert!(found.is_none());
+        let handles = job_test_handles(3);
+        let response = inventory_timeout_rows(handles.clone());
+        assert_eq!(response["finished"], false);
+        assert_eq!(response["pending"], json!(handles));
+        assert_eq!(response["status"][1]["probed"], false);
+        assert_eq!(response["status"][1]["target"], handles[1]["target"]);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let denied =
+            job_wait_inventory(deadline, async { Err(BridgeError::inventory("denied")) }).await;
+        assert!(matches!(denied, Err(BridgeError::Inventory(_))));
+    }
+
+    #[test]
+    fn batch_wait_returns_only_unfinished_handles_for_followup() {
+        let jobs = [
+            json!({"target":"asset-a","job_id":"aaaaaaaa"}),
+            json!({"target":"asset-b","job_id":"bbbbbbbb"}),
+            json!({"target":"asset-c","job_id":"cccccccc"}),
+        ];
+        let pairs: Vec<_> = jobs
+            .iter()
+            .map(|row| {
+                (
+                    Host {
+                        name: row["target"].as_str().unwrap().into(),
+                        ..Host::default()
+                    },
+                    row["job_id"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        let value = project_job_wait(
+            &jobs,
+            &pairs,
+            vec![
+                json!({"status":"done","exit_code":"0"}),
+                json!({"status":"failed","exit_code":"7"}),
+                json!({"status":"running","watch_timeout":true}),
+            ],
+            false,
+        );
+        assert_eq!(value["pending"], json!([jobs[2]]));
+        assert_eq!(value["status"][1]["exit_code"], "7");
+        assert_eq!(value["status"][1]["job_id"], "bbbbbbbb");
+        assert_eq!(value["status"][2]["target"], "asset-c");
+    }
 
     #[test]
     fn terminal_page_wait_defaults_to_fifteen_seconds() {
