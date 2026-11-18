@@ -19,7 +19,7 @@ use crate::inventory::{shell_quote, wrap_command, Host};
 use crate::scheduler::{queue_rejection, round, ExecutionSlots, Lane, SlotWait, Timings};
 use crate::storage::journal::ProgressSink;
 use crate::storage::results::{now, OutputPreview, ResultStore};
-use crate::transport::recovery::ConnectionRecovery;
+use crate::transport::recovery::{ConnectionRecovery, Lease};
 use crate::transport::session::{
     exec_end_marker, exec_packet, exec_start_marker, new_nonce, ShellSession,
 };
@@ -798,7 +798,8 @@ impl Runner {
             };
         }
         let mut timings = Timings::default();
-        let attempt = {
+        let mut active = None;
+        let result = {
             let attempt = self.attempt(
                 host,
                 &command,
@@ -810,6 +811,7 @@ impl Runner {
                 &err_path,
                 &sent_flag,
                 &mut timings,
+                &mut active,
             );
             if let Some(deadline) = spec.fs_deadline {
                 let result = if Instant::now() >= deadline {
@@ -821,29 +823,39 @@ impl Runner {
                         result = attempt => Ok(result),
                     }
                 };
-                match result {
-                    Ok(attempt) => attempt,
-                    Err(_) => {
-                        let sent = sent_flag.load(Ordering::SeqCst);
-                        let mut attempt = Attempt::not_started(
-                            Some("filesystem deadline expired".into()),
-                            if sent {
-                                "execution"
-                            } else {
-                                "filesystem_deadline"
-                            },
-                        );
-                        attempt.code = 124;
-                        attempt.timed_out = true;
-                        attempt.sent = sent;
-                        attempt.executed = Some(sent);
-                        attempt
-                    }
-                }
+                result
             } else {
-                attempt.await
+                Ok(attempt.await)
             }
         };
+        let attempt = match result {
+            Ok(attempt) => attempt,
+            Err(_) => {
+                // The attempt future and its session gate are dropped, but its
+                // target lease lives here. Retire a possibly still running Fs
+                // shell before allowing replacement or reuse.
+                if active.is_some() && spec.internal_session {
+                    if let Some(session_id) = spec.session_id.as_deref() {
+                        let _ = self.close_session(host, session_id, true).await;
+                    }
+                }
+                let sent = sent_flag.load(Ordering::SeqCst);
+                let mut attempt = Attempt::not_started(
+                    Some("filesystem deadline expired".into()),
+                    if sent {
+                        "execution"
+                    } else {
+                        "filesystem_deadline"
+                    },
+                );
+                attempt.code = 124;
+                attempt.timed_out = true;
+                attempt.sent = sent;
+                attempt.executed = Some(sent);
+                attempt
+            }
+        };
+        drop(active);
         let elapsed = started_at.elapsed().as_secs_f64();
         // Every stored stream must exist even when the attempt failed early.
         for path in [&out_path, &err_path] {
@@ -979,8 +991,8 @@ impl Runner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn attempt(
-        &self,
+    async fn attempt<'a>(
+        &'a self,
         host: &Host,
         command: &str,
         body: &str,
@@ -991,6 +1003,7 @@ impl Runner {
         err_path: &std::path::Path,
         sent: &AtomicBool,
         timings: &mut Timings,
+        active: &mut Option<Lease<'a>>,
     ) -> Attempt {
         let key = match host.connection_key() {
             Ok(key) => key,
@@ -998,8 +1011,8 @@ impl Runner {
         };
         // Take the target lease before a session gate: a draining connection must not be
         // held by a request that is only waiting for an idle shell.
-        let lease = match self.recovery.enter(&key, queue_timeout).await {
-            Ok(lease) => lease,
+        match self.recovery.enter(&key, queue_timeout).await {
+            Ok(lease) => *active = Some(lease),
             Err(error) => {
                 return Attempt {
                     code: 124,
@@ -1015,7 +1028,7 @@ impl Runner {
                     session_state: None,
                 }
             }
-        };
+        }
         let session_gate = match &spec.session_id {
             Some(session_id) => {
                 let gate = {
@@ -1118,9 +1131,7 @@ impl Runner {
                 }
             }
         };
-        // The lease stays held across the whole remote exchange: a replacement triggered
-        // by another channel on this connection must wait until this one is finished.
-        let _lease = lease;
+        // The caller holds the lease across the entire remote exchange and cleanup.
         let deadline = Duration::from_secs_f64(timeout);
         let attempt = if let Some(session_id) = &spec.session_id {
             self.run_on_session(
