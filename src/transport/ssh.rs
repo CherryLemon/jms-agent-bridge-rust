@@ -122,8 +122,17 @@ pub struct ChannelShell {
 }
 
 pub struct ChannelWriter {
-    inner: russh::ChannelWriteHalf<Msg>,
+    inner: WriteChannel,
     closed: Arc<AtomicBool>,
+}
+
+enum WriteChannel {
+    Ssh(russh::ChannelWriteHalf<Msg>),
+    #[cfg(test)]
+    Stalled {
+        prefix_len: usize,
+        frames: mpsc::Sender<Option<Bytes>>,
+    },
 }
 
 pub struct ChannelReader {
@@ -174,7 +183,7 @@ impl ChannelShell {
         });
         Self {
             writer: ChannelWriter {
-                inner: write,
+                inner: WriteChannel::Ssh(write),
                 closed: Arc::new(AtomicBool::new(false)),
             },
             reader: ChannelReader {
@@ -193,6 +202,19 @@ impl ChannelShell {
 }
 
 impl ChannelWriter {
+    /// Test sink that accepts only a prefix; `None` represents a channel close.
+    #[cfg(test)]
+    pub(crate) fn mock_stalled(prefix_len: usize) -> (mpsc::Receiver<Option<Bytes>>, Self) {
+        let (frames, receiver) = mpsc::channel(4);
+        (
+            receiver,
+            Self {
+                inner: WriteChannel::Stalled { prefix_len, frames },
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+        )
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
@@ -201,10 +223,19 @@ impl ChannelWriter {
         if self.closed.load(Ordering::SeqCst) {
             return Err(BridgeError::ssh("channel is closed"));
         }
+        let inner = match &self.inner {
+            WriteChannel::Ssh(inner) => inner,
+            #[cfg(test)]
+            WriteChannel::Stalled { prefix_len, frames } => {
+                let prefix = Bytes::copy_from_slice(&data[..data.len().min(*prefix_len)]);
+                frames.send(Some(prefix)).await.expect("test sink dropped");
+                return std::future::pending().await;
+            }
+        };
         let mut remaining = data;
         while !remaining.is_empty() {
             let before = remaining.len();
-            self.inner.data(&mut remaining).await.map_err(|error| {
+            inner.data(&mut remaining).await.map_err(|error| {
                 self.closed.store(true, Ordering::SeqCst);
                 BridgeError::ssh(format!("channel write failed: {error}"))
             })?;
@@ -218,7 +249,13 @@ impl ChannelWriter {
     }
 
     pub async fn write_eof(&self) {
-        let _ = self.inner.eof().await;
+        match &self.inner {
+            WriteChannel::Ssh(inner) => {
+                let _ = inner.eof().await;
+            }
+            #[cfg(test)]
+            WriteChannel::Stalled { .. } => panic!("test sink does not support EOF"),
+        }
     }
 
     pub async fn signal(&self, signal: &str) -> BridgeResult<()> {
@@ -233,7 +270,12 @@ impl ChannelWriter {
                 )))
             }
         };
-        self.inner
+        let inner = match &self.inner {
+            WriteChannel::Ssh(inner) => inner,
+            #[cfg(test)]
+            WriteChannel::Stalled { .. } => panic!("test sink does not support signals"),
+        };
+        inner
             .signal(sig)
             .await
             .map_err(|error| BridgeError::ssh(format!("signal failed: {error}")))
@@ -241,7 +283,15 @@ impl ChannelWriter {
 
     pub async fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        let _ = self.inner.close().await;
+        match &self.inner {
+            WriteChannel::Ssh(inner) => {
+                let _ = inner.close().await;
+            }
+            #[cfg(test)]
+            WriteChannel::Stalled { frames, .. } => {
+                let _ = frames.send(None).await;
+            }
+        }
     }
 }
 

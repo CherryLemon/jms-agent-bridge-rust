@@ -137,6 +137,69 @@ max_parallel = 2\n",
         .unwrap_err();
     assert!(error.message().contains("unknown terminal session"));
 
+    // Historical command output is addressable through both terminal entry
+    // points without creating a shell, even when its old handle is absent.
+    let command_id = runtime
+        .store
+        .create(object(json!({
+            "kind": "terminal", "session_id": "previous-shell"
+        })))
+        .unwrap();
+    std::fs::write(
+        runtime.store.path(&command_id, "stdout").unwrap(),
+        b"recorded",
+    )
+    .unwrap();
+    runtime
+        .store
+        .finish(
+            &command_id,
+            object(json!({
+                "execution_state": "completed", "exit_code": 0, "ok": true
+            })),
+        )
+        .unwrap();
+    let first = server
+        .dispatch(
+            "terminal",
+            object(json!({
+                "action": "read", "session": "previous-shell",
+                "options": {"result_id": command_id, "max_bytes": 3}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["stdout"], "rec");
+    let second = server
+        .dispatch(
+            "call",
+            object(json!({
+                "operation": "terminal_read", "arguments": {
+                    "session": "previous-shell", "result_id": command_id, "cursor": first["cursor"]
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["stdout"], "orded");
+    let wrong_session = server
+        .dispatch(
+            "terminal",
+            object(json!({
+                "action": "read", "session": "unrelated",
+                "options": {"result_id": command_id}
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(wrong_session
+        .message()
+        .contains("not a command for this terminal"));
+
+    // A pre-fix partial write was saved as executed=true even without START.
+    // Both terminal and general metadata reads clarify it without migrating the file.
+    legacy_partial_send_metadata_is_corrected_on_read(&runtime, &server).await;
+
     // Failure counters stay visible in the receipts surface.
     let status = runtime.status().await;
     assert!(status.get("execution").is_some());
@@ -209,6 +272,95 @@ max_parallel = 2\n",
     );
 
     runtime.shutdown().await;
+}
+
+async fn legacy_partial_send_metadata_is_corrected_on_read(
+    runtime: &BridgeRuntime,
+    server: &BridgeServer,
+) {
+    use jms_bridge::storage::journal::ProgressSink;
+
+    let old_bytes = include_bytes!("fixtures/terminal_legacy_partial_send.json");
+    let old: Value = serde_json::from_slice(old_bytes).unwrap();
+    let id = old["result_id"].as_str().unwrap();
+    let directory = runtime.store.directory(id).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("meta.json");
+    std::fs::write(&path, old_bytes).unwrap();
+    let terminal = server
+        .dispatch(
+            "terminal",
+            object(json!({
+                "action": "read", "session": old["session_id"],
+                "options": {"result_id": id}
+            })),
+        )
+        .await
+        .unwrap();
+    let meta = server
+        .dispatch("meta", object(json!({"ref": format!("result:{id}")})))
+        .await
+        .unwrap();
+    let receipt_id = "legacy-terminal-receipt";
+    let receipt_result = id.to_string();
+    runtime
+        .journal
+        .execute(
+            receipt_id,
+            "terminal",
+            &json!({}),
+            move |progress| async move {
+                progress.record("execution_results", json!({"result_id": receipt_result}))?;
+                Ok(json!({"result_id": receipt_result}))
+            },
+        )
+        .await
+        .unwrap();
+    let receipt = runtime.request_status(receipt_id).await.unwrap();
+    for projection in [
+        &terminal,
+        &meta,
+        &receipt["execution_results"][0]["result_status"],
+    ] {
+        assert_eq!(projection.get("executed"), Some(&Value::Null));
+        assert_eq!(projection["failure_stage"], "channel");
+        assert_eq!(projection["completion_unknown"], true);
+        assert_eq!(projection["error"], old["error"]);
+    }
+    assert_eq!(terminal["state"], "unknown");
+    assert_eq!(meta["execution_state"], "unknown");
+    assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+
+    // Unrelated annotations must not bake the read-time correction into the record.
+    runtime
+        .store
+        .annotate(id, object(json!({"diagnostic": "checked"})))
+        .unwrap();
+    let annotated: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(annotated["executed"], true);
+    assert_eq!(runtime.store.metadata(id).unwrap()["executed"], Value::Null);
+
+    // Actual START evidence from legacy capture used its own channel error and
+    // could include exit_code=null. Neither that nor other kinds/stages match.
+    for (key, value) in [
+        (
+            "error",
+            json!("terminal command timed out; completion is unknown"),
+        ),
+        ("exit_code", Value::Null),
+        ("kind", json!("run")),
+        ("status", json!("running")),
+        ("failure_stage", json!("closed_by_caller")),
+    ] {
+        let mut nonmatch = old.clone();
+        nonmatch[key] = value;
+        std::fs::write(&path, serde_json::to_vec(&nonmatch).unwrap()).unwrap();
+        assert_eq!(
+            runtime.store.metadata(id).unwrap()["executed"],
+            true,
+            "{key}"
+        );
+    }
 }
 
 fn object(value: Value) -> Map<String, Value> {

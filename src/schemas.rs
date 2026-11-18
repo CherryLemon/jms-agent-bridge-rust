@@ -183,6 +183,7 @@ reuse handle. Running is not completion; reads honour cursors.",
                                        "properties": {"stdout": {"type": "integer", "minimum": 0},
                                                       "stderr": {"type": "integer", "minimum": 0}},
                                        "description": "Re-read from absolute byte offsets."},
+                            "result_id": string("read: bind to this command."),
                             "signal": {"type": "string", "enum": ["INT", "TERM"]},
                             "eof": boolean(false, "write: close stdin."),
                             "allow_dangerous": boolean(false, DANGEROUS_FLAG_DESCRIPTION),
@@ -467,6 +468,7 @@ fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
     exec["request_id"] = request_id_property();
     let mut read = pages();
     read["session"] = json!({"type": "string"});
+    read["result_id"] = json!({"type": "string", "minLength": 1});
     let mut write = pages();
     write["session"] = json!({"type": "string"});
     write["input"] = json!({"type": "string", "maxLength": 1048576});
@@ -854,7 +856,7 @@ fn public_view(name: &str, schema: Value) -> Value {
         let hint = match name {
             "run" => "script_path, cwd, env, container, image, docker_args, session_id, timeout, max_output_bytes",
             "fs" => "action-specific fields (offset, limit, start_line, local_path, overwrite, ...)",
-            _ => "target, container, image, docker_args, cwd, env, wait_ms, max_bytes, cursor, signal, eof",
+            _ => "target, container, image, docker_args, cwd, env, wait_ms, max_bytes, cursor, result_id, signal, eof",
         };
         options.clear();
         options.insert("type".into(), Value::from("object"));
@@ -872,6 +874,27 @@ fn public_view(name: &str, schema: Value) -> Value {
 mod tests {
     use super::*;
     use crate::schema::validate;
+
+    #[test]
+    fn terminal_read_accepts_command_id_through_both_entries() {
+        let arguments = json!({"action":"read","session":"s","options":{"result_id":"r"}});
+        let terminal = full_specs()
+            .into_iter()
+            .find(|tool| tool.name == "terminal")
+            .unwrap();
+        validate(&terminal.input_schema, &arguments).unwrap();
+        let legacy = operations();
+        validate(
+            &legacy["terminal_read"]["inputSchema"],
+            &json!({"session":"s","result_id":"r"}),
+        )
+        .unwrap();
+        assert!(validate(
+            &legacy["terminal_write"]["inputSchema"],
+            &json!({"session":"s","result_id":"r","input":"text"}),
+        )
+        .is_err());
+    }
 
     #[test]
     fn descriptions_steer_repeated_container_work_to_terminal() {
