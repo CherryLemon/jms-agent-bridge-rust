@@ -335,59 +335,79 @@ where
     F: Fn(Host, String) -> Fut + Sync,
     Fut: std::future::Future<Output = BridgeResult<Value>>,
 {
-    use futures::{stream, StreamExt};
+    use futures::{stream::FuturesUnordered, StreamExt};
+    use std::{cmp::Reverse, collections::BinaryHeap};
+    use tokio::time::{sleep_until, Instant};
     const MAX_IN_FLIGHT: usize = 4;
+
     let mut seen = std::collections::HashSet::new();
-    let mut pending: Vec<_> = pairs
+    let unique: Vec<_> = pairs
         .iter()
         .filter(|(host, id)| seen.insert(pair_key(host, id)))
-        .cloned()
         .collect();
+    let now = Instant::now();
+    let mut scheduled: BinaryHeap<_> = (0..unique.len())
+        .map(|index| Reverse((now, index)))
+        .collect();
+    let mut in_flight = FuturesUnordered::new();
     let mut last = std::collections::HashMap::new();
-    while !pending.is_empty() && tokio::time::Instant::now() < deadline {
-        let work = stream::iter(pending.clone()).map(|(host, id)| {
+
+    while Instant::now() < deadline {
+        while in_flight.len() < MAX_IN_FLIGHT {
+            let Some(&Reverse((due, index))) = scheduled.peek() else {
+                break;
+            };
+            let now = Instant::now();
+            if now < due || now >= deadline {
+                break;
+            }
+            scheduled.pop();
+            let (host, id) = unique[index];
             let probe = &probe;
-            async move {
-                if tokio::time::Instant::now() >= deadline {
+            in_flight.push(async move {
+                // Enqueuing a future does not poll it. Check again at actual start.
+                if Instant::now() >= deadline {
                     return None;
                 }
-                let key = pair_key(&host, &id);
-                let name = host.name.clone();
-                let row = match probe(host, id).await {
+                let key = pair_key(host, id);
+                let row = match probe(host.clone(), id.clone()).await {
                     Ok(row) => row,
-                    Err(error) => json!({"host":name,"job_id":key.1,"ok":false,
+                    Err(error) => json!({"host":host.name,"job_id":id,"ok":false,
                                          "error":error.message()}),
                 };
-                Some((key, row))
-            }
-        });
-        let mut work = std::pin::pin!(work.buffer_unordered(MAX_IN_FLIGHT));
-        loop {
-            tokio::select! {
-                biased;
-                _ = tokio::time::sleep_until(deadline) => {
-                    let finished = pending.iter().all(|(host, id)|
-                        last.get(&pair_key(host, id)).is_some_and(is_terminal_status)
-                    );
-                    return (collect_rows(pairs, &last, !finished), finished);
-                }
-                observed = work.next() => match observed {
-                    Some(Some((key,row))) => { last.insert(key, row); },
-                    Some(None) => {},
-                    None => break,
-                },
-            }
+                Some((index, key, row))
+            });
         }
-        pending.retain(|(host, id)| {
-            !last
-                .get(&pair_key(host, id))
-                .is_some_and(is_terminal_status)
-        });
-        if !pending.is_empty() {
-            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)).await;
+
+        if scheduled.is_empty() && in_flight.is_empty() {
+            return (collect_rows(pairs, &last, false), true);
+        }
+
+        // A hanging status request occupies only its own slot. A timely running
+        // response can be rechecked independently at its own next poll time.
+        let next_ready = if in_flight.len() < MAX_IN_FLIGHT {
+            scheduled
+                .peek()
+                .map(|Reverse((due, _))| *due)
+                .unwrap_or(deadline)
+        } else {
+            deadline
+        };
+        tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => break,
+            observed = in_flight.next(), if !in_flight.is_empty() => {
+                if let Some(Some((index, key, row))) = observed {
+                    if !is_terminal_status(&row) {
+                        scheduled.push(Reverse((Instant::now() + interval, index)));
+                    }
+                    last.insert(key, row);
+                }
+            }
+            _ = sleep_until(next_ready) => {}
         }
     }
-    let finished = pending.is_empty();
+    let finished = last.len() == unique.len() && last.values().all(is_terminal_status);
     (collect_rows(pairs, &last, !finished), finished)
 }
 
@@ -956,6 +976,45 @@ mod tests {
         assert!(observations
             .iter()
             .all(|(host, time)| host != "queued" && *time < deadline));
+    }
+
+    #[tokio::test]
+    async fn running_handle_is_repolled_while_another_probe_hangs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::time::Instant;
+        let pair = |name: &str| {
+            (
+                Host {
+                    name: name.into(),
+                    ..Host::default()
+                },
+                "abcd1234".to_string(),
+            )
+        };
+        let counters = AtomicUsize::new(0);
+        let started_at = Instant::now();
+        let (rows, finished) = watch_pairs(
+            &[pair("fast"), pair("hung")],
+            started_at + Duration::from_millis(150),
+            Duration::from_millis(5),
+            |host, id| {
+                let counters = &counters;
+                async move {
+                    if host.name == "hung" {
+                        return std::future::pending().await;
+                    }
+                    let attempt = counters.fetch_add(1, Ordering::SeqCst);
+                    let status = if attempt == 0 { "running" } else { "done" };
+                    Ok(json!({"job_id":id,"host":host.name,"status":status,"exit_code":"0"}))
+                }
+            },
+        )
+        .await;
+        assert!(!finished);
+        assert_eq!(counters.load(Ordering::SeqCst), 2);
+        assert_eq!(rows[0]["status"], "done");
+        assert_eq!(rows[1]["watch_timeout"], true);
     }
 
     #[tokio::test]

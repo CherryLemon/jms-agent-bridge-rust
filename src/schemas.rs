@@ -208,7 +208,7 @@ reuse handle. Running is not completion; reads honour cursors.",
                     "target":{"type":"string","minLength":1},
                     "command":{"type":"string","maxLength":1048576},
                     "job_id":{"type":"string","pattern":"^[0-9a-f]{8}$"},
-                    "jobs":job_pairs_schema(),
+                    "jobs":{"oneOf":[job_pairs_schema(),job_batch_ref_schema()]},
                     "allow_dangerous":boolean(false, DANGEROUS_FLAG_DESCRIPTION),
                     "timeout":{"type":"number","minimum":1,"maximum":180,"default":50},
                     "interval":{"type":"number","minimum":0.1,"maximum":30,"default":2},
@@ -548,6 +548,11 @@ fn job_pairs_schema() -> Value {
         "properties":{"target":{"type":"string","minLength":1},
                       "job_id":{"type":"string","pattern":"^[0-9a-f]{8}$"}}
     }})
+}
+
+pub(crate) fn job_batch_ref_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["ref"],
+           "properties":{"ref":{"type":"string","pattern":"^[0-9a-f]{32}$"}}})
 }
 
 fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool)> {

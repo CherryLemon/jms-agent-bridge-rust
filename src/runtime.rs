@@ -754,11 +754,9 @@ require allow_dangerous=true",
                 "job wait takes jobs or targets/job_id, not both",
             ));
         }
-        let jobs = payload
+        let input = payload
             .get("jobs")
-            .and_then(Value::as_array)
-            .filter(|jobs| !jobs.is_empty())
-            .ok_or_else(|| BridgeError::invalid("job wait requires nonempty jobs"))?;
+            .ok_or_else(|| BridgeError::invalid("job wait requires jobs"))?;
         let timeout = payload
             .get("timeout")
             .and_then(Value::as_f64)
@@ -768,30 +766,19 @@ require allow_dangerous=true",
             .and_then(Value::as_f64)
             .unwrap_or(2.0);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout);
-        let inventory = tokio::time::timeout_at(deadline, self.inventory())
-            .await
-            .map_err(|_| {
-                BridgeError::invalid(
-                    "job wait timed out resolving permitted targets; no probe started",
-                )
-            })??;
-        let mut handles = Vec::with_capacity(jobs.len());
-        for handle in jobs {
-            let handle = handle
-                .as_object()
-                .ok_or_else(|| BridgeError::invalid("job handle must be an object"))?;
-            let target = used_string(handle, "target")?;
-            let id = used_string(handle, "job_id")?;
-            if let Some(error) = validate_job_id(&id) {
-                return Err(BridgeError::invalid(error));
-            }
-            handles.push((target, id));
-        }
+        // Validate syntax and references before any inventory/gateway access. A
+        // typed local result is only a source of handles, never authorization.
+        let jobs = load_job_handles(&self.store, input)?;
+        let handles = validate_job_handles(&jobs)?;
+        let Some(inventory) = job_wait_inventory(deadline, self.inventory()).await? else {
+            return stage_job_batch(&self.store, JobBatch::Wait, inventory_timeout_rows(jobs));
+        };
         let pairs = inventory.resolve_job_targets(&handles)?;
         let (status, finished) = self.jobs.wait_until(&pairs, deadline, interval).await;
-        self.stage_operation_result(
-            "jms_job_wait",
-            project_job_wait(jobs, &pairs, status, finished),
+        stage_job_batch(
+            &self.store,
+            JobBatch::Wait,
+            project_job_wait(&jobs, &pairs, status, finished),
         )
     }
 
@@ -855,7 +842,11 @@ require allow_dangerous=true",
                 map.insert("request_id".into(), Value::from(request_id.clone()));
             }
             if job_submit_facade {
-                value = project_job_submission(value);
+                return stage_job_batch(
+                    &self.store,
+                    JobBatch::Submit,
+                    project_job_submission(value),
+                );
             }
             return self.stage_operation_result(&operation_for_task, value);
         }
@@ -1489,6 +1480,162 @@ fn unknown_row(host: &str, message: &str) -> Map<String, Value> {
     .unwrap_or_default()
 }
 
+#[derive(Clone, Copy)]
+enum JobBatch {
+    Submit,
+    Wait,
+}
+
+impl JobBatch {
+    fn scope(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Submit => ("jms_submit_job", "jobs"),
+            Self::Wait => ("jms_job_wait", "pending"),
+        }
+    }
+}
+
+const JOB_BATCH_RESULT: &str = "job_batch";
+
+/// Stage bulky diagnostic rows first. Pass the inline handles (or a typed
+/// continuation reference when the handles alone are too large) directly to wait.
+fn stage_job_batch(store: &ResultStore, scope: JobBatch, value: Value) -> BridgeResult<Value> {
+    let bytes = serde_json::to_vec(&value)?;
+    if bytes.len() <= OPERATION_BUDGET {
+        return Ok(value);
+    }
+    let (operation, section) = scope.scope();
+    let metadata = json!({"kind":JOB_BATCH_RESULT,"operation":operation,
+                          "handle_section":section,"bytes":bytes.len()})
+    .as_object()
+    .expect("object")
+    .clone();
+    let result_id = store.save_serialized(&value, &bytes, metadata)?;
+    let mut result = json!({
+        "staged": true,
+        "result_id": result_id,
+        "operation": operation,
+        "bytes": bytes.len(),
+        "note": "Full diagnostics: read_result with stream='result'."
+    });
+    for field in [
+        "ok",
+        "finished",
+        "request_id",
+        "request_state",
+        "duplicate",
+        "execution_replayed",
+        "completion_unknown",
+        "watch_timeout",
+        "inventory_timed_out",
+    ] {
+        if let Some(item) = value.get(field) {
+            result[field] = item.clone();
+        }
+    }
+    if let Some(handles) = value.get(section) {
+        result[section] = handles.clone();
+        if serde_json::to_vec(&result)?.len() > OPERATION_BUDGET {
+            result[section] = json!({"ref": result_id});
+        }
+    }
+    Ok(result)
+}
+
+fn load_job_handles(store: &ResultStore, input: &Value) -> BridgeResult<Vec<Value>> {
+    if let Some(handles) = input.as_array() {
+        return Ok(handles.clone());
+    }
+    crate::schema::validate(&schemas::job_batch_ref_schema(), input).map_err(|_| {
+        BridgeError::invalid("jobs must be a handle array or a job continuation ref")
+    })?;
+    let id = input["ref"].as_str().expect("validated reference");
+    let meta = store.metadata(id)?;
+    let scope = (
+        meta.get("operation").and_then(Value::as_str),
+        meta.get("handle_section").and_then(Value::as_str),
+    );
+    let section = match scope {
+        (Some("jms_submit_job"), Some("jobs")) => "jobs",
+        (Some("jms_job_wait"), Some("pending")) => "pending",
+        _ => {
+            return Err(BridgeError::invalid(
+                "result is not a reusable job continuation",
+            ))
+        }
+    };
+    if meta.get("kind").and_then(Value::as_str) != Some(JOB_BATCH_RESULT)
+        || meta.get("status").and_then(Value::as_str) != Some("complete")
+    {
+        return Err(BridgeError::invalid(
+            "result is not a reusable job continuation",
+        ));
+    }
+    let value: Value = serde_json::from_slice(&std::fs::read(store.path(id, "result")?)?)?;
+    value
+        .get(section)
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| BridgeError::invalid("job continuation has no saved handle array"))
+}
+
+fn validate_job_handles(jobs: &[Value]) -> BridgeResult<Vec<(String, String)>> {
+    if jobs.is_empty() {
+        return Err(BridgeError::invalid("job wait requires nonempty handles"));
+    }
+    jobs.iter()
+        .map(|handle| {
+            let fields = handle
+                .as_object()
+                .filter(|fields| fields.len() == 2)
+                .ok_or_else(|| BridgeError::invalid("job handle must contain target and job_id"))?;
+            let target = used_string(fields, "target")?;
+            let id = used_string(fields, "job_id")?;
+            if let Some(error) = validate_job_id(&id) {
+                return Err(BridgeError::invalid(error));
+            }
+            if target.trim().is_empty()
+                || target.eq_ignore_ascii_case("all")
+                || target.contains(['*', '?', '[', ']'])
+            {
+                return Err(BridgeError::invalid(
+                    "job handles require an exact permitted target",
+                ));
+            }
+            Ok((target, id))
+        })
+        .collect()
+}
+
+async fn job_wait_inventory(
+    deadline: tokio::time::Instant,
+    inventory: impl std::future::Future<Output = BridgeResult<crate::inventory::Inventory>>,
+) -> BridgeResult<Option<crate::inventory::Inventory>> {
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(None);
+    }
+    match tokio::time::timeout_at(deadline, inventory).await {
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(inventory)) if tokio::time::Instant::now() < deadline => Ok(Some(inventory)),
+        Ok(Ok(_)) | Err(_) => Ok(None),
+    }
+}
+
+fn inventory_timeout_rows(jobs: Vec<Value>) -> Value {
+    let status: Vec<_> = jobs
+        .iter()
+        .map(|handle| {
+            json!({
+                "target":handle["target"], "job_id":handle["job_id"],
+                "status":"unknown", "ok":false, "watch_timeout":true, "probed":false,
+                "reason":"inventory_timeout",
+            })
+        })
+        .collect();
+    json!({"ok":false,"finished":false,"watch_timeout":true,"inventory_timed_out":true,
+           "status":status,"pending":jobs})
+}
+
 fn project_job_wait(
     jobs: &[Value],
     pairs: &[(Host, String)],
@@ -1601,16 +1748,18 @@ fn job_row(handle: &crate::jobs::JobHandle, outcome: &crate::execution::ExecOutc
     Value::Object(row)
 }
 
+const OPERATION_BUDGET: usize = 8 * 1024;
+
 /// Save an oversized operation payload and return a bounded summary of it.
 pub fn stage_if_large(
     store: &crate::storage::results::ResultStore,
     operation: &str,
     value: Value,
 ) -> BridgeResult<Value> {
-    const BUDGET: usize = 8 * 1024;
+    let budget = OPERATION_BUDGET;
     // Serialize once: the same bytes decide the budget, feed the preview and get saved.
     let bytes = serde_json::to_vec(&value)?;
-    if bytes.len() <= BUDGET {
+    if bytes.len() <= budget {
         return Ok(value);
     }
     // `serde_json` output is UTF-8; borrow it instead of copying the whole payload.
@@ -1666,7 +1815,7 @@ pub fn stage_if_large(
     summary.insert(
         "note".into(),
         Value::from(format!(
-            "response exceeded {BUDGET} bytes; full payload saved as {result_id} (read_result with stream='result')"
+            "response exceeded {budget} bytes; full payload saved as {result_id} (read_result with stream='result')"
         )),
     );
     Ok(Value::Object(summary))
@@ -1816,6 +1965,117 @@ fn meta_section_keys(section: &str) -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job_test_store() -> (tempfile::TempDir, ResultStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        (dir, store)
+    }
+
+    fn job_test_handles(count: u32) -> Vec<Value> {
+        (0..count)
+            .map(|i| json!({"target":format!("asset-{i:012}"),"job_id":format!("{i:08x}")}))
+            .collect()
+    }
+
+    #[test]
+    fn stage_keeps_large_submit_handles_inline_when_only_diagnostics_overflow() {
+        let (_dir, store) = job_test_store();
+        let handles = job_test_handles(30);
+        let submissions: Vec<_> = handles.iter().map(|h| json!({
+            "host": h["target"], "job_id":h["job_id"], "launch_state":"acknowledged", "diagnostic":"x".repeat(500),
+        })).collect();
+        let raw =
+            json!({"ok":true,"request_id":"original","jobs":handles,"submissions":submissions});
+        let staged = stage_job_batch(&store, JobBatch::Submit, raw.clone()).unwrap();
+        assert_eq!(staged["staged"], true);
+        assert_eq!(staged["request_id"], "original");
+        assert_eq!(staged["jobs"], raw["jobs"]);
+        assert!(staged.get("submissions").is_none());
+        assert!(staged.to_string().len() <= OPERATION_BUDGET);
+        let full: Value = serde_json::from_slice(
+            &std::fs::read(
+                store
+                    .path(staged["result_id"].as_str().unwrap(), "result")
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(full, raw);
+    }
+
+    #[test]
+    fn stage_keeps_single_pending_handle_when_many_rows_finish() {
+        let (_dir, store) = job_test_store();
+        let handles = job_test_handles(200);
+        let pending = json!([handles.last().unwrap()]);
+        let status: Vec<_> = handles
+            .iter()
+            .map(|h| {
+                json!({
+                    "target":h["target"],"job_id":h["job_id"],"status":"done","exit_code":"0",
+                })
+            })
+            .collect();
+        let staged = stage_job_batch(
+            &store,
+            JobBatch::Wait,
+            json!({
+                "ok":false,"finished":false,"pending":pending,"status":status,
+            }),
+        )
+        .unwrap();
+        assert_eq!(staged["staged"], true);
+        assert_eq!(staged["pending"], pending);
+        assert_eq!(staged["finished"], false);
+    }
+
+    #[test]
+    fn oversized_handles_roundtrip_only_through_typed_job_continuations() {
+        let (_dir, store) = job_test_store();
+        let handles = job_test_handles(220);
+        for scope in [JobBatch::Submit, JobBatch::Wait] {
+            let (operation, field) = scope.scope();
+            let mut raw = json!({"ok":true});
+            raw[field] = json!(handles);
+            let staged = stage_job_batch(&store, scope, raw.clone()).unwrap();
+            assert!(staged.to_string().len() <= OPERATION_BUDGET);
+            assert_eq!(staged[field]["ref"], staged["result_id"]);
+            let restored = load_job_handles(&store, &staged[field]).unwrap();
+            assert_eq!(restored, handles);
+            assert!(validate_job_handles(&restored).is_ok());
+            let reconstructed: Value = json!({"action":"wait","jobs":staged[field]});
+            let schema = schemas::full_specs()
+                .into_iter()
+                .find(|s| s.name == "job")
+                .unwrap();
+            assert!(crate::schema::validate(&schema.input_schema, &reconstructed).is_ok());
+            let arbitrary = stage_if_large(&store, operation, raw).unwrap();
+            assert!(load_job_handles(&store, &json!({"ref":arbitrary["result_id"]})).is_err());
+        }
+        assert!(validate_job_handles(&[json!({"target":"*","job_id":"aabbccdd"})]).is_err());
+        assert!(validate_job_handles(&[json!({"target":"asset","job_id":"bad"})]).is_err());
+    }
+
+    #[tokio::test]
+    async fn inventory_timeout_keeps_original_handles_but_real_errors_are_not_timeouts() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+        let found = job_wait_inventory(deadline, std::future::pending())
+            .await
+            .unwrap();
+        assert!(found.is_none());
+        let handles = job_test_handles(3);
+        let response = inventory_timeout_rows(handles.clone());
+        assert_eq!(response["finished"], false);
+        assert_eq!(response["pending"], json!(handles));
+        assert_eq!(response["status"][1]["probed"], false);
+        assert_eq!(response["status"][1]["target"], handles[1]["target"]);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let denied =
+            job_wait_inventory(deadline, async { Err(BridgeError::inventory("denied")) }).await;
+        assert!(matches!(denied, Err(BridgeError::Inventory(_))));
+    }
 
     #[test]
     fn batch_wait_returns_only_unfinished_handles_for_followup() {

@@ -179,7 +179,11 @@ concurrent duplicate can report `request_state: "running"`; retry or reconcile
 the same ID to recover its final handles. An equivalent legacy
 `call(operation="jms_submit_job", request_id=...)` uses the same durable receipt.
 `wait` returns ordered `status` rows and a reusable `pending` array if the shared
-watch deadline expires. The timeout never cancels a job. Legacy
+watch deadline expires. The timeout never cancels a job. Large diagnostics are saved
+under `result_id`; `jobs` or `pending` remains inline when it fits. If the
+handles themselves are too large, the same field contains `{"ref":"<id>"}`.
+Pass that object unchanged as `jobs` to continue; the bridge checks each target
+against the current permitted inventory before probing it. Legacy
 `call(operation="jms_job_wait")` with a single ID is unchanged.
 
 ## State
@@ -214,7 +218,7 @@ the same state directory can be reused when switching binaries — see
   `$'…'` quoting) instead of a named argv helper, so a foreground REPL read
   cannot swallow the completion marker while `import x` still works.
 * The advertised schema carries only the common fields plus an `options` entry
-  point (about 5.8 KB for all eight tools, down from 10.2 KB with every field
+  point (under 7 KiB for all eight tools, down from 10.2 KB with every field
   spelled out); validation always uses the complete definition, and
   `discover(operation=<tool>)` returns it. The `fs` action fields are documented
   per action through `discover(operation="jms_fs", query=<action>)`.
