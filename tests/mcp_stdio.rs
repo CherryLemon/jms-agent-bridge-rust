@@ -125,4 +125,31 @@ fn stdio_stdout_carries_only_mcp_messages() {
         .expect("tool result text");
     let value: serde_json::Value = serde_json::from_str(text).expect("compact JSON");
     assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    for (id, arguments, expected_field) in [
+        (
+            4,
+            serde_json::json!({"operation": "terminal_read"}),
+            "inputSchema",
+        ),
+        (
+            5,
+            serde_json::json!({"operation": "terminal_read", "view": "signature"}),
+            "signature",
+        ),
+    ] {
+        session.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "discover", "arguments": arguments},
+        }));
+        let reply = session.receive();
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(body.get(expected_field).is_some(), "{body}");
+        if id == 5 {
+            assert!(body["signature"]
+                .as_str()
+                .unwrap()
+                .contains("wait_ms?[0..30000]"));
+        }
+    }
 }

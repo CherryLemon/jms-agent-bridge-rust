@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::schema::strip_titles;
 
@@ -220,14 +221,15 @@ continue with next_offset.",
         ToolSpec {
             name: "discover",
             description:
-                "Search assets or operation names; operation returns one schema. Inventory \
-does not show accelerator occupancy; use jms_accelerator_status for live checks.",
+                "Find assets or operations. For accelerator occupancy use jms_accelerator_status.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "query": string("Category, operation substring, or asset name/IP/UUID."),
-                    "operation": string("Return this operation's full schema."),
+                    "query": string("Category or search."),
+                    "operation": {"type": "string"},
+                    "view": {"type": "string", "enum": ["full", "signature"], "default": "full"},
+                    "if_none_match": string("Prior operations etag."),
                     "topic": {"type": "string", "enum": ["operations", "assets", "status"], "default": "operations"},
                     "limit": integer(1, 30, 10, "Rows per page."),
                     "offset": integer(0, 100000, 0, "Rows to skip."),
@@ -290,6 +292,113 @@ fn request_id_property() -> Value {
 pub fn operations() -> &'static BTreeMap<String, Value> {
     static OPERATIONS: OnceLock<BTreeMap<String, Value>> = OnceLock::new();
     OPERATIONS.get_or_init(build_operations)
+}
+
+pub fn exact_operation_schema(name: &str, query: &str) -> Result<Value, String> {
+    if name == "jms_fs" && !query.is_empty() {
+        return fs_action_schema(query);
+    }
+    if let Some(spec) = full_specs().into_iter().find(|spec| spec.name == name) {
+        return Ok(exact_tool_schema(spec));
+    }
+    operations()
+        .get(name)
+        .cloned()
+        .ok_or_else(|| "unknown operation; use discover(query=...)".into())
+}
+
+fn exact_tool_schema(spec: ToolSpec) -> Value {
+    json!({
+        "name": spec.name,
+        "description": spec.description,
+        "inputSchema": spec.input_schema,
+        "annotations": {
+            "readOnlyHint": spec.read_only,
+            "destructiveHint": spec.destructive,
+            "openWorldHint": spec.open_world,
+        },
+        "advertised": true,
+    })
+}
+
+/// One line derived from the same required/properties schema used for validation.
+/// Action constants and bounds for common budget fields stay visible.
+pub fn operation_signature(name: &str, schema: &Value) -> String {
+    let schema = &schema["inputSchema"];
+    let Some(properties) = schema["properties"].as_object() else {
+        return format!("{name}()");
+    };
+    let mut fields = properties
+        .iter()
+        .map(|(name, spec)| {
+            let required = schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|value| value.as_str() == Some(name)));
+            (required, name, spec)
+        })
+        .collect::<Vec<_>>();
+    fields.sort_unstable_by(|(a_required, a, _), (b_required, b, _)| {
+        b_required.cmp(a_required).then(a.cmp(b))
+    });
+    let fields = fields
+        .into_iter()
+        .map(|(required, name, spec)| {
+            let mut field = name.to_string();
+            if !required {
+                field.push('?');
+            }
+            if let Some(value) = spec.get("const") {
+                field.push_str(&format!("={value}"));
+            } else if matches!(name.as_str(), "limit" | "max_bytes" | "timeout" | "wait_ms") {
+                if let (Some(min), Some(max)) = (spec.get("minimum"), spec.get("maximum")) {
+                    field.push_str(&format!("[{min}..{max}]"));
+                }
+            }
+            field
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{name}({fields})")
+}
+
+fn json_digest(value: &Value) -> String {
+    hex::encode(Sha256::digest(value.to_string().as_bytes()))
+}
+
+/// Static operation schemas only. Never used as the live inventory generation.
+pub fn operation_catalog_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        let fs_actions = operations()["jms_fs"]["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("fs action enumeration");
+        let details = fs_actions
+            .iter()
+            .map(|action| {
+                fs_action_schema(action.as_str().expect("fs action name"))
+                    .expect("an action schema for every advertised fs action")
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "opcat-v1-{}",
+            json_digest(&json!([
+                categories(),
+                operations(),
+                full_specs()
+                    .into_iter()
+                    .map(exact_tool_schema)
+                    .collect::<Vec<_>>(),
+                details,
+            ]))
+        )
+    })
+}
+
+pub fn operation_discovery_etag(scope: &Value, body: &Value) -> String {
+    format!(
+        "opview-v1-{}",
+        json_digest(&json!([operation_catalog_version(), scope, body]))
+    )
 }
 
 fn build_operations() -> BTreeMap<String, Value> {

@@ -208,6 +208,173 @@ max_parallel = 2\n",
         json!("read")
     );
 
+    let signature = server
+        .dispatch(
+            "discover",
+            object(json!({"query": "read", "operation": "jms_fs", "view": "signature"})),
+        )
+        .await
+        .expect("discover filesystem signature");
+    let line = signature["signature"].as_str().unwrap();
+    assert!(
+        line.starts_with(r#"jms_fs(action="read", path, target, "#),
+        "{line}"
+    );
+    assert!(line.contains("byte_offset?"));
+    assert!(signature.get("inputSchema").is_none());
+    assert_ne!(signature["etag"], schema["etag"]);
+    assert_eq!(signature["catalog_version"], schema["catalog_version"]);
+
+    let resident = server
+        .dispatch("discover", object(json!({"operation": "run"})))
+        .await
+        .unwrap();
+    assert_eq!(resident["advertised"], true);
+    assert!(resident["inputSchema"]["properties"]["script_path"].is_object());
+
+    let page_args = json!({"query": "jobs", "view": "signature", "limit": 1, "offset": 0});
+    let page = server
+        .dispatch("discover", object(page_args.clone()))
+        .await
+        .unwrap();
+    let row = &page["operations"][0];
+    assert_eq!(row["name"], "jms_submit_job");
+    assert_eq!(
+        row["signature"],
+        "jms_submit_job(command, targets, allow_dangerous?)"
+    );
+    let tag = page["etag"].clone();
+    let mut cached = page_args;
+    cached["if_none_match"] = tag.clone();
+    let reply = server.dispatch("discover", object(cached)).await.unwrap();
+    assert_eq!(
+        reply,
+        json!({
+            "unchanged": true, "etag": tag, "catalog_version": page["catalog_version"],
+        })
+    );
+
+    for different in [
+        json!({"query": "jobs", "view": "signature", "limit": 1, "offset": 1}),
+        json!({"query": "jobs", "view": "signature", "limit": 2}),
+        json!({"query": "jobs", "limit": 1}),
+        json!({"query": "JOBS", "view": "signature", "limit": 1}),
+        json!({"query": "terminal", "view": "signature", "limit": 1}),
+        json!({"operation": "jms_submit_job", "view": "signature", "limit": 1}),
+    ] {
+        let mut different = different;
+        different["if_none_match"] = tag.clone();
+        let reply = server
+            .dispatch("discover", object(different))
+            .await
+            .unwrap();
+        assert!(reply.get("unchanged").is_none());
+        assert_ne!(reply["etag"], tag);
+    }
+
+    let wrong_token = server
+        .dispatch(
+            "discover",
+            object(json!({
+                "query": "jobs", "view": "signature", "limit": 1,
+                "if_none_match": page["catalog_version"],
+            })),
+        )
+        .await
+        .unwrap();
+    assert!(wrong_token.get("operations").is_some());
+
+    let status = server
+        .dispatch(
+            "discover",
+            object(json!({
+                "topic": "status", "if_none_match": page["etag"],
+            })),
+        )
+        .await
+        .unwrap();
+    assert!(status.get("unchanged").is_none());
+    let asset_error = server
+        .dispatch(
+            "discover",
+            object(json!({
+                "topic": "assets", "if_none_match": page["etag"],
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(!asset_error.message().is_empty());
+
+    // Real streamable HTTP service, using the same stateless runtime factory as the CLI.
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+    let mut config = StreamableHttpServerConfig::default();
+    config.legacy_session_mode = false;
+    config.json_response = true;
+    let service: StreamableHttpService<BridgeServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            {
+                let runtime = runtime.clone();
+                move || Ok(BridgeServer::new(runtime.clone()))
+            },
+            std::sync::Arc::new(LocalSessionManager::default()),
+            config,
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let http = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for (id, args, field) in [
+        (
+            1,
+            json!({"operation": "jms_fs", "query": "read"}),
+            "inputSchema",
+        ),
+        (
+            2,
+            json!({"operation": "jms_fs", "query": "read", "view": "signature"}),
+            "signature",
+        ),
+        (
+            3,
+            json!({"operation": "jms_fs", "query": "read", "view": "signature",
+                   "if_none_match": signature["etag"]}),
+            "unchanged",
+        ),
+    ] {
+        let reply: Value = client
+            .post(&endpoint)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-06-18")
+            .json(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                          "params": {"name": "discover", "arguments": args}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .expect("compact HTTP MCP tool reply"),
+        )
+        .unwrap();
+        assert!(body.get(field).is_some(), "{body}");
+    }
+    http.abort();
+
     runtime.shutdown().await;
 }
 

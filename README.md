@@ -136,6 +136,22 @@ Advanced fields live in an `options` object so the advertised schema stays small
 `discover(operation="jms_fs", query=<action>)` narrows it per action. Everything
 that is accepted but not advertised is still validated before any side effect.
 
+Add `view="signature"` to an operation search or exact lookup for a one-line
+signature derived from the schema. Required arguments are listed first,
+optional arguments are marked with `?`, selected common bounds are included,
+and an action-specific lookup fixes the action
+(e.g. `discover(operation="jms_fs", query="read", view="signature")`).
+Omit `view` for the normal search summary (including signatures) or the full
+schema of an exact operation or filesystem action.
+
+`topic="operations"` responses include a static `catalog_version` and an
+`etag` scoped to that bridge instance, query, operation, view, limit and offset.
+Send that `etag` as `if_none_match` on the same request; an unchanged response
+carries only `unchanged: true`, `etag` and `catalog_version`. If the cached
+body is unavailable, omit `if_none_match` to retrieve it. Asset inventory and
+live status keep their normal responses, including refresh errors, without
+operation catalog etags.
+
 Listings are paged (`offset`/`limit`, `next_offset` in the answer) and a `call`
 response above 8 KiB is saved whole: the reply then carries `staged: true`, a
 business summary and a `result_id` that `read_result(stream="result")` reads back.
