@@ -368,6 +368,7 @@ max_parallel = 2\n",
 
     // A pre-fix partial write was saved as executed=true even without START.
     // Both terminal and general metadata reads clarify it without migrating the file.
+    run_saved_views_do_not_change_receipt_identity(&runtime, &server).await;
     legacy_partial_send_metadata_is_corrected_on_read(&runtime, &server).await;
     terminal_request_identity_is_shared(&runtime, &server).await;
 
@@ -1091,6 +1092,112 @@ async fn legacy_partial_send_metadata_is_corrected_on_read(
             "{key}"
         );
     }
+}
+
+async fn run_saved_views_do_not_change_receipt_identity(
+    runtime: &BridgeRuntime,
+    server: &BridgeServer,
+) {
+    let result_id = runtime.store.create(Map::new()).unwrap();
+    std::fs::write(
+        runtime.store.path(&result_id, "stdout").unwrap(),
+        "alpha\nβeta\ngamma\n",
+    )
+    .unwrap();
+    std::fs::write(
+        runtime.store.path(&result_id, "stderr").unwrap(),
+        "prefix [ERR] suffix\n",
+    )
+    .unwrap();
+    runtime.store.finish(&result_id, Map::new()).unwrap();
+    let id = "saved-run-view";
+    // Deliberately seed the pre-view normalized journal payload.
+    let business = json!({
+        "targets":["offline"], "script":":", "cwd":null, "env":null,
+        "container":null, "image":null, "docker_args":null, "session_id":null,
+        "timeout":60, "max_output_bytes":4096, "allow_dangerous":false
+    });
+    let result = json!({"ok":true,"results":[{
+        "host":"offline","ok":true,"exit_code":0,"execution_state":"completed",
+        "result_id":result_id,"stdout":"legacy preview"
+    }]});
+    runtime
+        .journal
+        .execute(id, "run", &business, {
+            let result = result.clone();
+            move |_| async move { Ok(result) }
+        })
+        .await
+        .unwrap();
+
+    let head = server
+        .dispatch(
+            "run",
+            object(json!({
+                "targets":["offline"],"script":":","request_id":id,
+                "options":{"output_view":{"head_lines":1}}
+            })),
+        )
+        .await
+        .unwrap();
+    let row = &head["results"][0];
+    assert_eq!(row["result_id"], result_id);
+    assert_eq!(row["exit_code"], 0);
+    assert!(row.get("stdout").is_none());
+    assert_eq!(row["output_view"]["text"], "alpha\n");
+    let next = &row["output_view"]["next_action"];
+    let page = server
+        .dispatch(
+            next["tool"].as_str().unwrap(),
+            object(next["arguments"].clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page["offset"], 6);
+    assert_eq!(page["next_offset"], 12);
+    assert_eq!(page["text"], "βeta\n");
+
+    let search = server
+        .dispatch(
+            "run",
+            object(json!({
+                "targets":["offline"],"script":":","request_id":id,"detail":"full",
+                "options":{"output_view":{"stream":"stderr","pattern":"[ERR]"}}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search["duplicate"], true);
+    assert_eq!(search["execution_replayed"], false);
+    assert_eq!(search["results"][0]["result_id"], result_id);
+    assert_eq!(
+        search["results"][0]["output_view"]["matches"][0]["offset"],
+        7
+    );
+    assert_eq!(search["results"][0]["output_view"]["eof"], true);
+    let plain = server
+        .dispatch(
+            "run",
+            object(json!({
+                "targets":["offline"],"script":":","request_id":id,"detail":"full"
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plain["results"], result["results"]);
+    assert!(plain["results"][0].get("output_view").is_none());
+
+    let invalid = server
+        .dispatch(
+            "run",
+            object(json!({
+                "targets":["offline"],"script":":","request_id":id,
+                "options":{"output_view":{"head_lines":1,"pattern":"[ERR]"}}
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(invalid.message().contains("output_view"));
 }
 
 fn object(value: Value) -> Map<String, Value> {
