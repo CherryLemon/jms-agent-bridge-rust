@@ -36,6 +36,7 @@ pub struct BridgeRuntime {
     pub jobs: Arc<Jobs>,
     pub inspector: Arc<AcceleratorInspector>,
     pub started_at: f64,
+    discovery_scope: uuid::Uuid,
     _lock: Option<StateLock>,
 }
 
@@ -91,6 +92,7 @@ impl BridgeRuntime {
             jobs,
             inspector,
             started_at: now(),
+            discovery_scope: uuid::Uuid::new_v4(),
             _lock: lock,
         }))
     }
@@ -411,6 +413,9 @@ require allow_dangerous=true",
             }
             identity
         };
+        if action != "read" && arguments.contains_key("result_id") {
+            return Err(BridgeError::invalid("result_id is only for terminal read"));
+        }
         match action {
             "open" => {
                 let target = arguments
@@ -483,6 +488,19 @@ require allow_dangerous=true",
             }
             "read" => {
                 let session = used_string(&arguments, "session")?;
+                if arguments.contains_key("result_id") {
+                    let result_id = used_string(&arguments, "result_id")?;
+                    return self
+                        .terminals
+                        .read_result(
+                            &session,
+                            &result_id,
+                            page.wait_ms,
+                            page.max_bytes,
+                            page.cursor.as_ref(),
+                        )
+                        .await;
+                }
                 self.terminals
                     .read(&session, page.wait_ms, page.max_bytes, page.cursor.as_ref())
                     .await
@@ -589,12 +607,8 @@ require allow_dangerous=true",
     // --- discover ------------------------------------------------------------
 
     pub async fn tool_discover(&self, arguments: &Map<String, Value>) -> BridgeResult<Value> {
-        let query = arguments
-            .get("query")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let raw_query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
+        let query = raw_query.trim();
         let topic = arguments
             .get("topic")
             .and_then(Value::as_str)
@@ -609,42 +623,51 @@ require allow_dangerous=true",
         }
         if topic == "assets" {
             self.catalog.ensure().await?;
-            return Ok(self.catalog.search(&query, offset, limit));
+            return Ok(self.catalog.search(query, offset, limit));
         }
-        let operations = schemas::operations();
-        if let Some(operation) = arguments.get("operation").and_then(Value::as_str) {
-            if operation.is_empty() {
-                return Err(BridgeError::invalid(
-                    "unknown operation; use discover(query=...)",
-                ));
-            }
-            if operation == "jms_fs" && !query.is_empty() {
-                return schemas::fs_action_schema(&query).map_err(BridgeError::invalid);
-            }
-            // A tool name returns its complete schema: this is where the fields kept out
-            // of the advertised `options` bag are documented.
-            if let Some(spec) = schemas::full_specs()
-                .into_iter()
-                .find(|spec| spec.name == operation)
-            {
-                return Ok(json!({
-                    "name": spec.name,
-                    "description": spec.description,
-                    "inputSchema": spec.input_schema,
-                    "annotations": {
-                        "readOnlyHint": spec.read_only,
-                        "destructiveHint": spec.destructive,
-                        "openWorldHint": spec.open_world,
-                    },
-                    "advertised": true,
-                }));
-            }
-            let schema = operations.get(operation).ok_or_else(|| {
-                BridgeError::invalid("unknown operation; use discover(query=...)")
-            })?;
-            return Ok(schema.clone());
+        let operation = arguments.get("operation").and_then(Value::as_str);
+        let view = arguments
+            .get("view")
+            .and_then(Value::as_str)
+            .unwrap_or("full");
+        let body = Self::discover_operations(query, operation, view, offset, limit)?;
+        // Never compare a global catalog version or a token for another representation.
+        let scope = json!([
+            self.discovery_scope.to_string(),
+            topic,
+            raw_query,
+            operation,
+            view,
+            offset,
+            limit,
+        ]);
+        let etag = schemas::operation_discovery_etag(&scope, &body);
+        if arguments.get("if_none_match").and_then(Value::as_str) == Some(&etag) {
+            return Ok(json!({"unchanged": true}));
         }
-        if query.is_empty() {
+        let mut body = body;
+        body["catalog_version"] = Value::from(schemas::operation_catalog_version());
+        body["etag"] = Value::from(etag);
+        Ok(body)
+    }
+
+    fn discover_operations(
+        query: &str,
+        operation: Option<&str>,
+        view: &str,
+        offset: usize,
+        limit: usize,
+    ) -> BridgeResult<Value> {
+        if let Some(name) = operation {
+            let schema =
+                schemas::exact_operation_schema(name, query).map_err(BridgeError::invalid)?;
+            return if view == "signature" {
+                Ok(json!({"name": name, "signature": schemas::operation_signature(name, &schema)}))
+            } else {
+                Ok(schema)
+            };
+        }
+        if query.is_empty() && view != "signature" {
             let categories: Map<String, Value> = schemas::categories()
                 .into_iter()
                 .map(|(name, members)| (name.to_string(), json!(members.len())))
@@ -654,6 +677,7 @@ require allow_dangerous=true",
                 "hint": "Pass a category/search query, then operation for one full schema.",
             }));
         }
+        let operations = schemas::operations();
         let lowered = query.to_lowercase();
         let names: Vec<String> = match schemas::categories()
             .into_iter()
@@ -680,6 +704,12 @@ require allow_dangerous=true",
             .skip(offset)
             .take(limit)
             .map(|name| {
+                if view == "signature" {
+                    return json!({
+                        "name": name,
+                        "signature": schemas::operation_signature(name, &operations[name]),
+                    });
+                }
                 let description = operations
                     .get(name)
                     .and_then(|schema| schema.get("description"))
@@ -689,10 +719,13 @@ require allow_dangerous=true",
                     .next()
                     .unwrap_or("")
                     .to_string();
-                json!({"name": name, "description": description})
+                json!({
+                    "name": name, "description": description,
+                    "signature": schemas::operation_signature(name, &operations[name]),
+                })
             })
             .collect();
-        let next = offset + selected.len();
+        let next = offset.saturating_add(selected.len());
         Ok(json!({
             "operations": selected,
             "matched": names.len(),

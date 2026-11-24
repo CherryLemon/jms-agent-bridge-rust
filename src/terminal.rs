@@ -57,7 +57,7 @@ pub struct Command {
     pub result_id: String,
     state: CmdState,
     sent: bool,
-    started: bool,
+    started: Arc<AtomicBool>,
     exit_code: Option<i32>,
     error: Option<String>,
     rejection: Map<String, Value>,
@@ -75,7 +75,7 @@ impl Command {
             result_id,
             state: CmdState::Queued,
             sent: false,
-            started: false,
+            started: Arc::new(AtomicBool::new(false)),
             exit_code: None,
             error: None,
             rejection: Map::new(),
@@ -83,6 +83,46 @@ impl Command {
             changed: Arc::new(Notify::new()),
             task: None,
         }
+    }
+
+    /// The same verdict is used for the live command and its retained result.
+    fn evidence(&self) -> Map<String, Value> {
+        let mut values = self.rejection.clone();
+        let completed = self.state == CmdState::Completed;
+        values.insert("ok".into(), json!(completed && self.exit_code == Some(0)));
+        values.insert("execution_state".into(), json!(self.state.as_str()));
+        values.insert(
+            "completion_unknown".into(),
+            json!(self.state == CmdState::Unknown),
+        );
+        values.insert(
+            "executed".into(),
+            if completed || self.started.load(Ordering::SeqCst) {
+                Value::Bool(true)
+            } else if self.sent {
+                Value::Null
+            } else {
+                Value::Bool(false)
+            },
+        );
+        if completed {
+            values.insert("exit_code".into(), json!(self.exit_code.unwrap_or(255)));
+        }
+        if let Some(error) = &self.error {
+            values.insert("error".into(), json!(error));
+        }
+        values
+    }
+
+    /// Called under the command lock, before a new command can replace this one.
+    fn persist_verdict(&self, store: &ResultStore, timings: Option<&Timings>) -> BridgeResult<()> {
+        let mut values = self.evidence();
+        if let Some(timings) = timings {
+            values.insert("timing".into(), timings.snapshot());
+        }
+        let stored = store.finish(&self.result_id, values).map(|_| ());
+        self.changed.notify_waiters();
+        stored
     }
 
     /// A command occupies the terminal from the moment it is admitted.
@@ -477,23 +517,6 @@ completion is unknown"
     }
 }
 
-/// Drop a binding's command slot, but only when it still holds this exact command.
-///
-/// Used when admission has to be rolled back (registry save failed): a newer command
-/// that replaced ours must never be cleared.
-fn clear_command(
-    slot: &mut Option<Arc<AsyncMutex<Command>>>,
-    expected: &Arc<AsyncMutex<Command>>,
-) -> bool {
-    match slot {
-        Some(current) if Arc::ptr_eq(current, expected) => {
-            *slot = None;
-            true
-        }
-        _ => false,
-    }
-}
-
 /// Check readiness and commit to sending under the command lock. If close
 /// won or the shell was already lost, nothing can reach the remote side.
 fn try_take_over(guard: &mut Command, shell_lost: bool, store: &ResultStore) -> bool {
@@ -504,17 +527,7 @@ fn try_take_over(guard: &mut Command, shell_lost: bool, store: &ResultStore) -> 
         let error = "terminal shell was lost before sending";
         guard.state = CmdState::NotStarted;
         guard.error = Some(error.into());
-        let _ = store.finish(
-            &guard.result_id,
-            json!({
-                "ok": false, "executed": false, "execution_state": "not_started",
-                "completion_unknown": false, "error": error,
-            })
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
-        );
-        guard.changed.notify_waiters();
+        let _ = guard.persist_verdict(store, None);
         return false;
     }
     guard.state = CmdState::Running;
@@ -526,12 +539,10 @@ fn try_take_over(guard: &mut Command, shell_lost: bool, store: &ResultStore) -> 
 ///
 /// `None` means "leave the stored result alone": a command that already reached a
 /// terminal state keeps it.
-fn close_final_state(state: CmdState) -> Option<(&'static str, bool, bool, &'static str)> {
+fn close_final_state(state: CmdState) -> Option<(CmdState, &'static str)> {
     match state {
-        // Never transmitted: nothing ran, and saying so is exact.
-        CmdState::Queued => Some(("not_started", false, false, "not_started")),
-        // Aborted in flight: the bytes may have reached the remote side.
-        CmdState::Running => Some(("unknown", true, true, "closed_by_caller")),
+        CmdState::Queued => Some((CmdState::NotStarted, "not_started")),
+        CmdState::Running => Some((CmdState::Unknown, "closed_by_caller")),
         CmdState::NotStarted | CmdState::Completed | CmdState::Unknown => None,
     }
 }
@@ -625,6 +636,28 @@ struct Binding {
     shell: Arc<TerminalShell>,
     command: Option<Arc<AsyncMutex<Command>>>,
     closed: bool,
+}
+
+impl Binding {
+    async fn check_exec_admission(&self) -> BridgeResult<()> {
+        let busy = match &self.command {
+            Some(current) => current.lock().await.is_busy(),
+            None => false,
+        };
+        // A worker can mark the shell lost while admission waits for its command
+        // lock. Check liveness after observing whether that command ended.
+        if self.closed || self.shell.is_closing() {
+            return Err(BridgeError::invalid(
+                "terminal shell was closed/lost; open a new session explicitly",
+            ));
+        }
+        if busy {
+            return Err(BridgeError::invalid(
+                "terminal is busy; read/write its active command first",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub struct Interactive {
@@ -933,18 +966,7 @@ impl Interactive {
         let (host, command, result_id) = {
             let mut binding_guard = binding.lock().await;
             self.permitted(&binding_guard).await?;
-            if binding_guard.closed || binding_guard.shell.is_closing() {
-                return Err(BridgeError::invalid(
-                    "terminal shell was closed/lost; open a new session explicitly",
-                ));
-            }
-            if let Some(current) = &binding_guard.command {
-                if current.lock().await.is_busy() {
-                    return Err(BridgeError::invalid(
-                        "terminal is busy; read/write its active command first",
-                    ));
-                }
-            }
+            binding_guard.check_exec_admission().await?;
             let host = binding_guard.host.clone();
             let mut metadata = Map::new();
             metadata.insert("kind".into(), Value::from("terminal"));
@@ -984,41 +1006,8 @@ impl Interactive {
             binding_guard.command = Some(command.clone());
             (host, command, result_id)
         };
-        if let Some(progress) = progress {
-            // The command is sent right after this point; without the mapping a crash
-            // would leave a result nobody can address.
-            if let Err(error) = progress.record(
-                "execution_results",
-                json!({"host": host.name, "result_id": result_id}),
-            ) {
-                let _ = self.store.fail_before_send(
-                    &result_id,
-                    &format!(
-                        "request progress could not be persisted: {}",
-                        error.message()
-                    ),
-                );
-                let mut guard = command.lock().await;
-                guard.state = CmdState::NotStarted;
-                guard.error = Some(error.message());
-                return Err(error);
-            }
-        }
-        if let Err(error) = self.save().await {
-            // The command is installed but no worker exists yet: without this rollback the
-            // terminal would report "busy" forever and the result would stay active.
-            let mut guard = command.lock().await;
-            guard.state = CmdState::NotStarted;
-            guard.error = Some(error.message());
-            drop(guard);
-            let _ = self.store.fail_before_send(
-                &result_id,
-                &format!("terminal registry could not be saved: {}", error.message()),
-            );
-            let mut binding_guard = binding.lock().await;
-            clear_command(&mut binding_guard.command, &command);
-            return Err(error);
-        }
+        self.persist_admission(&host, &result_id, &command, progress)
+            .await?;
         // The worker owns the shell for the duration of the command; the caller only
         // polls its files, so an MCP disconnect cannot cancel accepted work.
         let runner = self.runner.clone();
@@ -1055,6 +1044,56 @@ impl Interactive {
         read_command_state(&self.store, session, &command, wait, max_bytes, cursor).await
     }
 
+    async fn persist_admission(
+        &self,
+        host: &Host,
+        result_id: &str,
+        command: &Arc<AsyncMutex<Command>>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
+    ) -> BridgeResult<()> {
+        // No worker is started until both mappings exist; without them a crash
+        // could leave a result nobody can address.
+        if let Some(progress) = progress {
+            if let Err(error) = progress.record(
+                "execution_results",
+                json!({"host": host.name, "result_id": result_id}),
+            ) {
+                self.reject_admission(command, "request progress could not be persisted", &error)
+                    .await;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.save().await {
+            self.reject_admission(command, "terminal registry could not be saved", &error)
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn reject_admission(
+        &self,
+        command: &Arc<AsyncMutex<Command>>,
+        reason: &str,
+        error: &BridgeError,
+    ) {
+        let mut guard = command.lock().await;
+        if guard.state != CmdState::Queued {
+            // An explicit close that published first keeps its verdict.
+            return;
+        }
+        guard.state = CmdState::NotStarted;
+        guard.error = Some(format!("{reason}: {}", error.message()));
+        guard
+            .rejection
+            .insert("failure_stage".into(), json!("sender"));
+        // Keep the failed command attached until a successful admission replaces it.
+        // The command lock serializes publication with readers and that replacement.
+        if let Err(persist_error) = guard.persist_verdict(&self.store, None) {
+            tracing::warn!(result_id = %guard.result_id, %persist_error, "could not save terminal admission failure");
+        }
+    }
+
     pub async fn read(
         &self,
         session: &str,
@@ -1083,6 +1122,34 @@ impl Interactive {
         let _ = lost;
         self.read_command(session, &command, wait_ms, max_bytes, cursor)
             .await
+    }
+
+    /// Read a command by its immutable ID, including after replacement or restart.
+    /// This uses the same retained output access as read_result.
+    pub async fn read_result(
+        &self,
+        session: &str,
+        result_id: &str,
+        wait_ms: u64,
+        max_bytes: usize,
+        cursor: Option<&Value>,
+    ) -> BridgeResult<Value> {
+        let explicit = json!({});
+        let cursor = cursor.or(Some(&explicit));
+        let binding = self.bindings.lock().await.get(session).cloned();
+        if let Some(binding) = binding {
+            let command = binding.lock().await.command.clone();
+            if let Some(command) = command {
+                // Retain this exact Arc across the wait, never re-lookup session.current.
+                if command.lock().await.result_id == result_id {
+                    terminal_result_metadata(&self.store, session, result_id)?;
+                    return self
+                        .read_command(session, &command, wait_ms, max_bytes, cursor)
+                        .await;
+                }
+            }
+        }
+        read_saved_terminal_result(&self.store, session, result_id, max_bytes, cursor)
     }
 
     /// Read one specific command's output, independent of what the session does next.
@@ -1123,14 +1190,11 @@ async fn read_command_state(
     cursor: Option<&Value>,
 ) -> BridgeResult<Value> {
     let mut guard = command.lock().await;
-    let mut positions: HashMap<String, u64> = guard.cursor.clone();
-    if let Some(cursor) = cursor.and_then(Value::as_object) {
-        for (stream, value) in cursor {
-            if let Some(offset) = value.as_u64() {
-                positions.insert(stream.clone(), offset);
-            }
-        }
-    }
+    let mut positions = if cursor.is_some() {
+        terminal_positions(cursor)
+    } else {
+        guard.cursor.clone()
+    };
     {
         // The result id is copied out so the helper never borrows the lock guard.
         let result_id = guard.result_id.clone();
@@ -1174,71 +1238,112 @@ async fn read_command_state(
         out.insert("session".into(), Value::from(session));
         out.insert("result_id".into(), Value::from(guard.result_id.clone()));
         out.insert("state".into(), Value::from(guard.state.as_str()));
-        let mut budget = max_bytes;
-        for stream in ["stderr", "stdout"] {
-            let path = store.path(&guard.result_id, stream)?;
-            let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-            let position = positions.get(stream).copied().unwrap_or(0);
-            let available = size.saturating_sub(position);
-            let limit = (budget as u64).min(available);
-            if limit > 0 {
-                let page = store.read(
-                    &guard.result_id,
-                    stream,
-                    position,
-                    limit as usize,
-                    false,
-                    None,
-                )?;
-                let text = page.get("text").and_then(Value::as_str).unwrap_or("");
-                out.insert(stream.to_string(), Value::from(text));
-                let next = page
-                    .get("next_offset")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(position);
-                positions.insert(stream.to_string(), next);
-                budget = budget.saturating_sub(text.len());
-            }
-            if positions.get(stream).copied().unwrap_or(0) < size {
-                out.insert("more".into(), Value::Bool(true));
-            }
+        append_terminal_page(store, &guard.result_id, max_bytes, &mut positions, &mut out)?;
+        if cursor.is_none() {
+            guard.cursor = positions;
         }
-        guard.cursor = positions.clone();
-        let mut cursor_map = Map::new();
-        for (stream, value) in &positions {
-            cursor_map.insert(stream.clone(), json!(value));
-        }
-        out.insert("cursor".into(), Value::Object(cursor_map));
-        if guard.state == CmdState::Completed {
-            let exit_code = guard.exit_code.unwrap_or(255);
-            out.insert("ok".into(), Value::Bool(exit_code == 0));
-            out.insert("exit_code".into(), json!(exit_code));
-        } else if matches!(guard.state, CmdState::Unknown | CmdState::NotStarted) {
-            out.insert("ok".into(), Value::Bool(false));
-            out.insert(
-                "executed".into(),
-                if guard.started {
-                    Value::Bool(true)
-                } else if guard.sent {
-                    Value::Null
-                } else {
-                    Value::Bool(false)
-                },
-            );
-            out.insert(
-                "completion_unknown".into(),
-                Value::Bool(guard.state == CmdState::Unknown),
-            );
-            out.insert(
-                "error".into(),
-                guard.error.clone().map(Value::from).unwrap_or(Value::Null),
-            );
-            for (key, value) in &guard.rejection {
-                out.insert(key.clone(), value.clone());
-            }
+        if !guard.is_busy() {
+            out.extend(guard.evidence());
         }
         Ok(Value::Object(out))
     }
+}
+
+fn terminal_positions(cursor: Option<&Value>) -> HashMap<String, u64> {
+    ["stdout", "stderr"]
+        .into_iter()
+        .filter_map(|stream| {
+            cursor?
+                .get(stream)?
+                .as_u64()
+                .map(|offset| (stream.to_string(), offset))
+        })
+        .collect()
+}
+
+fn append_terminal_page(
+    store: &ResultStore,
+    result_id: &str,
+    max_bytes: usize,
+    positions: &mut HashMap<String, u64>,
+    out: &mut Map<String, Value>,
+) -> BridgeResult<()> {
+    let mut budget = max_bytes;
+    for stream in ["stderr", "stdout"] {
+        let path = store.path(result_id, stream)?;
+        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let position = positions.get(stream).copied().unwrap_or(0);
+        let limit = (budget as u64).min(size.saturating_sub(position));
+        if limit > 0 {
+            let page = store.read(result_id, stream, position, limit as usize, false, None)?;
+            let text = page.get("text").and_then(Value::as_str).unwrap_or("");
+            out.insert(stream.to_string(), Value::from(text));
+            let next = page
+                .get("next_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(position);
+            positions.insert(stream.to_string(), next);
+            budget = budget.saturating_sub(text.len());
+        }
+        if positions.get(stream).copied().unwrap_or(0) < size {
+            out.insert("more".into(), Value::Bool(true));
+        }
+    }
+    out.insert("cursor".into(), json!(positions));
+    Ok(())
+}
+
+fn terminal_result_metadata(
+    store: &ResultStore,
+    session: &str,
+    result_id: &str,
+) -> BridgeResult<Map<String, Value>> {
+    let meta = store.metadata(result_id)?;
+    if meta.get("kind").and_then(Value::as_str) != Some("terminal")
+        || meta.get("session_id").and_then(Value::as_str) != Some(session)
+    {
+        return Err(BridgeError::invalid(
+            "result is not a command for this terminal session",
+        ));
+    }
+    Ok(meta)
+}
+
+fn read_saved_terminal_result(
+    store: &ResultStore,
+    session: &str,
+    result_id: &str,
+    max_bytes: usize,
+    cursor: Option<&Value>,
+) -> BridgeResult<Value> {
+    let meta = terminal_result_metadata(store, session, result_id)?;
+    let state = match meta.get("execution_state").and_then(Value::as_str) {
+        Some(state @ ("completed" | "not_started" | "unknown")) => state,
+        _ => "unknown",
+    };
+    let mut result = json!({
+        "session": session, "result_id": result_id, "state": state,
+        "ok": state == "completed" && meta.get("ok").and_then(Value::as_bool) == Some(true),
+        "completion_unknown": state == "unknown",
+    });
+    let out = result.as_object_mut().expect("object");
+    for key in [
+        "exit_code",
+        "executed",
+        "error",
+        "failure_stage",
+        "reason",
+        "retryable",
+        "queue",
+        "queue_timed_out",
+    ] {
+        if let Some(value) = meta.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    let mut positions = terminal_positions(cursor);
+    append_terminal_page(store, result_id, max_bytes, &mut positions, out)?;
+    Ok(result)
 }
 
 impl Interactive {
@@ -1274,6 +1379,11 @@ impl Interactive {
         };
         {
             let guard = command.lock().await;
+            if shell.is_closing() {
+                return Err(BridgeError::invalid(
+                    "terminal shell was closed/lost; open a new session explicitly",
+                ));
+            }
             if !guard.is_busy() || guard.state != CmdState::Running {
                 return Err(BridgeError::invalid(
                     "write needs an active foreground command; use exec for shell commands",
@@ -1310,9 +1420,10 @@ impl Interactive {
         let (shell, command) = {
             let mut guard = binding.lock().await;
             guard.closed = true;
+            guard.shell.mark_lost();
             (guard.shell.clone(), guard.command.clone())
         };
-        if let Some(command) = command {
+        let verdict = if let Some(command) = command {
             let mut guard = command.lock().await;
             if let Some(task) = guard.task.take() {
                 if !task.is_finished() {
@@ -1323,31 +1434,23 @@ impl Interactive {
             // running one has no completion evidence, and a finished one keeps its
             // verdict. Without this the saved result would stay `running` forever.
             let final_state = close_final_state(guard.state);
-            if let Some((state, executed, unknown, failure_stage)) = final_state {
-                guard.state = if state == "not_started" {
-                    CmdState::NotStarted
-                } else {
-                    CmdState::Unknown
-                };
+            if let Some((state, failure_stage)) = final_state {
+                guard.state = state;
                 guard.error =
-                    Some("terminal closed by the caller before the command finished".to_string());
-                let result_id = guard.result_id.clone();
-                guard.changed.notify_waiters();
-                drop(guard);
-                let mut values = Map::new();
-                values.insert("ok".into(), Value::Bool(false));
-                values.insert("executed".into(), Value::Bool(executed));
-                values.insert("execution_state".into(), Value::from(state));
-                values.insert("completion_unknown".into(), Value::Bool(unknown));
-                values.insert("failure_stage".into(), Value::from(failure_stage));
-                values.insert(
-                    "error".into(),
-                    Value::from("terminal closed by the caller before the command finished"),
-                );
-                self.store.finish(&result_id, values)?;
+                    Some("terminal closed by the caller before the command finished".into());
+                guard
+                    .rejection
+                    .insert("failure_stage".into(), json!(failure_stage));
+                guard.persist_verdict(&self.store, None)
+            } else {
+                Ok(())
             }
-        }
+        } else {
+            Ok(())
+        };
+        // Closing the old channel must still happen if the result store is down.
         shell.close().await;
+        verdict?;
         self.bindings.lock().await.remove(session);
         self.save().await?;
         Ok(json!({"ok": true, "session": session, "state": "closed"}))
@@ -1407,17 +1510,11 @@ async fn run_terminal_command(
         Ok(lease) => lease,
         Err(error) => {
             let mut guard = command.lock().await;
-            guard.state = CmdState::NotStarted;
-            guard.error = Some(error.message());
-            let result_id = guard.result_id.clone();
-            guard.changed.notify_waiters();
-            drop(guard);
-            let mut values = Map::new();
-            values.insert("ok".into(), Value::Bool(false));
-            values.insert("executed".into(), Value::Bool(false));
-            values.insert("execution_state".into(), Value::from("not_started"));
-            values.insert("completion_unknown".into(), Value::Bool(false));
-            let _ = store.finish(&result_id, values);
+            if guard.state == CmdState::Queued {
+                guard.state = CmdState::NotStarted;
+                guard.error = Some(error.message());
+                guard.persist_verdict(&store, None)?;
+            }
             return Ok(());
         }
     };
@@ -1436,41 +1533,7 @@ async fn run_terminal_command(
         Ok(slot) => slot,
         Err(wait) => {
             let mut guard = command.lock().await;
-            guard.state = CmdState::NotStarted;
-            match wait {
-                SlotWait::Full(full) => {
-                    guard.error = Some(full.message());
-                    guard.rejection = full.response();
-                    guard
-                        .rejection
-                        .insert("failure_stage".into(), Value::from(QueueFail::QUEUE));
-                    guard
-                        .rejection
-                        .insert("queue_timed_out".into(), Value::Bool(false));
-                }
-                SlotWait::Timeout(timeout) => {
-                    guard.error = Some(timeout.message());
-                    guard
-                        .rejection
-                        .insert("failure_stage".into(), Value::from(timeout.stage));
-                    guard
-                        .rejection
-                        .insert("queue_timed_out".into(), Value::Bool(true));
-                }
-            }
-            let result_id = guard.result_id.clone();
-            let rejection = guard.rejection.clone();
-            guard.changed.notify_waiters();
-            drop(guard);
-            let mut values = Map::new();
-            values.insert("ok".into(), Value::Bool(false));
-            values.insert("executed".into(), Value::Bool(false));
-            values.insert("execution_state".into(), Value::from("not_started"));
-            values.insert("completion_unknown".into(), Value::Bool(false));
-            for (key, value) in rejection {
-                values.insert(key, value);
-            }
-            let _ = store.finish(&result_id, values);
+            persist_queue_rejection(&mut guard, &store, wait, &timings)?;
             return Ok(());
         }
     };
@@ -1485,52 +1548,19 @@ async fn run_terminal_command(
         (
             guard.result_id.clone(),
             guard.changed.clone(),
-            Arc::new(AtomicBool::new(false)),
+            guard.started.clone(),
         )
     };
-    // The write itself happens outside the lock: a channel that stops consuming must not
-    // keep `close` from taking the lock and aborting this task.
-    let sent = match tokio::time::timeout(Duration::from_secs(120), shell.send_packet(&plan.packet))
-        .await
+    if !send_terminal_packet(
+        &shell,
+        &command,
+        &store,
+        &plan.packet,
+        Duration::from_secs(120),
+        &timings,
+    )
+    .await?
     {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            // Part of the packet may already have reached the shell, and the packet
-            // starts with `builtin eval`, so a write error is not proof of "not run".
-            let mut guard = command.lock().await;
-            if guard.state == CmdState::Running {
-                guard.state = CmdState::Unknown;
-                guard.error = Some(format!(
-                    "the command could not be written completely: {}",
-                    error.message()
-                ));
-            }
-            false
-        }
-        Err(_) => {
-            let mut guard = command.lock().await;
-            if guard.state == CmdState::Running {
-                guard.state = CmdState::Unknown;
-                guard.error = Some("writing the command to the terminal timed out".to_string());
-            }
-            false
-        }
-    };
-    if !sent {
-        let mut values = Map::new();
-        values.insert("ok".into(), Value::Bool(false));
-        values.insert("executed".into(), Value::Bool(true));
-        values.insert("execution_state".into(), Value::from("unknown"));
-        values.insert("completion_unknown".into(), Value::Bool(true));
-        values.insert("failure_stage".into(), Value::from("channel"));
-        values.insert(
-            "error".into(),
-            Value::from(
-                "the command may have reached the terminal only partially; check the session before retrying",
-            ),
-        );
-        let _ = store.finish(&result_id, values);
-        changed.notify_waiters();
         return Ok(());
     }
     let out_path = store.path(&result_id, "stdout")?;
@@ -1546,7 +1576,10 @@ async fn run_terminal_command(
         )
         .await;
     let mut guard = command.lock().await;
-    guard.started = started.load(Ordering::SeqCst);
+    // A caller close that published first owns the verdict.
+    if guard.state != CmdState::Running {
+        return Ok(());
+    }
     match outcome {
         Ok(code) => {
             guard.state = CmdState::Completed;
@@ -1565,48 +1598,84 @@ async fn run_terminal_command(
             }
         }
     }
-    let mut values = Map::new();
-    values.insert(
-        "ok".into(),
-        Value::Bool(guard.state == CmdState::Completed && guard.exit_code == Some(0)),
-    );
-    values.insert(
-        "exit_code".into(),
-        guard.exit_code.map_or(Value::Null, |code| json!(code)),
-    );
-    values.insert(
-        "executed".into(),
-        if guard.started {
-            Value::Bool(true)
-        } else if guard.sent {
-            Value::Null
-        } else {
-            Value::Bool(false)
-        },
-    );
-    values.insert("execution_state".into(), Value::from(guard.state.as_str()));
-    values.insert(
-        "completion_unknown".into(),
-        Value::Bool(guard.state == CmdState::Unknown),
-    );
-    if let Some(error) = &guard.error {
-        values.insert("error".into(), Value::from(error.clone()));
-    }
-    values.insert("timing".into(), timings.snapshot());
-    for (key, value) in guard.rejection.clone() {
-        values.insert(key, value);
-    }
-    let result_id = guard.result_id.clone();
-    guard.changed.notify_waiters();
+    guard.persist_verdict(&store, Some(&timings))?;
     drop(guard);
     drop(slot);
-    let _ = store.finish(&result_id, values);
     Ok(())
 }
 
-struct QueueFail;
-impl QueueFail {
-    const QUEUE: &'static str = "execution_queue";
+fn persist_queue_rejection(
+    guard: &mut Command,
+    store: &ResultStore,
+    wait: SlotWait,
+    timings: &Timings,
+) -> BridgeResult<()> {
+    if guard.state != CmdState::Queued {
+        return Ok(());
+    }
+    guard.state = CmdState::NotStarted;
+    match wait {
+        SlotWait::Full(full) => {
+            guard.error = Some(full.message());
+            guard.rejection = full.response();
+            guard
+                .rejection
+                .insert("failure_stage".into(), json!("execution_queue"));
+            guard
+                .rejection
+                .insert("queue_timed_out".into(), json!(false));
+        }
+        SlotWait::Timeout(timeout) => {
+            guard.error = Some(timeout.message());
+            guard
+                .rejection
+                .insert("failure_stage".into(), json!(timeout.stage));
+            guard
+                .rejection
+                .insert("queue_timed_out".into(), json!(true));
+        }
+    }
+    guard.persist_verdict(store, Some(timings))
+}
+
+async fn send_terminal_packet(
+    shell: &TerminalShell,
+    command: &AsyncMutex<Command>,
+    store: &ResultStore,
+    packet: &[u8],
+    timeout: Duration,
+    timings: &Timings,
+) -> BridgeResult<bool> {
+    // Do not hold the command lock across the write; caller close may abort it.
+    let error = match tokio::time::timeout(timeout, shell.send_packet(packet)).await {
+        Ok(Ok(())) => return Ok(true),
+        Ok(Err(error)) => format!(
+            "the command could not be written completely: {}",
+            error.message()
+        ),
+        Err(_) => "writing the command to the terminal timed out".to_string(),
+    };
+    // A prefix may be buffered in the remote parser. Never admit another command to
+    // this shell once the current command can be observed as no longer busy.
+    shell.mark_lost();
+    let persisted = {
+        let mut guard = command.lock().await;
+        if guard.state == CmdState::Running {
+            // An incomplete write is not START evidence. Caller close, if it won,
+            // still owns the verdict.
+            guard.state = CmdState::Unknown;
+            guard.error = Some(error);
+            guard
+                .rejection
+                .insert("failure_stage".into(), json!("channel"));
+            guard.persist_verdict(store, Some(timings))
+        } else {
+            Ok(())
+        }
+    };
+    // Close even if recording the verdict fails. The binding remains readable.
+    shell.close().await;
+    persisted.map(|()| false)
 }
 
 /// Evidence copied from a finished terminal command into fan-out style rows.
@@ -1617,6 +1686,156 @@ pub fn command_rejection(meta: &Map<String, Value>) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn terminal_with_stalled_writer(
+        directory: &std::path::Path,
+        prefix_len: usize,
+    ) -> (Interactive, Host, mpsc::Receiver<Option<Bytes>>) {
+        use crate::config::{BastionConfig, BridgeSettings};
+        use sha2::{Digest, Sha256};
+
+        let settings = Arc::new(BridgeSettings {
+            state_dir: directory.to_path_buf(),
+            ..BridgeSettings::default()
+        });
+        let cfg = Arc::new(BastionConfig::default());
+        let mut identity_parts = cfg.credential_identity();
+        identity_parts.push(settings.preferred_account.clone());
+        atomic_json(
+            &directory.join("assets.json"),
+            &json!({
+                "identity": hex::encode(Sha256::digest(serde_json::to_vec(&identity_parts).unwrap())),
+                "refreshed_at": crate::storage::results::now(),
+                "assets": [{
+                    "id":"11111111-1111-1111-1111-111111111111", "name":"test-host",
+                    "active":true, "protocols":["ssh"], "login":"test", "account":"test"
+                }],
+            }),
+        )
+        .unwrap();
+        let store = Arc::new(ResultStore::new(directory.join("results"), 3600.0, 3600.0).unwrap());
+        let catalog = AssetCatalog::new(cfg.clone(), settings.clone()).unwrap();
+        let runner = Runner::new(cfg, settings, store.clone()).unwrap();
+        let host = catalog.inventory().hosts.pop().unwrap();
+        let protection = Arc::new(runner.protect_terminal(&host.connection_key().unwrap()));
+        let (frames, writer) = ChannelWriter::mock_stalled(prefix_len);
+        let stream = || StreamSource {
+            receiver: mpsc::channel(1).1,
+            buffer: Vec::new(),
+            closed: false,
+        };
+        let shell = Arc::new(TerminalShell {
+            writer,
+            streams: AsyncMutex::new(Streams {
+                out: stream(),
+                err: stream(),
+            }),
+            lost: Arc::new(AtomicBool::new(false)),
+            protection,
+            demux: Mutex::new(None),
+        });
+        let interactive = Interactive::new(catalog, runner, store);
+        interactive.bindings.lock().await.insert(
+            "s".into(),
+            Arc::new(AsyncMutex::new(Binding {
+                session: "s".into(),
+                host: host.clone(),
+                shell,
+                command: None,
+                closed: false,
+            })),
+        );
+        (interactive, host, frames)
+    }
+
+    fn test_command(store: &ResultStore, kind: &str, session: &str, bytes: &[u8]) -> String {
+        let id = store
+            .create(
+                json!({"kind": kind, "session_id": session})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        std::fs::write(store.path(&id, "stdout").unwrap(), bytes).unwrap();
+        id
+    }
+
+    #[test]
+    fn retained_terminal_pages_are_bound_to_the_original_session_and_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let result_id = {
+            let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+            let a = test_command(&store, "terminal", "s", b"abcdef");
+            let b = test_command(&store, "terminal", "s", b"second command");
+            let ordinary = test_command(&store, "run", "s", b"not a terminal");
+            store
+                .finish(
+                    &a,
+                    json!({"execution_state":"completed","exit_code":7,"ok":false})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap();
+            let page = read_saved_terminal_result(&store, "s", &a, 3, None).unwrap();
+            assert_eq!(page["result_id"], a);
+            assert_eq!(page["stdout"], "abc");
+            assert_eq!(page["state"], "completed");
+            assert_eq!(page["exit_code"], 7);
+            assert_eq!(page["ok"], false);
+            assert_eq!(page["more"], true);
+            assert!(read_saved_terminal_result(&store, "wrong", &a, 8, None).is_err());
+            assert!(read_saved_terminal_result(&store, "s", &ordinary, 8, None).is_err());
+            assert_eq!(
+                read_saved_terminal_result(&store, "s", &b, 16, None).unwrap()["state"],
+                "unknown"
+            );
+            a
+        };
+        // New store instance; no live Session/Command needed for output.
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let page =
+            read_saved_terminal_result(&store, "s", &result_id, 3, Some(&json!({"stdout":3})))
+                .unwrap();
+        assert_eq!(page["stdout"], "def");
+        std::fs::remove_file(store.directory(&result_id).unwrap().join("meta.json")).unwrap();
+        assert!(read_saved_terminal_result(&store, "s", &result_id, 3, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_cursors_do_not_advance_or_rewind_implicit_terminal_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let id = test_command(&store, "terminal", "s", b"abcdef");
+        let command = Arc::new(AsyncMutex::new(Command::new(id)));
+        let wait = ReadWait::Output(0);
+        assert_eq!(
+            read_command_state(&store, "s", &command, wait, 2, None)
+                .await
+                .unwrap()["stdout"],
+            "ab"
+        );
+        for (offset, expected) in [(0, "ab"), (4, "ef"), (0, "ab")] {
+            let page = read_command_state(
+                &store,
+                "s",
+                &command,
+                wait,
+                2,
+                Some(&json!({"stdout":offset})),
+            )
+            .await
+            .unwrap();
+            assert_eq!(page["stdout"], expected);
+        }
+        assert_eq!(
+            read_command_state(&store, "s", &command, wait, 2, None)
+                .await
+                .unwrap()["stdout"],
+            "cd"
+        );
+    }
 
     #[test]
     fn a_closed_stream_without_its_marker_ends_the_command() {
@@ -1843,13 +2062,11 @@ mod tests {
         // `close` wins: it finalises the queued command as not_started.
         {
             let mut guard = command.lock().await;
-            let (state, executed, unknown, stage) =
+            let (state, stage) =
                 close_final_state(guard.state).expect("queued command is finalised");
-            guard.state = CmdState::NotStarted;
-            assert_eq!(
-                (state, executed, unknown, stage),
-                ("not_started", false, false, "not_started")
-            );
+            guard.state = state;
+            assert_eq!(stage, "not_started");
+            assert_eq!(guard.evidence()["executed"], false);
         }
         // The worker then reaches its takeover and must refuse.
         {
@@ -1872,53 +2089,243 @@ mod tests {
             assert!(guard.sent);
         }
         let mut guard = command.lock().await;
-        let (state, executed, unknown, stage) =
-            close_final_state(guard.state).expect("running command is finalised");
-        guard.state = CmdState::Unknown;
-        assert_eq!(
-            (state, executed, unknown, stage),
-            ("unknown", true, true, "closed_by_caller")
-        );
+        let (state, stage) = close_final_state(guard.state).expect("running command is finalised");
+        guard.state = state;
+        assert_eq!(stage, "closed_by_caller");
+        assert_eq!(guard.evidence()["executed"], Value::Null);
+        assert_eq!(guard.evidence()["completion_unknown"], true);
+        guard.started.store(true, Ordering::SeqCst);
+        assert_eq!(guard.evidence()["executed"], true);
     }
 
-    /// A write that fails midway is not proof that nothing was sent: the packet starts
-    /// with `builtin eval`, so a partial write can still run the script.
     #[tokio::test]
-    async fn a_failed_send_after_takeover_stays_unknown() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
-        let command = Arc::new(AsyncMutex::new(Command::new("r3".to_string())));
+    async fn stalled_partial_send_closes_the_channel_without_replacing_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (interactive, _, mut frames) = terminal_with_stalled_writer(dir.path(), 6).await;
+        let store = &interactive.store;
+        let id = test_command(store, "terminal", "s", b"");
+        let command = Arc::new(AsyncMutex::new(Command::new(id.clone())));
+        let binding = interactive.binding("s").await.unwrap();
+        let shell = {
+            let mut binding = binding.lock().await;
+            binding.command = Some(command.clone());
+            binding.shell.clone()
+        };
+        interactive.save().await.unwrap();
         {
             let mut guard = command.lock().await;
-            assert!(try_take_over(&mut guard, false, &store));
-            guard.sent = true;
+            assert!(try_take_over(&mut guard, shell.is_closing(), store));
         }
-        // The worker's failure path.
-        {
-            let mut guard = command.lock().await;
-            if guard.state == CmdState::Running {
-                guard.state = CmdState::Unknown;
-                guard.error = Some("partial write".to_string());
-            }
+        let plan = CommandPlan::new(":");
+        let timings = Timings::default();
+        let mut sending = Box::pin(send_terminal_packet(
+            &shell,
+            &command,
+            store,
+            &plan.packet,
+            Duration::from_millis(50),
+            &timings,
+        ));
+        assert!(futures::poll!(sending.as_mut()).is_pending());
+        assert_eq!(frames.try_recv().unwrap().unwrap(), &b"printf"[..]);
+        assert!(
+            !shell.is_closing(),
+            "a stall does not itself flag the writer closed"
+        );
+        let mut reader = Box::pin(interactive.read("s", 30_000, 4096, None));
+        assert!(futures::poll!(reader.as_mut()).is_pending());
+        assert!(!sending.await.unwrap());
+        assert_eq!(frames.try_recv().unwrap(), None, "old channel was closed");
+        let live = tokio::time::timeout(Duration::from_secs(1), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live["result_id"], id);
+        assert_eq!(live["state"], "unknown");
+        assert_eq!(live["executed"], Value::Null);
+        assert_eq!(live["completion_unknown"], true);
+        assert_eq!(
+            live["error"],
+            "writing the command to the terminal timed out"
+        );
+        let refusal = interactive
+            .execute("s", ":", false, 0, 4096, None, None)
+            .await
+            .unwrap_err();
+        assert!(refusal.message().contains("closed/lost"));
+        assert_eq!(interactive.sessions().await["sessions"][0]["state"], "lost");
+        assert_eq!(
+            interactive.read("s", 0, 4096, None).await.unwrap()["result_id"],
+            id
+        );
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let archived = read_saved_terminal_result(store, "s", &id, 4096, None).unwrap();
+        let restarted = ResultStore::new(store.root.clone(), 3600.0, 3600.0).unwrap();
+        let replay = read_saved_terminal_result(&restarted, "s", &id, 4096, None).unwrap();
+        for key in [
+            "result_id",
+            "state",
+            "executed",
+            "completion_unknown",
+            "failure_stage",
+            "error",
+        ] {
+            assert_eq!(live[key], archived[key], "{key}");
+            assert_eq!(archived[key], replay[key], "{key}");
         }
-        let guard = command.lock().await;
-        assert_eq!(guard.state, CmdState::Unknown);
-        assert!(guard.sent, "the send evidence must not be reversed");
     }
 
-    #[test]
-    fn rolling_back_admission_only_clears_its_own_command() {
-        let mine = Arc::new(AsyncMutex::new(Command::new("mine".to_string())));
-        let other = Arc::new(AsyncMutex::new(Command::new("other".to_string())));
-        let mut slot = Some(mine.clone());
-        assert!(
-            !clear_command(&mut slot, &other),
-            "a different command is untouched"
-        );
-        assert!(slot.is_some());
-        assert!(clear_command(&mut slot, &mine));
-        assert!(slot.is_none());
-        assert!(!clear_command(&mut slot, &mine));
+    #[tokio::test]
+    async fn admission_checks_liveness_after_waiting_on_the_current_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let (interactive, _, _frames) = terminal_with_stalled_writer(dir.path(), 1).await;
+        let binding = interactive.binding("s").await.unwrap();
+        let mut binding = binding.lock().await;
+        let command = Arc::new(AsyncMutex::new(Command::new("a".into())));
+        binding.command = Some(command.clone());
+        let mut guard = command.lock().await;
+        guard.state = CmdState::Running;
+        let mut admission = Box::pin(binding.check_exec_admission());
+        assert!(futures::poll!(admission.as_mut()).is_pending());
+        binding.shell.mark_lost();
+        guard.state = CmdState::Unknown;
+        drop(guard);
+        assert!(admission
+            .await
+            .unwrap_err()
+            .message()
+            .contains("closed/lost"));
+    }
+
+    struct FailingProgress;
+
+    impl crate::storage::journal::ProgressSink for FailingProgress {
+        fn record(&self, field: &str, value: Value) -> BridgeResult<()> {
+            assert_eq!(field, "execution_results");
+            assert!(value.get("result_id").and_then(Value::as_str).is_some());
+            Err(BridgeError::storage("test receipt write failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_failures_wake_readers_and_archive_the_same_unsent_verdict() {
+        for (progress, phrase) in [
+            (None, "terminal registry could not be saved"),
+            (
+                Some(&FailingProgress as &dyn crate::storage::journal::ProgressSink),
+                "request progress could not be persisted",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (interactive, host, mut frames) = terminal_with_stalled_writer(dir.path(), 1).await;
+            let id = test_command(&interactive.store, "terminal", "s", b"");
+            let command = Arc::new(AsyncMutex::new(Command::new(id.clone())));
+            interactive.binding("s").await.unwrap().lock().await.command = Some(command.clone());
+            if progress.is_none() {
+                std::fs::create_dir(&interactive.registry).unwrap();
+            }
+            let mut reader = Box::pin(interactive.read("s", 30_000, 4096, None));
+            assert!(futures::poll!(reader.as_mut()).is_pending());
+            assert!(interactive
+                .persist_admission(&host, &id, &command, progress)
+                .await
+                .is_err());
+            let live = tokio::time::timeout(Duration::from_secs(1), reader)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(live["result_id"], id);
+            assert_eq!(live["state"], "not_started");
+            assert_eq!(live["executed"], false);
+            assert_eq!(live["completion_unknown"], false);
+            assert_eq!(live["failure_stage"], "sender");
+            assert!(live["error"].as_str().unwrap().starts_with(phrase));
+            assert_eq!(
+                interactive.store.metadata(&id).unwrap()["status"],
+                "complete"
+            );
+
+            // The terminal can accept a later command, without losing the first failure.
+            assert!(interactive
+                .execute("s", ":", false, 0, 4096, None, Some(&FailingProgress))
+                .await
+                .is_err());
+            assert_ne!(
+                interactive.read("s", 0, 4096, None).await.unwrap()["result_id"],
+                id
+            );
+            let archived = interactive
+                .read_result("s", &id, 0, 4096, None)
+                .await
+                .unwrap();
+            for key in [
+                "state",
+                "executed",
+                "completion_unknown",
+                "failure_stage",
+                "error",
+            ] {
+                assert_eq!(live[key], archived[key], "{key}");
+            }
+            assert!(matches!(
+                frames.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_rejection_is_persisted_before_slot_release_and_survives_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let id = test_command(&store, "terminal", "s", b"");
+        let command = Arc::new(AsyncMutex::new(Command::new(id.clone())));
+        let scheduler = crate::scheduler::ExecutionSlots::new(1, 0, 0, 0).unwrap();
+        let mut timing = Timings::default();
+        let active = scheduler
+            .acquire(Lane::General, Duration::from_secs(1), &mut timing)
+            .await
+            .unwrap();
+        let rejection = match scheduler
+            .acquire(Lane::General, Duration::from_secs(1), &mut timing)
+            .await
+        {
+            Err(rejected @ SlotWait::Full(_)) => rejected,
+            _ => panic!("the occupied lane has no queue slots"),
+        };
+        {
+            let mut guard = command.lock().await;
+            persist_queue_rejection(&mut guard, &store, rejection, &timing).unwrap();
+            assert!(!guard.is_busy());
+            assert_eq!(
+                store.metadata(&id).unwrap()["execution_state"],
+                "not_started"
+            );
+        }
+        drop(active);
+        let live = read_command_state(&store, "s", &command, ReadWait::Output(0), 4096, None)
+            .await
+            .unwrap();
+        let archived = read_saved_terminal_result(&store, "s", &id, 4096, None).unwrap();
+        for key in [
+            "state",
+            "executed",
+            "completion_unknown",
+            "failure_stage",
+            "error",
+            "reason",
+            "queue",
+            "retryable",
+            "queue_timed_out",
+        ] {
+            assert_eq!(live[key], archived[key], "{key}");
+        }
+        assert_eq!(archived["reason"], "queue_full");
+        assert_eq!(archived["retryable"], true);
+        assert_eq!(archived["queue_timed_out"], false);
     }
 
     #[tokio::test]
@@ -1986,12 +2393,12 @@ mod tests {
         // A queued command never left the machine.
         assert_eq!(
             close_final_state(CmdState::Queued),
-            Some(("not_started", false, false, "not_started"))
+            Some((CmdState::NotStarted, "not_started"))
         );
         // A running command was already sent, so its completion is unknown.
         assert_eq!(
             close_final_state(CmdState::Running),
-            Some(("unknown", true, true, "closed_by_caller"))
+            Some((CmdState::Unknown, "closed_by_caller"))
         );
         // Finished work keeps its verdict.
         assert_eq!(close_final_state(CmdState::Completed), None);

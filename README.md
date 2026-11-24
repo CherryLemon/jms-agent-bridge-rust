@@ -132,10 +132,39 @@ a command in flight is reported as `running`; the query never waits for that
 command, so status latency does not grow with command duration. A terminal accepts
 one command at a time: a second `exec` is refused with "terminal is busy".
 
+For a command's saved output, call
+`terminal(action="read", session=..., options={"result_id":"..."})`
+(or legacy `terminal_read` with the same ID). It reads that command even if a
+new command owns the terminal or the server has restarted. Use the returned
+cursor for subsequent pages; explicit cursors do not move the implicit session
+cursor. Omit the result ID to read the session's current command as before.
+If sending a command fails or times out, that shell is marked lost and cannot
+accept another command. Keep the result ID to reconcile the uncertain outcome;
+open a new terminal explicitly rather than replaying the command automatically.
+
 Advanced fields live in an `options` object so the advertised schema stays small;
 `discover(operation="run"|"fs"|"terminal"|"job")` returns the complete schema, and
 `discover(operation="jms_fs", query=<action>)` narrows it per action. Everything
 that is accepted but not advertised is still validated before any side effect.
+
+Add `view="signature"` to an operation search or exact lookup for a one-line
+signature derived from the schema. Required arguments are listed first,
+optional arguments are marked with `?`, selected common bounds are included,
+and an action-specific lookup fixes the action
+(e.g. `discover(operation="jms_fs", query="read", view="signature")`).
+Omit `view` for the normal search summary (including signatures) or the full
+schema of an exact operation or filesystem action.
+
+`topic="operations"` responses include a static `catalog_version` and an
+`etag` scoped to that bridge instance, query, operation, view, limit and offset.
+Conditional discovery is optional. Send that `etag` as `if_none_match` on the
+same request; a hit returns only `{"unchanged":true}`. A miss returns the full
+requested representation with a fresh tag. If the cached body is unavailable,
+omit `if_none_match` to retrieve it. The tag and version add about 180 bytes to
+an uncached response, which can outweigh the payload of a one-line lookup;
+caching is most useful for repeated lists and full schemas. Asset inventory and
+live status keep their normal responses, including refresh errors, without
+operation catalog etags.
 
 Listings are paged (`offset`/`limit`, `next_offset` in the answer) and a `call` or `job`
 response above 8 KiB is saved whole: the reply then carries `staged: true`, a

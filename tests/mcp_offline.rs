@@ -225,6 +225,69 @@ max_parallel = 2\n",
         .unwrap_err();
     assert!(error.message().contains("unknown terminal session"));
 
+    // Historical command output is addressable through both terminal entry
+    // points without creating a shell, even when its old handle is absent.
+    let command_id = runtime
+        .store
+        .create(object(json!({
+            "kind": "terminal", "session_id": "previous-shell"
+        })))
+        .unwrap();
+    std::fs::write(
+        runtime.store.path(&command_id, "stdout").unwrap(),
+        b"recorded",
+    )
+    .unwrap();
+    runtime
+        .store
+        .finish(
+            &command_id,
+            object(json!({
+                "execution_state": "completed", "exit_code": 0, "ok": true
+            })),
+        )
+        .unwrap();
+    let first = server
+        .dispatch(
+            "terminal",
+            object(json!({
+                "action": "read", "session": "previous-shell",
+                "options": {"result_id": command_id, "max_bytes": 3}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["stdout"], "rec");
+    let second = server
+        .dispatch(
+            "call",
+            object(json!({
+                "operation": "terminal_read", "arguments": {
+                    "session": "previous-shell", "result_id": command_id, "cursor": first["cursor"]
+                }
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["stdout"], "orded");
+    let wrong_session = server
+        .dispatch(
+            "terminal",
+            object(json!({
+                "action": "read", "session": "unrelated",
+                "options": {"result_id": command_id}
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(wrong_session
+        .message()
+        .contains("not a command for this terminal"));
+
+    // A pre-fix partial write was saved as executed=true even without START.
+    // Both terminal and general metadata reads clarify it without migrating the file.
+    legacy_partial_send_metadata_is_corrected_on_read(&runtime, &server).await;
+
     // Failure counters stay visible in the receipts surface.
     let status = runtime.status().await;
     assert!(status.get("execution").is_some());
@@ -296,7 +359,311 @@ max_parallel = 2\n",
         json!("read")
     );
 
+    let signature = server
+        .dispatch(
+            "discover",
+            object(json!({"query": "read", "operation": "jms_fs", "view": "signature"})),
+        )
+        .await
+        .expect("discover filesystem signature");
+    let line = signature["signature"].as_str().unwrap();
+    assert!(
+        line.starts_with(r#"jms_fs(action="read", path, target, "#),
+        "{line}"
+    );
+    assert!(line.contains("byte_offset?"));
+    assert!(signature.get("inputSchema").is_none());
+    assert_ne!(signature["etag"], schema["etag"]);
+    assert_eq!(signature["catalog_version"], schema["catalog_version"]);
+
+    // Action-specific discovery must match the pre-connection runtime validator.
+    for (action, max, default) in [
+        ("read", 120, 30),
+        ("upload", 900, 900),
+        ("download", 900, 900),
+    ] {
+        let full = server
+            .dispatch(
+                "discover",
+                object(json!({"operation": "jms_fs", "query": action})),
+            )
+            .await
+            .unwrap();
+        let timeout = &full["inputSchema"]["properties"]["timeout"];
+        assert_eq!(timeout["maximum"], max, "{action}");
+        assert_eq!(timeout["default"], default, "{action}");
+
+        let compact = server
+            .dispatch(
+                "discover",
+                object(json!({
+                    "operation": "jms_fs", "query": action, "view": "signature",
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(compact["signature"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("timeout?[1..{max}]")));
+
+        let mut fs_args = json!({"target": "mock", "path": "/remote", "action": action});
+        if action != "read" {
+            fs_args["local_path"] = json!(config_path);
+        }
+        for (seconds, allowed) in [(max, true), (max + 1, false)] {
+            fs_args["timeout"] = json!(seconds);
+            assert_eq!(
+                jms_bridge::schema::validate(&full["inputSchema"], &fs_args).is_ok(),
+                allowed,
+                "schema {action} {seconds}",
+            );
+            assert_eq!(
+                jms_bridge::filesystem::validate(&object(fs_args.clone())).is_ok(),
+                allowed,
+                "runtime {action} {seconds}",
+            );
+        }
+    }
+
+    let resident = server
+        .dispatch("discover", object(json!({"operation": "run"})))
+        .await
+        .unwrap();
+    assert_eq!(resident["advertised"], true);
+    assert!(resident["inputSchema"]["properties"]["script_path"].is_object());
+
+    let page_args = json!({"query": "jobs", "view": "signature", "limit": 1, "offset": 0});
+    let page = server
+        .dispatch("discover", object(page_args.clone()))
+        .await
+        .unwrap();
+    let row = &page["operations"][0];
+    assert_eq!(row["name"], "jms_submit_job");
+    assert_eq!(
+        row["signature"],
+        "jms_submit_job(command, targets, allow_dangerous?)"
+    );
+    let tag = page["etag"].clone();
+    let mut cached = page_args;
+    cached["if_none_match"] = tag.clone();
+    let reply = server.dispatch("discover", object(cached)).await.unwrap();
+    assert_eq!(reply, json!({"unchanged": true}));
+
+    for different in [
+        json!({"query": "jobs", "view": "signature", "limit": 1, "offset": 1}),
+        json!({"query": "jobs", "view": "signature", "limit": 2}),
+        json!({"query": "jobs", "limit": 1}),
+        json!({"query": "JOBS", "view": "signature", "limit": 1}),
+        json!({"query": "terminal", "view": "signature", "limit": 1}),
+        json!({"operation": "jms_submit_job", "view": "signature", "limit": 1}),
+    ] {
+        let mut different = different;
+        different["if_none_match"] = tag.clone();
+        let reply = server
+            .dispatch("discover", object(different))
+            .await
+            .unwrap();
+        assert!(reply.get("unchanged").is_none());
+        assert_ne!(reply["etag"], tag);
+    }
+
+    let wrong_token = server
+        .dispatch(
+            "discover",
+            object(json!({
+                "query": "jobs", "view": "signature", "limit": 1,
+                "if_none_match": page["catalog_version"],
+            })),
+        )
+        .await
+        .unwrap();
+    assert!(wrong_token.get("operations").is_some());
+
+    let status = server
+        .dispatch(
+            "discover",
+            object(json!({
+                "topic": "status", "if_none_match": page["etag"],
+            })),
+        )
+        .await
+        .unwrap();
+    assert!(status.get("unchanged").is_none());
+    let asset_error = server
+        .dispatch(
+            "discover",
+            object(json!({
+                "topic": "assets", "if_none_match": page["etag"],
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(!asset_error.message().is_empty());
+
+    // Real streamable HTTP service, using the same stateless runtime factory as the CLI.
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+    let mut config = StreamableHttpServerConfig::default();
+    config.legacy_session_mode = false;
+    config.json_response = true;
+    let service: StreamableHttpService<BridgeServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            {
+                let runtime = runtime.clone();
+                move || Ok(BridgeServer::new(runtime.clone()))
+            },
+            std::sync::Arc::new(LocalSessionManager::default()),
+            config,
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let http = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new().nest_service("/mcp", service))
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for (id, args, field) in [
+        (
+            1,
+            json!({"operation": "jms_fs", "query": "read"}),
+            "inputSchema",
+        ),
+        (
+            2,
+            json!({"operation": "jms_fs", "query": "read", "view": "signature"}),
+            "signature",
+        ),
+        (
+            3,
+            json!({"operation": "jms_fs", "query": "read", "view": "signature",
+                   "if_none_match": signature["etag"]}),
+            "unchanged",
+        ),
+    ] {
+        let reply: Value = client
+            .post(&endpoint)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-06-18")
+            .json(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                          "params": {"name": "discover", "arguments": args}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .expect("compact HTTP MCP tool reply"),
+        )
+        .unwrap();
+        assert!(body.get(field).is_some(), "{body}");
+        if field == "unchanged" {
+            assert_eq!(body, json!({"unchanged": true}));
+        }
+    }
+    http.abort();
+
     runtime.shutdown().await;
+}
+
+async fn legacy_partial_send_metadata_is_corrected_on_read(
+    runtime: &BridgeRuntime,
+    server: &BridgeServer,
+) {
+    use jms_bridge::storage::journal::ProgressSink;
+
+    let old_bytes = include_bytes!("fixtures/terminal_legacy_partial_send.json");
+    let old: Value = serde_json::from_slice(old_bytes).unwrap();
+    let id = old["result_id"].as_str().unwrap();
+    let directory = runtime.store.directory(id).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("meta.json");
+    std::fs::write(&path, old_bytes).unwrap();
+    let terminal = server
+        .dispatch(
+            "terminal",
+            object(json!({
+                "action": "read", "session": old["session_id"],
+                "options": {"result_id": id}
+            })),
+        )
+        .await
+        .unwrap();
+    let meta = server
+        .dispatch("meta", object(json!({"ref": format!("result:{id}")})))
+        .await
+        .unwrap();
+    let receipt_id = "legacy-terminal-receipt";
+    let receipt_result = id.to_string();
+    runtime
+        .journal
+        .execute(
+            receipt_id,
+            "terminal",
+            &json!({}),
+            move |progress| async move {
+                progress.record("execution_results", json!({"result_id": receipt_result}))?;
+                Ok(json!({"result_id": receipt_result}))
+            },
+        )
+        .await
+        .unwrap();
+    let receipt = runtime.request_status(receipt_id).await.unwrap();
+    for projection in [
+        &terminal,
+        &meta,
+        &receipt["execution_results"][0]["result_status"],
+    ] {
+        assert_eq!(projection.get("executed"), Some(&Value::Null));
+        assert_eq!(projection["failure_stage"], "channel");
+        assert_eq!(projection["completion_unknown"], true);
+        assert_eq!(projection["error"], old["error"]);
+    }
+    assert_eq!(terminal["state"], "unknown");
+    assert_eq!(meta["execution_state"], "unknown");
+    assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+
+    // Unrelated annotations must not bake the read-time correction into the record.
+    runtime
+        .store
+        .annotate(id, object(json!({"diagnostic": "checked"})))
+        .unwrap();
+    let annotated: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(annotated["executed"], true);
+    assert_eq!(runtime.store.metadata(id).unwrap()["executed"], Value::Null);
+
+    // Actual START evidence from legacy capture used its own channel error and
+    // could include exit_code=null. Neither that nor other kinds/stages match.
+    for (key, value) in [
+        (
+            "error",
+            json!("terminal command timed out; completion is unknown"),
+        ),
+        ("exit_code", Value::Null),
+        ("kind", json!("run")),
+        ("status", json!("running")),
+        ("failure_stage", json!("closed_by_caller")),
+    ] {
+        let mut nonmatch = old.clone();
+        nonmatch[key] = value;
+        std::fs::write(&path, serde_json::to_vec(&nonmatch).unwrap()).unwrap();
+        assert_eq!(
+            runtime.store.metadata(id).unwrap()["executed"],
+            true,
+            "{key}"
+        );
+    }
 }
 
 fn object(value: Value) -> Map<String, Value> {
