@@ -126,13 +126,28 @@ impl BridgeServer {
                     },
                     error.message
                 );
-                BridgeError::invalid_arguments(message, error.diagnostic(""))
+                let diagnostic = if name == "fs" {
+                    crate::schema::fs_diagnostic(error, &flat, "")
+                } else {
+                    error.diagnostic("")
+                };
+                BridgeError::invalid_arguments(message, diagnostic)
             },
         )?;
         let value = match name {
             "run" => self.runtime.tool_run(flat.clone()).await?,
             "job" => self.runtime.tool_job(flat.clone()).await?,
-            "fs" => self.runtime.tool_fs(flat.clone()).await?,
+            "fs" => self.runtime.tool_fs(flat.clone()).await.map_err(|error| {
+                if arguments
+                    .get("options")
+                    .and_then(|options| options.get("timeout"))
+                    .is_some()
+                {
+                    error.with_validation_prefix("/options")
+                } else {
+                    error
+                }
+            })?,
             "terminal" => {
                 let action = flat
                     .get("action")

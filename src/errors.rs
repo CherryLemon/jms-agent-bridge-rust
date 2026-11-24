@@ -41,6 +41,15 @@ impl BridgeError {
         }
     }
 
+    pub(crate) fn with_validation_prefix(mut self, prefix: &str) -> Self {
+        if let Self::InvalidArguments { validation, .. } = &mut self {
+            if let Some(path) = validation["path"].as_str() {
+                validation["path"] = serde_json::json!(format!("{prefix}{path}"));
+            }
+        }
+        self
+    }
+
     pub(crate) fn tool_error_body(&self) -> Value {
         let mut body = serde_json::json!({"ok": false, "error": self.message()});
         if let Self::InvalidArguments { validation, .. } = self {
