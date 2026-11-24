@@ -61,16 +61,13 @@ pub struct Command {
     exit_code: Option<i32>,
     error: Option<String>,
     rejection: Map<String, Value>,
-    cursor: HashMap<String, u64>,
+    cursor: TerminalPageCursor,
     changed: Arc<Notify>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Command {
     fn new(result_id: String) -> Self {
-        let mut cursor = HashMap::new();
-        cursor.insert("stdout".to_string(), 0);
-        cursor.insert("stderr".to_string(), 0);
         Self {
             result_id,
             state: CmdState::Queued,
@@ -79,7 +76,7 @@ impl Command {
             exit_code: None,
             error: None,
             rejection: Map::new(),
-            cursor,
+            cursor: TerminalPageCursor::default(),
             changed: Arc::new(Notify::new()),
             task: None,
         }
@@ -901,53 +898,51 @@ impl Interactive {
             .lock()
             .await
             .insert(session.clone(), binding.clone());
-        let mut setup: Vec<String> = Vec::new();
+        if let Err(error) = self.configure_open(&session, cwd, env).await {
+            let _ = self.close(&session).await;
+            return Err(error);
+        }
+        Ok(json!({"ok": true, "session": session, "host": target, "state": "idle"}))
+    }
+
+    /// The readiness handshake has completed. Send a setup command only
+    /// when there is a directory or environment to apply.
+    async fn configure_open(
+        &self,
+        session: &str,
+        cwd: Option<&str>,
+        env: &[(String, String)],
+    ) -> BridgeResult<()> {
+        let mut setup = Vec::new();
         if let Some(cwd) = cwd {
             setup.push(format!("cd -- {}", shell_quote(cwd)));
         }
         for (key, value) in env {
             setup.push(format!("export {key}={}", shell_quote(value)));
         }
-        let script = if setup.is_empty() {
-            ":".to_string()
-        } else {
-            setup.join(" && ")
-        };
-        let setup_deadline = Instant::now() + Duration::from_secs(10);
-        let value = self
-            .execute_with_wait(
-                &session,
-                &script,
-                false,
-                ReadWait::Completion(setup_deadline),
-                4096,
-                None,
-                None,
-            )
-            .await;
-        let value = match value {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = self.close(&session).await;
-                return Err(error);
+        if !setup.is_empty() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let value = self
+                .execute_with_wait(
+                    session,
+                    &setup.join(" && "),
+                    false,
+                    ReadWait::Completion(deadline),
+                    4096,
+                    None,
+                    None,
+                )
+                .await?;
+            if value.get("state").and_then(Value::as_str) != Some("completed")
+                || value.get("exit_code").and_then(Value::as_i64) != Some(0)
+            {
+                return Err(BridgeError::invalid(format!(
+                    "terminal setup failed; result_id={}",
+                    value.get("result_id").and_then(Value::as_str).unwrap_or("")
+                )));
             }
-        };
-        if value.get("state").and_then(Value::as_str) != Some("completed")
-            || value.get("exit_code").and_then(Value::as_i64) != Some(0)
-        {
-            let _ = self.close(&session).await;
-            return Err(BridgeError::invalid(format!(
-                "terminal setup failed; result_id={}",
-                value.get("result_id").and_then(Value::as_str).unwrap_or("")
-            )));
         }
-        self.save().await?;
-        Ok(json!({
-            "ok": true,
-            "session": session,
-            "host": target,
-            "state": "idle",
-        }))
+        self.save().await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1152,10 +1147,9 @@ impl Interactive {
         let Some(command) = command else {
             return Ok(json!({
                 "ok": true, "session": session,
-                "state": if closed { "closed" } else { "idle" },
+                "state": if closed { "closed" } else if lost { "lost" } else { "idle" },
             }));
         };
-        let _ = lost;
         self.read_command(session, &command, wait, max_bytes, cursor)
             .await
     }
@@ -1238,20 +1232,20 @@ async fn read_command_state(
 ) -> BridgeResult<Value> {
     let mut guard = command.lock().await;
     let mut positions = if cursor.is_some() {
-        terminal_positions(cursor)
+        TerminalPageCursor::from(cursor)
     } else {
         guard.cursor.clone()
     };
     {
         // The result id is copied out so the helper never borrows the lock guard.
         let result_id = guard.result_id.clone();
-        let has_output = |store: &ResultStore, positions: &HashMap<String, u64>| -> bool {
+        let has_output = |store: &ResultStore, positions: &TerminalPageCursor| -> bool {
             ["stdout", "stderr"].iter().any(|stream| {
                 store
                     .path(&result_id, stream)
                     .ok()
                     .and_then(|path| std::fs::metadata(path).ok())
-                    .map(|meta| meta.len() > positions.get(*stream).copied().unwrap_or(0))
+                    .map(|meta| meta.len() > positions.offsets[usize::from(*stream == "stderr")])
                     .unwrap_or(false)
             })
         };
@@ -1300,47 +1294,88 @@ async fn read_command_state(
     }
 }
 
-fn terminal_positions(cursor: Option<&Value>) -> HashMap<String, u64> {
-    ["stdout", "stderr"]
-        .into_iter()
-        .filter_map(|stream| {
-            cursor?
-                .get(stream)?
-                .as_u64()
-                .map(|offset| (stream.to_string(), offset))
-        })
-        .collect()
+const PAGE_STREAMS: [&str; 2] = ["stdout", "stderr"];
+
+#[derive(Clone, Copy)]
+struct TerminalPageCursor {
+    offsets: [u64; 2],
+    next: usize,
+}
+
+impl Default for TerminalPageCursor {
+    fn default() -> Self {
+        Self {
+            offsets: [0; 2],
+            next: 1,
+        }
+    }
+}
+
+impl TerminalPageCursor {
+    fn from(cursor: Option<&Value>) -> Self {
+        let field = |name| cursor.and_then(|c| c.get(name));
+        Self {
+            offsets: PAGE_STREAMS.map(|name| field(name).and_then(Value::as_u64).unwrap_or(0)),
+            next: usize::from(field("next_stream").and_then(Value::as_str) != Some("stdout")),
+        }
+    }
+
+    fn to_json(self) -> Value {
+        json!({"stdout": self.offsets[0], "stderr": self.offsets[1],
+               "next_stream": PAGE_STREAMS[self.next]})
+    }
 }
 
 fn append_terminal_page(
     store: &ResultStore,
     result_id: &str,
     max_bytes: usize,
-    positions: &mut HashMap<String, u64>,
+    positions: &mut TerminalPageCursor,
     out: &mut Map<String, Value>,
 ) -> BridgeResult<()> {
-    let mut budget = max_bytes;
-    for stream in ["stderr", "stdout"] {
-        let path = store.path(result_id, stream)?;
-        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        let position = positions.get(stream).copied().unwrap_or(0);
-        let limit = (budget as u64).min(size.saturating_sub(position));
-        if limit > 0 {
-            let page = store.read(result_id, stream, position, limit as usize, false, None)?;
-            let text = page.get("text").and_then(Value::as_str).unwrap_or("");
-            out.insert(stream.to_string(), Value::from(text));
-            let next = page
-                .get("next_offset")
-                .and_then(Value::as_u64)
-                .unwrap_or(position);
-            positions.insert(stream.to_string(), next);
-            budget = budget.saturating_sub(text.len());
+    let first = positions.next;
+    let second = 1 - first;
+    let pending = |stream: usize| -> BridgeResult<u64> {
+        let path = store.path(result_id, PAGE_STREAMS[stream])?;
+        let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        Ok(size.saturating_sub(positions.offsets[stream]))
+    };
+    let first_pending = pending(first)?;
+    let second_pending = pending(second)?;
+    let budget = max_bytes as u64;
+    let reserve_second = second_pending.min(budget / 2);
+    let first_limit = first_pending.min(budget - reserve_second);
+    let read_stream = |stream: usize,
+                       cursor: &mut TerminalPageCursor,
+                       limit: u64,
+                       fields: &mut Map<String, Value>|
+     -> BridgeResult<u64> {
+        if limit == 0 {
+            return Ok(0);
         }
-        if positions.get(stream).copied().unwrap_or(0) < size {
-            out.insert("more".into(), Value::Bool(true));
+        let name = PAGE_STREAMS[stream];
+        let position = cursor.offsets[stream];
+        let page = store.read(result_id, name, position, limit as usize, false, None)?;
+        let next = page["next_offset"].as_u64().unwrap_or(position);
+        cursor.offsets[stream] = next;
+        if let Some(text) = page["text"].as_str() {
+            fields.insert(name.into(), Value::from(text));
         }
+        // Account source offsets, not the potentially lossy UTF-8 text length.
+        Ok(next.saturating_sub(position))
+    };
+    let first_read = read_stream(first, positions, first_limit, out)?;
+    let second_limit = second_pending.min(budget.saturating_sub(first_read));
+    let second_read = read_stream(second, positions, second_limit, out)?;
+    // Both streams get a turn at the first byte even with a one-byte page.
+    // The choice travels in the explicit cursor, not shared reader state.
+    if first_pending > 0 && second_pending > 0 && (first_read > 0 || second_read > 0) {
+        positions.next = second;
     }
-    out.insert("cursor".into(), json!(positions));
+    if first_read < first_pending || second_read < second_pending {
+        out.insert("more".into(), Value::Bool(true));
+    }
+    out.insert("cursor".into(), positions.to_json());
     Ok(())
 }
 
@@ -1392,7 +1427,7 @@ fn read_saved_terminal_result(
             out.insert(key.to_string(), value.clone());
         }
     }
-    let mut positions = terminal_positions(cursor);
+    let mut positions = TerminalPageCursor::from(cursor);
     append_terminal_page(store, result_id, max_bytes, &mut positions, out)?;
     Ok(result)
 }
@@ -1852,6 +1887,141 @@ mod tests {
             .unwrap();
         std::fs::write(store.path(&id, "stdout").unwrap(), bytes).unwrap();
         id
+    }
+
+    #[tokio::test]
+    async fn ready_shell_without_setup_stays_idle_without_an_extra_packet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (interactive, _, mut frames) = terminal_with_stalled_writer(dir.path(), 1).await;
+        interactive.configure_open("s", None, &[]).await.unwrap();
+        let binding = interactive.binding("s").await.unwrap();
+        assert!(binding.lock().await.command.is_none());
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            interactive.read("s", 0, 4096, None).await.unwrap()["state"],
+            "idle"
+        );
+        assert!(interactive.registry.is_file());
+        assert_eq!(interactive.sessions().await["sessions"][0]["state"], "idle");
+
+        binding.lock().await.shell.mark_lost();
+        let lost = interactive.read("s", 0, 4096, None).await.unwrap();
+        assert_eq!(lost["state"], "lost");
+        assert!(lost.get("result_id").is_none());
+        assert_eq!(interactive.sessions().await["sessions"][0]["state"], "lost");
+        assert!(binding
+            .lock()
+            .await
+            .check_exec_admission()
+            .await
+            .unwrap_err()
+            .message()
+            .contains("closed/lost"));
+        assert!(binding.lock().await.command.is_none());
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    fn terminal_page(store: &ResultStore, id: &str, budget: usize, cursor: &Value) -> Value {
+        read_saved_terminal_result(store, "s", id, budget, Some(cursor)).unwrap()
+    }
+
+    #[test]
+    fn one_byte_pages_favor_both_streams_with_imbalanced_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        // Exercise both directions, including an old cursor with highly
+        // imbalanced offsets and no scheduling field.
+        for (heavy, light) in [("stdout", "stderr"), ("stderr", "stdout")] {
+            let id = test_command(&store, "terminal", "s", b"");
+            std::fs::write(store.path(&id, heavy).unwrap(), vec![b'H'; 120]).unwrap();
+            std::fs::write(store.path(&id, light).unwrap(), b"L").unwrap();
+            let old = json!({(heavy): 100, (light): 0});
+            let one = terminal_page(&store, &id, 1, &old);
+            assert_eq!(one, terminal_page(&store, &id, 1, &old));
+            let two = terminal_page(&store, &id, 1, &one["cursor"]);
+            assert_eq!(two, terminal_page(&store, &id, 1, &one["cursor"]));
+            let bytes = |page: &Value| {
+                PAGE_STREAMS
+                    .iter()
+                    .map(|name| page[*name].as_str().map_or(0, str::len))
+                    .sum::<usize>()
+            };
+            assert_eq!(bytes(&one), 1);
+            assert_eq!(bytes(&two), 1);
+            assert!(one[light] == "L" || two[light] == "L");
+            assert_eq!(two["cursor"][heavy], 101);
+            assert_eq!(two["cursor"][light], 1);
+            assert_eq!(two["more"], true);
+        }
+    }
+
+    #[test]
+    fn fair_pages_lend_unused_budget_and_drain_in_order_without_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        for (stdout, stderr) in [
+            ("", ""),
+            ("only-out", ""),
+            ("", "only-err"),
+            ("ab", "1234567"),
+            ("abcdefghi", "0123456"),
+        ] {
+            let id = test_command(&store, "terminal", "s", stdout.as_bytes());
+            std::fs::write(store.path(&id, "stderr").unwrap(), stderr.as_bytes()).unwrap();
+            let mut cursor = json!({});
+            let mut observed = [String::new(), String::new()];
+            for _ in 0..8 {
+                let page = terminal_page(&store, &id, 5, &cursor);
+                let mut n = 0;
+                for (i, name) in PAGE_STREAMS.into_iter().enumerate() {
+                    let text = page[name].as_str().unwrap_or("");
+                    observed[i].push_str(text);
+                    n += text.len();
+                }
+                let remaining = stdout.len() + stderr.len()
+                    - cursor["stdout"].as_u64().unwrap_or(0) as usize
+                    - cursor["stderr"].as_u64().unwrap_or(0) as usize;
+                assert_eq!(n, remaining.min(5));
+                cursor = page["cursor"].clone();
+                if page["more"] != true {
+                    break;
+                }
+            }
+            assert_eq!(observed, [stdout, stderr]);
+        }
+    }
+
+    #[test]
+    fn utf8_boundary_extension_uses_source_bytes_and_rotates_below_one_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(dir.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let id = test_command(&store, "terminal", "s", b"\xffabc");
+        std::fs::write(store.path(&id, "stderr").unwrap(), "🙂é".as_bytes()).unwrap();
+
+        // Match ResultStore's existing whole-character extension at max_bytes=1.
+        let first = terminal_page(&store, &id, 1, &json!({}));
+        assert_eq!(first["stderr"], "🙂");
+        assert_eq!(first["cursor"]["stderr"], 4);
+        assert_eq!(first["cursor"]["stdout"], 0);
+        let second = terminal_page(&store, &id, 1, &first["cursor"]);
+        assert_eq!(second["stdout"], "�");
+        assert_eq!(second["cursor"]["stdout"], 1);
+        assert_eq!(second["cursor"]["stderr"], 4);
+
+        // One invalid source byte displays as three UTF-8 bytes. It still
+        // leaves one source byte for the peer when both streams can use it.
+        std::fs::write(store.path(&id, "stderr").unwrap(), b"z").unwrap();
+        let shared = terminal_page(&store, &id, 2, &json!({"next_stream":"stdout"}));
+        assert_eq!(shared["stdout"], "�");
+        assert_eq!(shared["stderr"], "z");
+        assert_eq!(shared["cursor"]["stdout"], 1);
+        assert_eq!(shared["cursor"]["stderr"], 1);
     }
 
     #[test]

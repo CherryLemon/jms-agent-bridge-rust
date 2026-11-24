@@ -139,6 +139,18 @@ new command owns the terminal or the server has restarted. Use the returned
 cursor for subsequent pages; explicit cursors do not move the implicit session
 cursor. Omit the result ID to read the session's current command as before.
 
+The stdout and stderr page share `max_bytes`. If both have pending output, the
+bridge reserves a share for each, lends unused capacity to the other stream,
+and alternates which one goes first. A one-byte page can therefore show either
+stream; keep the returned `next_stream` in explicit cursors when available.
+Old cursors with just offsets remain accepted. The budget counts source bytes,
+with an existing UTF-8 boundary extension of up to three bytes per page.
+Lossy display of invalid bytes can be longer than its source offsets.
+
+Opening with no cwd or environment finishes after the two-stream readiness
+handshake. Opening with setup options still waits for the setup exit status.
+
+
 For a short command that may print before exiting, set
 `options={"wait_for":"completed","wait_ms":15000}` on terminal `exec`, `read` or
 `write`. The legacy equivalents accept the same fields directly. The default

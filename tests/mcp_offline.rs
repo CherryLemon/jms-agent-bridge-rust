@@ -285,7 +285,8 @@ max_parallel = 2\n",
             "terminal",
             object(json!({
                 "action": "read", "session": "previous-shell",
-                "options": {"result_id": command_id, "max_bytes": 3}
+                "options": {"result_id": command_id, "max_bytes": 3,
+                            "cursor":{"stdout":0,"stderr":0}}
             })),
         )
         .await
@@ -303,6 +304,18 @@ max_parallel = 2\n",
         .await
         .unwrap();
     assert_eq!(second["stdout"], "orded");
+    assert_eq!(first["cursor"]["next_stream"], "stderr");
+    let replay = server
+        .dispatch(
+            "terminal",
+            object(json!({
+                "action": "read", "session": "previous-shell",
+                "options": {"result_id": command_id, "cursor": first["cursor"]}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, second);
     let wrong_session = server
         .dispatch(
             "terminal",
