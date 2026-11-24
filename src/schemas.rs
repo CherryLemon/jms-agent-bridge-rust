@@ -222,7 +222,9 @@ reuse handle. Running is not completion; reads honour cursors.",
                     "interval":{"type":"number","minimum":0.1,"maximum":30,"default":2},
                     "offset":int(0,1099511627776,0),
                     "max_bytes":int(1024,16384,4096),
-                    "tail":{"type":"boolean"}
+                    "tail":{"type":"boolean"},
+                    "pattern":{"type":"string","minLength":1,"maxLength":1024},
+                    "cursor":{"type":"string","minLength":1,"maxLength":256}
                 }
             }),
             read_only:false,
@@ -712,13 +714,15 @@ fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool
         ),
         (
             "jms_job_logs",
-            "Read a job's log from offset or tail; poll with the returned next_offset.",
+            "Read a job's log by offset, tail or literal pattern; continue with next_offset or next_cursor.",
             json!({
                 "host": {"type": "string"},
                 "job_id": {"type": "string", "pattern": "^[0-9a-f]{8}$"},
                 "offset": int(0, 1099511627776, 0),
                 "max_bytes": int(1024, 16384, 4096),
                 "tail": {"type":"boolean"},
+                "pattern":{"type":"string","minLength":1,"maxLength":1024},
+                "cursor":{"type":"string","minLength":1,"maxLength":256},
             }),
             json!(["host", "job_id"]),
             true,
@@ -1043,6 +1047,8 @@ fn public_view(name: &str, schema: Value) -> Value {
             "offset",
             "max_bytes",
             "tail",
+            "pattern",
+            "cursor",
         ],
         _ => return schema,
     };
