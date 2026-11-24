@@ -1147,10 +1147,9 @@ impl Interactive {
         let Some(command) = command else {
             return Ok(json!({
                 "ok": true, "session": session,
-                "state": if closed { "closed" } else { "idle" },
+                "state": if closed { "closed" } else if lost { "lost" } else { "idle" },
             }));
         };
-        let _ = lost;
         self.read_command(session, &command, wait, max_bytes, cursor)
             .await
     }
@@ -1906,6 +1905,26 @@ mod tests {
             "idle"
         );
         assert!(interactive.registry.is_file());
+        assert_eq!(interactive.sessions().await["sessions"][0]["state"], "idle");
+
+        binding.lock().await.shell.mark_lost();
+        let lost = interactive.read("s", 0, 4096, None).await.unwrap();
+        assert_eq!(lost["state"], "lost");
+        assert!(lost.get("result_id").is_none());
+        assert_eq!(interactive.sessions().await["sessions"][0]["state"], "lost");
+        assert!(binding
+            .lock()
+            .await
+            .check_exec_admission()
+            .await
+            .unwrap_err()
+            .message()
+            .contains("closed/lost"));
+        assert!(binding.lock().await.command.is_none());
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     fn terminal_page(store: &ResultStore, id: &str, budget: usize, cursor: &Value) -> Value {
