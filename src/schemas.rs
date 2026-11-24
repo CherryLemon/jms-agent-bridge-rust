@@ -304,8 +304,7 @@ continue with next_offset.",
         },
         ToolSpec {
             name: "call",
-            description: "Call a discovered operation. request_id applies to jms_submit_job. Full \
-responses: read_result(stream='result').",
+            description: "Call discovered operations. Full responses: read_result(stream='result').",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -315,7 +314,7 @@ responses: read_result(stream='result').",
                     "arguments": {"type": "object", "description": "Validated against the operation schema.",
                                   "default": {}},
                     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
-                                   "description": "jms_submit_job only: recover with request_status."},
+                                   "description": "Job submit/cancel: recover via request_status."},
                 },
             }),
             read_only: false,
