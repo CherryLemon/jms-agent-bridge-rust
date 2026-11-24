@@ -271,6 +271,16 @@ byte of the suffix. To follow later appends, omit `tail` and pass
 including when text decoding replaces a partial UTF-8 sequence.
 
 
+For generation-checked forward paging without a pattern, start with
+`cursor="start"` and an optional numeric `offset` (default 0). Continue
+with the returned `next_cursor` in place of `offset`. The log text and
+numeric `next_offset` are still returned. A replacement or observed
+truncation returns `reset: true` and no bytes; start a fresh cursor to
+read the new log. If the log does not exist yet or the initial offset
+is beyond the sampled end, `next_cursor` is null; retry the initial
+request after the file is available or grows. The opt-in cursor does
+not combine with `tail` or with search cursors.
+
 Search the same log with a literal `pattern` (up to 1024 UTF-8 bytes),
 instead of `tail`. Start with `offset` (default 0); repeat the same pattern
 and pass `next_cursor` as `cursor` on later calls. Each call scans at most
