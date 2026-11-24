@@ -4,7 +4,7 @@
 //! single asset detail answers: 200, 500 (transient) or 404 (permission revoked).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::Path;
 use axum::http::StatusCode;
@@ -27,6 +27,16 @@ fn detail(id: &str) -> Value {
 }
 
 fn router(status: Arc<AtomicUsize>) -> Router {
+    router_with_order(status, None)
+}
+
+#[derive(Default)]
+struct DetailOrder {
+    slow: AtomicUsize,
+    completed: Mutex<Vec<String>>,
+}
+
+fn router_with_order(status: Arc<AtomicUsize>, order: Option<Arc<DetailOrder>>) -> Router {
     Router::new()
         .route(
             "/api/v1/perms/users/my/assets/",
@@ -45,7 +55,19 @@ fn router(status: Arc<AtomicUsize>) -> Router {
             "/api/v1/perms/users/my/assets/{id}/",
             get(move |Path(id): Path<String>| {
                 let status = status.clone();
+                let order = order.clone();
                 async move {
+                    if let Some(order) = order {
+                        let slow = if order.slow.load(Ordering::SeqCst) == 0 {
+                            ASSET_A
+                        } else {
+                            ASSET_B
+                        };
+                        if id == slow {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        order.completed.lock().unwrap().push(id.clone());
+                    }
                     if id == ASSET_B {
                         match status.load(Ordering::SeqCst) {
                             200 => (StatusCode::OK, Json(detail(&id))),
@@ -184,9 +206,10 @@ async fn discover_etag_does_not_hide_failed_refresh_or_revocation() {
     use serde_json::Map;
 
     let state = Arc::new(AtomicUsize::new(200));
+    let order = Arc::new(DetailOrder::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let app = router(state.clone());
+    let app = router_with_order(state.clone(), Some(order.clone()));
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -248,6 +271,53 @@ async fn discover_etag_does_not_hide_failed_refresh_or_revocation() {
     assert_ne!(full["etag"], tag);
     assert_eq!(full["assets"][0]["name"], "asset-a");
     assert_eq!(full["inventory_version"], version);
+
+    let args_page = |offset: usize, tag: Option<&str>| -> Map<String, Value> {
+        let mut args = json!({"topic":"assets", "limit":1, "offset":offset});
+        if let Some(tag) = tag {
+            args["if_none_match"] = json!(tag);
+        }
+        args.as_object().unwrap().clone()
+    };
+    assert_eq!(
+        order.completed.lock().unwrap().last_chunk::<2>().unwrap(),
+        &[ASSET_B, ASSET_A],
+    );
+    let mut before = Vec::new();
+    for (offset, id) in [ASSET_A, ASSET_B].iter().enumerate() {
+        let page = server
+            .dispatch("discover", args_page(offset, None))
+            .await
+            .unwrap();
+        assert_eq!(page["assets"][0]["id"], *id);
+        before.push(page);
+    }
+    assert_eq!(before[0]["next_offset"], 1);
+    assert!(before[1]["next_offset"].is_null());
+
+    order.completed.lock().unwrap().clear();
+    order.slow.store(1, Ordering::SeqCst);
+    assert_eq!(runtime.catalog.refresh().await["ok"], true);
+    assert_eq!(
+        order.completed.lock().unwrap().as_slice(),
+        &[ASSET_A, ASSET_B]
+    );
+    for (offset, previous) in before.iter().enumerate() {
+        let tag = previous["etag"].as_str().unwrap();
+        let hit = server
+            .dispatch("discover", args_page(offset, Some(tag)))
+            .await
+            .unwrap();
+        assert_eq!(hit["unchanged"], true);
+        assert_eq!(hit["inventory_version"], previous["inventory_version"]);
+        let page = server
+            .dispatch("discover", args_page(offset, None))
+            .await
+            .unwrap();
+        assert_eq!(page["etag"], tag);
+        assert_eq!(page["assets"], previous["assets"]);
+        assert_eq!(page["next_offset"], previous["next_offset"]);
+    }
 
     state.store(500, Ordering::SeqCst);
     assert_eq!(runtime.catalog.refresh().await["ok"], false);

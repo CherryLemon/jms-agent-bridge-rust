@@ -40,19 +40,32 @@ impl Snapshot {
         if map.get("identity").and_then(Value::as_str) != Some(identity) {
             return None;
         }
+        let mut assets = map
+            .get("assets")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        sort_asset_rows(&mut assets);
         Some(Self {
             refreshed_at: map
                 .get("refreshed_at")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0),
-            assets: map
-                .get("assets")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default(),
+            assets,
             identity: identity.to_string(),
         })
     }
+}
+
+fn sort_asset_rows(assets: &mut [Value]) {
+    // Preserve rows even if the server returns duplicate identities. Order
+    // their normalized contents so asynchronous completion never breaks ties.
+    assets.sort_by(|a, b| {
+        a.get("id")
+            .and_then(Value::as_str)
+            .cmp(&b.get("id").and_then(Value::as_str))
+            .then_with(|| a.to_string().cmp(&b.to_string()))
+    });
 }
 
 struct CatalogState {
@@ -404,9 +417,10 @@ impl AssetCatalog {
         let mut stage = "API fetch";
         let mut hint = "check API access/configuration";
         let result = async {
-            let assets = self.fetch_assets().await?;
+            let mut assets = self.fetch_assets().await?;
             stage = "snapshot preparation";
             hint = "check snapshot data and local state storage";
+            sort_asset_rows(&mut assets);
             let snapshot = Snapshot {
                 refreshed_at: now(),
                 assets,
