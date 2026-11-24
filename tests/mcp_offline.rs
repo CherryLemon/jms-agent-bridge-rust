@@ -369,6 +369,7 @@ max_parallel = 2\n",
     // A pre-fix partial write was saved as executed=true even without START.
     // Both terminal and general metadata reads clarify it without migrating the file.
     run_saved_views_do_not_change_receipt_identity(&runtime, &server).await;
+    run_saved_view_fanout_and_paging(&runtime, &server).await;
     legacy_partial_send_metadata_is_corrected_on_read(&runtime, &server).await;
     terminal_request_identity_is_shared(&runtime, &server).await;
 
@@ -1198,6 +1199,202 @@ async fn run_saved_views_do_not_change_receipt_identity(
         .await
         .unwrap_err();
     assert!(invalid.message().contains("output_view"));
+}
+
+async fn seed_saved_run(
+    runtime: &BridgeRuntime,
+    id: &str,
+    targets: &[String],
+    budget: u64,
+    value: Value,
+) {
+    // Use the pre-view normalized identity, never the rendering arguments.
+    let business = json!({
+        "targets":targets, "script":":", "cwd":null, "env":null,
+        "container":null, "image":null, "docker_args":null, "session_id":null,
+        "timeout":60, "max_output_bytes":budget, "allow_dangerous":false
+    });
+    runtime
+        .journal
+        .execute(id, "run", &business, |_| async { Ok(value) })
+        .await
+        .unwrap();
+}
+
+async fn run_saved_view_fanout_and_paging(runtime: &BridgeRuntime, server: &BridgeServer) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let targets = vec!["failed".to_string(), "no-stderr".to_string()];
+    let failed = runtime
+        .store
+        .create(object(json!({"host":"failed"})))
+        .unwrap();
+    let missing = runtime
+        .store
+        .create(object(json!({"host":"no-stderr"})))
+        .unwrap();
+    let failed_path = runtime.store.path(&failed, "stderr").unwrap();
+    let match_offset = 8 * 1024 * 1024 + 32;
+    let mut stderr = std::fs::File::create(failed_path).unwrap();
+    stderr.seek(SeekFrom::Start(match_offset)).unwrap();
+    stderr.write_all(b"[ERR] literal\n").unwrap();
+    std::fs::write(
+        runtime.store.path(&missing, "stdout").unwrap(),
+        b"other output\n",
+    )
+    .unwrap();
+    let metas = [
+        runtime
+            .store
+            .finish(
+                &failed,
+                object(json!({
+                    "ok":false,"execution_state":"completed","exit_code":7
+                })),
+            )
+            .unwrap(),
+        runtime
+            .store
+            .finish(
+                &missing,
+                object(json!({
+                    "ok":true,"execution_state":"completed","exit_code":0
+                })),
+            )
+            .unwrap(),
+    ];
+    let fail_receipt = "saved-view-partial-stream";
+    let rows = jms_bridge::execution::fanout_rows(&runtime.store, &metas, 256).unwrap();
+    seed_saved_run(
+        runtime,
+        fail_receipt,
+        &targets,
+        256,
+        json!({"ok":false,"results":rows}),
+    )
+    .await;
+    let search = server.dispatch("run", object(json!({
+        "targets":targets,"script":":","request_id":fail_receipt,"detail":"full",
+        "options":{"max_output_bytes":256,"output_view":{"stream":"stderr","pattern":"[ERR]"}}
+    }))).await.unwrap();
+    assert_eq!(search["duplicate"], true);
+    assert_eq!(search["execution_replayed"], false);
+    assert_eq!(search["ok"], false);
+    let first = &search["results"][0];
+    assert_eq!(first["result_id"], failed);
+    assert_eq!(first["exit_code"], 7);
+    assert_eq!(first["ok"], false);
+    let view = &first["output_view"];
+    assert_eq!(view["matches"], json!([]));
+    assert_eq!(view["eof"], false);
+    assert_eq!(view["next_offset"], 8 * 1024 * 1024);
+    let action = &view["next_action"];
+    assert_eq!(action["arguments"]["pattern"], "[ERR]");
+    assert_eq!(action["arguments"]["stream"], "stderr");
+    let page = server
+        .dispatch(
+            action["tool"].as_str().unwrap(),
+            object(action["arguments"].clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page["matches"][0]["offset"], match_offset);
+    assert_eq!(page["next_offset"], match_offset + 5);
+    assert_eq!(page["eof"], false); // the match used the page's byte budget
+    let mut remaining = object(action["arguments"].clone());
+    remaining.insert("offset".into(), page["next_offset"].clone());
+    let end = server.dispatch("read_result", remaining).await.unwrap();
+    assert_eq!(end["matches"], json!([]));
+    assert_eq!(end["eof"], true);
+
+    let other = &search["results"][1];
+    assert_eq!(other["result_id"], missing);
+    assert_eq!(other["exit_code"], 0);
+    assert_eq!(other["stdout"], "other output\n");
+    assert!(other.get("output_view").is_none());
+    assert!(other["output_view_error"]
+        .as_str()
+        .unwrap()
+        .contains("no stderr stream"));
+
+    // A 256-byte batch of 65 hosts allocates three bytes to each. The head
+    // view reserves all three for UTF-8 slack; omit the view rather than
+    // invoking read_result with illegal limit=0 or discarding old previews.
+    let targets: Vec<_> = (0..65).map(|i| format!("target-{i}")).collect();
+    let mut small = Vec::new();
+    for host in &targets {
+        let id = runtime.store.create(object(json!({"host":host}))).unwrap();
+        std::fs::write(runtime.store.path(&id, "stdout").unwrap(), b"abcd").unwrap();
+        small.push(
+            runtime
+                .store
+                .finish(
+                    &id,
+                    object(json!({
+                        "ok":true,"execution_state":"completed","exit_code":0
+                    })),
+                )
+                .unwrap(),
+        );
+    }
+    let rows = jms_bridge::execution::fanout_rows(&runtime.store, &small, 256).unwrap();
+    let zero_receipt = "saved-view-zero-share";
+    seed_saved_run(
+        runtime,
+        zero_receipt,
+        &targets,
+        256,
+        json!({"ok":true,"results":rows}),
+    )
+    .await;
+    let zero_share = server
+        .dispatch(
+            "run",
+            object(json!({
+                "targets":targets,"script":":","request_id":zero_receipt,"detail":"full",
+                "options":{"max_output_bytes":256,"output_view":{"head_lines":1}}
+            })),
+        )
+        .await
+        .unwrap();
+    assert_eq!(zero_share["duplicate"], true);
+    assert_eq!(zero_share["execution_replayed"], false);
+    let results = zero_share["results"].as_array().unwrap();
+    assert_eq!(results.len(), 65);
+    for row in results {
+        assert_eq!(row["stdout"], "abc");
+        assert!(row.get("output_view").is_none());
+        assert!(row.get("output_view_error").is_none());
+        assert_eq!(row["preview_ranges"]["stdout"]["omitted"], json!([3, 4]));
+    }
+
+    // Staged JSON retains its existing read_result(stream=result) contract;
+    // first-view rendering is scoped to saved run stdout and stderr.
+    let body = json!({"ok":true,"data":"β".repeat(10_000)});
+    let staged =
+        jms_bridge::runtime::stage_if_large(&runtime.store, "fixture_stage", body.clone()).unwrap();
+    assert_eq!(staged["staged"], true);
+    let mut offset = 0;
+    let mut text = String::new();
+    loop {
+        let page = server
+            .dispatch(
+                "read_result",
+                object(json!({
+                    "result_id":staged["result_id"],"stream":"result","offset":offset,"limit":4096
+                })),
+            )
+            .await
+            .unwrap();
+        text.push_str(page["text"].as_str().unwrap());
+        if page["eof"] == true {
+            break;
+        }
+        let next = page["next_offset"].as_u64().unwrap();
+        assert!(next > offset);
+        offset = next;
+    }
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), body);
 }
 
 fn object(value: Value) -> Map<String, Value> {
