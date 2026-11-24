@@ -285,7 +285,10 @@ numeric `next_offset` are still returned. A replacement or observed
 truncation returns `reset: true` and no bytes; start a fresh cursor to
 read the new log. If the log does not exist yet or the initial offset
 is beyond the sampled end, `next_cursor` is null; retry the initial
-request after the file is available or grows. The opt-in cursor does
+request after the file is available or grows. If enrollment fails,
+`next_cursor` is null: retry with `cursor="start"` and the returned
+`next_offset`. A failed continuation retains its encoded cursor.
+The opt-in cursor does
 not combine with `tail` or with search cursors.
 
 Search the same log with a literal `pattern` (up to 1024 UTF-8 bytes),
@@ -313,6 +316,17 @@ handles themselves are too large, the same field contains `{"ref":"<id>"}`.
 Pass that object unchanged as `jobs` to continue; the bridge checks each target
 against the current permitted inventory before probing it. Legacy
 `call(operation="jms_job_wait")` with a single ID is unchanged.
+
+For paired-handle `job(action="wait", jobs=..., tail=true)`, optionally add a
+`failure_tail` to verified `failed` status rows. This is skipped by default.
+Only the first four distinct failed pairs are probed, in parallel, within
+the remaining wait deadline and for at most one extra second after status
+collection. Missing, denied, or late tails are omitted without changing
+status, exit code, or pending handles. Each tail reads at most 256 source
+bytes, with byte offsets and up to 768 UTF-8 text bytes after lossy decoding.
+Tails are omitted if they would force otherwise inline status rows to be
+staged. This is a best-effort excerpt, not a complete log or a wait prerequisite.
+
 
 An inline `jobs` or `pending` array marked `remote_job` can be copied to another
 bridge. The receiving bridge must resolve the same asset, use an account that
