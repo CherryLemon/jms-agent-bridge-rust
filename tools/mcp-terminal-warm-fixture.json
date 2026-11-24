@@ -1,0 +1,7 @@
+{
+  "targets": [{"id": "22222222-2222-4222-8222-222222222222", "name": "fixture-b"}],
+  "commands": [
+    {"script": "printf fixture-warm-output", "stdout": "fixture-warm-output", "stderr": "", "exit_code": 0},
+    {"script": "true", "stdout": "", "stderr": "", "exit_code": 0}
+  ]
+}
