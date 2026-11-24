@@ -36,7 +36,7 @@ max_parallel = 2\n",
         .expect("runtime starts without network");
     let server = BridgeServer::new(runtime.clone());
 
-    // Six tools stay advertised, with closed schemas.
+    // Eight tools stay advertised, with closed schemas.
     let tools = server.tool_specs();
     let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     assert_eq!(
@@ -45,6 +45,7 @@ max_parallel = 2\n",
             "run",
             "fs",
             "terminal",
+            "job",
             "read_result",
             "discover",
             "call",
@@ -57,6 +58,93 @@ max_parallel = 2\n",
             Some(&json!(false))
         );
     }
+
+    // Seed a mocked launch under the legacy operation, keeping it in-flight.
+    // Both public entry points must attach to that receipt, not call a launcher.
+    let request_id = "facade-legacy-shared-id";
+    let business = json!({"targets":["a","b","c"],"command":"printf hello"});
+    let seeded_business = business.clone();
+    let journal = runtime.journal.clone();
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let worker_gate = gate.clone();
+    let launched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worker_launched = launched.clone();
+    let worker = tokio::spawn(async move {
+        journal.execute(request_id, "jms_submit_job", &seeded_business, move |_sink| async move {
+            worker_launched.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            worker_gate.notified().await;
+            Ok(json!({"ok":false,"jobs":[
+                {"host":"a","asset_id":"mock-asset-a","job_id":"11111111","launch_state":"acknowledged"},
+                {"host":"b","job_id":"22222222","launch_state":"unknown"},
+                {"host":"c","job_id":"33333333","launch_state":"rejected","stderr":"mock refusal"}
+            ]}))
+        }).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while launched.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let facade = || {
+        server.dispatch(
+            "job",
+            object(json!({
+                "action":"submit", "targets":["a","b","c"], "command":"printf hello",
+                "allow_dangerous":false, "request_id":request_id
+            })),
+        )
+    };
+    let legacy = || {
+        server.dispatch(
+            "call",
+            object(json!({
+                "operation":"jms_submit_job","arguments":business,"request_id":request_id,
+                "detail":"full"
+            })),
+        )
+    };
+    let (new_running, old_running) = tokio::join!(facade(), legacy());
+    for value in [new_running.unwrap(), old_running.unwrap()] {
+        assert_eq!(value["duplicate"], true);
+        assert_eq!(value["request_state"], "running");
+        assert_eq!(value["execution_replayed"], false);
+    }
+    gate.notify_one();
+    worker.await.unwrap().unwrap();
+    let recovered = facade().await.unwrap();
+    assert_eq!(
+        recovered["jobs"],
+        json!([
+            {"target":"mock-asset-a","job_id":"11111111"}, {"target":"b","job_id":"22222222"}
+        ])
+    );
+    assert_eq!(recovered["submissions"][2]["stderr"], "mock refusal");
+    assert_eq!(legacy().await.unwrap()["jobs"][2]["job_id"], "33333333");
+    assert_eq!(launched.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let changed = server
+        .dispatch(
+            "job",
+            object(json!({
+                "action":"submit","targets":["a","b","c"],"command":"printf changed",
+                "request_id":request_id
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(changed.message().contains("arguments cannot change"));
+    assert!(server
+        .dispatch(
+            "job",
+            object(json!({
+                "action":"submit","targets":["a"],"command":"printf hello"
+            }))
+        )
+        .await
+        .unwrap_err()
+        .message()
+        .contains("requires request_id"));
 
     // Guard: an unauthorized destructive script is refused before any connection.
     let error = server

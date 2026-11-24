@@ -1,6 +1,6 @@
 //! Published tool and operation schemas.
 //!
-//! Seven resident tools carry the whole interface. Everything else is an explicit
+//! A small set of resident tools carries the whole interface. Everything else is an explicit
 //! operation whitelisted here and disclosed one schema at a time by `discover`; the
 //! same schema validates `call` arguments *before* any side effect.
 
@@ -199,6 +199,32 @@ reuse handle. Running is not completion; reads honour cursors.",
             read_only: false,
             destructive: true,
             open_world: true,
+        },
+        ToolSpec {
+            name: "job",
+            description: "Submit, wait, logs, status, cancel or list detached jobs. Submit needs request_id; pass its jobs to wait. See discover(operation='job').",
+            input_schema: json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["action"],
+                "properties":{
+                    "action":{"enum":["submit","wait","logs","status","cancel","list"]},
+                    "request_id":request_id_property(),
+                    "targets":array_of_strings("", None),
+                    "target":{"type":"string","minLength":1},
+                    "command":{"type":"string","maxLength":1048576},
+                    "job_id":{"type":"string","pattern":"^[0-9a-f]{8}$"},
+                    "jobs":{"oneOf":[job_pairs_schema(),job_batch_ref_schema()]},
+                    "allow_dangerous":boolean(false, DANGEROUS_FLAG_DESCRIPTION),
+                    "timeout":{"type":"number","minimum":1,"maximum":180,"default":50},
+                    "interval":{"type":"number","minimum":0.1,"maximum":30,"default":2},
+                    "offset":int(0,1099511627776,0),
+                    "max_bytes":int(1024,16384,4096)
+                }
+            }),
+            read_only:false,
+            destructive:true,
+            open_world:true,
         },
         ToolSpec {
             name: "read_result",
@@ -631,6 +657,19 @@ fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
     ]
 }
 
+fn job_pairs_schema() -> Value {
+    json!({"type":"array","minItems":1,"items":{
+        "type":"object","additionalProperties":false,"required":["target","job_id"],
+        "properties":{"target":{"type":"string","minLength":1},
+                      "job_id":{"type":"string","pattern":"^[0-9a-f]{8}$"}}
+    }})
+}
+
+pub(crate) fn job_batch_ref_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["ref"],
+           "properties":{"ref":{"type":"string","pattern":"^[0-9a-f]{32}$"}}})
+}
+
 fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool)> {
     vec![
         (
@@ -934,7 +973,18 @@ pub fn advertised() -> Vec<ToolSpec> {
     full_specs()
         .into_iter()
         .map(|spec| {
-            let schema = public_view(&spec.name, spec.input_schema.clone());
+            let mut schema = public_view(&spec.name, spec.input_schema.clone());
+            // Keep help discoverable without charging the same per-field prose
+            // on every tools/list. Options and policy flags still need inline guidance.
+            if let Some(properties) = schema["properties"].as_object_mut() {
+                for (key, field) in properties {
+                    if !matches!(key.as_str(), "options" | "allow_dangerous") {
+                        if let Some(map) = field.as_object_mut() {
+                            map.remove("description");
+                        }
+                    }
+                }
+            }
             ToolSpec {
                 input_schema: schema,
                 ..spec
@@ -963,6 +1013,20 @@ fn public_view(name: &str, schema: Value) -> Value {
             "options",
         ],
         "terminal" => &["action", "target", "session", "script", "input", "options"],
+        "job" => &[
+            "action",
+            "request_id",
+            "targets",
+            "target",
+            "command",
+            "allow_dangerous",
+            "job_id",
+            "jobs",
+            "timeout",
+            "interval",
+            "offset",
+            "max_bytes",
+        ],
         _ => return schema,
     };
     let mut value = schema;
@@ -971,6 +1035,16 @@ fn public_view(name: &str, schema: Value) -> Value {
     };
     if let Some(properties) = map.get_mut("properties").and_then(Value::as_object_mut) {
         properties.retain(|key, _| keep.contains(&key.as_str()));
+        if name == "job" {
+            properties.insert("request_id".into(), json!({"type":"string"}));
+            properties.insert(
+                "targets".into(),
+                json!({"type":"array","items":{"type":"string"}}),
+            );
+            properties.insert("target".into(), json!({"type":"string"}));
+            properties.insert("command".into(), json!({"type":"string"}));
+            properties.insert("job_id".into(), json!({"type":"string"}));
+        }
     }
     if let Some(required) = map.get_mut("required").and_then(Value::as_array_mut) {
         required.retain(|item| {
@@ -987,18 +1061,11 @@ fn public_view(name: &str, schema: Value) -> Value {
         .and_then(|properties| properties.get_mut("options"))
         .and_then(Value::as_object_mut)
     {
-        let hint = match name {
-            "run" => "script_path, cwd, env, container, image, docker_args, session_id, timeout, max_output_bytes",
-            "fs" => "action-specific fields (offset, limit, start_line, local_path, overwrite, ...)",
-            _ => "target, container, image, docker_args, cwd, env, wait_ms, max_bytes, cursor, result_id, signal, eof",
-        };
         options.clear();
         options.insert("type".into(), Value::from("object"));
         options.insert(
             "description".into(),
-            Value::from(format!(
-                "Advanced fields: {hint}. discover(operation='{name}') lists them."
-            )),
+            Value::from(format!("Advanced fields: discover(operation='{name}').")),
         );
     }
     value
@@ -1008,6 +1075,29 @@ fn public_view(name: &str, schema: Value) -> Value {
 mod tests {
     use super::*;
     use crate::schema::validate;
+
+    #[test]
+    fn job_submit_accepts_existing_explicit_boolean_in_both_schemas() {
+        let public = advertised()
+            .into_iter()
+            .find(|spec| spec.name == "job")
+            .unwrap();
+        let full = full_specs()
+            .into_iter()
+            .find(|spec| spec.name == "job")
+            .unwrap();
+        for schema in [&public.input_schema, &full.input_schema] {
+            for value in [json!(true), json!(false), json!("true")] {
+                let valid = value.is_boolean();
+                let args = json!({
+                    "action": "submit", "request_id": "test-id",
+                    "targets": ["test-machine"], "command": "printf hello",
+                    "allow_dangerous": value,
+                });
+                assert_eq!(validate(schema, &args).is_ok(), valid);
+            }
+        }
+    }
 
     #[test]
     fn terminal_read_accepts_command_id_through_both_entries() {
@@ -1061,6 +1151,11 @@ mod tests {
                 "terminal",
                 json!({"action": "open", "target": "a", "options": {"cwd": "/tmp"}}),
                 json!({"action": "nope"}),
+            ),
+            (
+                "job",
+                json!({"action":"wait","jobs":[{"target":"a","job_id":"abcd1234"}]}),
+                json!({"action":"wait","jobs":[{"target":"a","job_id":"BAD"}]}),
             ),
             (
                 "read_result",

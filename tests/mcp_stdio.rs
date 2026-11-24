@@ -106,6 +106,7 @@ fn stdio_stdout_carries_only_mcp_messages() {
             "run",
             "fs",
             "terminal",
+            "job",
             "read_result",
             "discover",
             "call",
