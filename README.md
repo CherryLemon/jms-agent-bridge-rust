@@ -173,9 +173,17 @@ same request; a hit returns only `{"unchanged":true}`. A miss returns the full
 requested representation with a fresh tag. If the cached body is unavailable,
 omit `if_none_match` to retrieve it. The tag and version add about 180 bytes to
 an uncached response, which can outweigh the payload of a one-line lookup;
-caching is most useful for repeated lists and full schemas. Asset inventory and
-live status keep their normal responses, including refresh errors, without
-operation catalog etags.
+caching is most useful for repeated lists and full schemas.
+
+`topic="assets"` uses a separate `inventory_version` for the authorized
+snapshot and a page-specific `etag`. A matching `if_none_match` returns
+`unchanged: true`, the version and `last_success`. Tags are scoped to the
+issuing bridge and exact query, representation, limit and offset. The bridge
+does not return a hit for snapshots only loaded from disk, stale snapshots,
+or while a refresh is in progress or has failed; it returns the normal full
+page and freshness/error diagnostics instead. This does not force an extra
+REST refresh or change the inventory refresh cadence. Live status remains
+uncached.
 
 Listings are paged (`offset`/`limit`, `next_offset` in the answer) and a `call` or `job`
 response above 8 KiB is saved whole: the reply then carries `staged: true`, a

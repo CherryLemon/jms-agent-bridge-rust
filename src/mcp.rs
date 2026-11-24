@@ -141,7 +141,11 @@ impl BridgeServer {
                 self.runtime.tool_terminal(&action, flat.clone()).await?
             }
             "read_result" => self.runtime.tool_read_result(&flat)?,
-            "discover" => self.runtime.tool_discover(&flat).await?,
+            "discover" => {
+                self.runtime
+                    .tool_discover_with_detail(&flat, &detail)
+                    .await?
+            }
             "call" => self.runtime.tool_call(flat.clone()).await?,
             "meta" => self.runtime.tool_meta(&flat).await?,
             other => return Err(BridgeError::invalid(format!("unknown tool {other:?}"))),

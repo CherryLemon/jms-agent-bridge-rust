@@ -176,3 +176,103 @@ async fn multi_account_assets_stay_unresolved_without_a_preference() {
         "the reason must say how to resolve it: {reason}"
     );
 }
+
+#[tokio::test]
+async fn discover_etag_does_not_hide_failed_refresh_or_revocation() {
+    use jms_bridge::mcp::BridgeServer;
+    use jms_bridge::runtime::BridgeRuntime;
+    use serde_json::Map;
+
+    let state = Arc::new(AtomicUsize::new(200));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = router(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[bastion]\nurl = \"http://{address}\"\nsession_token = \"offline-token\"\n\
+             [bridge]\nstate_dir = {:?}\n",
+            directory.path().join("state").display().to_string()
+        ),
+    )
+    .unwrap();
+    let runtime = BridgeRuntime::start(Some(&config), false).await.unwrap();
+    let server = BridgeServer::new(runtime.clone());
+    let initial = runtime.catalog.refresh().await;
+    assert_eq!(initial["ok"], true, "{initial}");
+    let args = |detail: &str, tag: Option<&str>| -> Map<String, Value> {
+        let mut args = json!({"topic":"assets","query":"asset-a","limit":1,"detail":detail});
+        if let Some(tag) = tag {
+            args["if_none_match"] = json!(tag);
+        }
+        args.as_object().unwrap().clone()
+    };
+
+    // Wait for the initial background refresh, avoiding a race with an in-flight
+    // snapshot which this same contract deliberately marks ineligible for a hit.
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let page = server
+                .dispatch("discover", args("compact", None))
+                .await
+                .unwrap();
+            if page.get("etag").is_some() {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let tag = first["etag"].as_str().unwrap();
+    let version = first["inventory_version"].as_str().unwrap();
+    assert_eq!(first["matched"], 1);
+    let hit = server
+        .dispatch("discover", args("compact", Some(tag)))
+        .await
+        .unwrap();
+    assert_eq!(hit["unchanged"], true);
+    assert_eq!(hit["inventory_version"], version);
+    assert!(hit["last_success"].is_number());
+
+    let full = server
+        .dispatch("discover", args("full", Some(tag)))
+        .await
+        .unwrap();
+    assert_ne!(full["etag"], tag);
+    assert_eq!(full["assets"][0]["name"], "asset-a");
+    assert_eq!(full["inventory_version"], version);
+
+    state.store(500, Ordering::SeqCst);
+    assert_eq!(runtime.catalog.refresh().await["ok"], false);
+    let failed = server
+        .dispatch("discover", args("compact", Some(tag)))
+        .await
+        .unwrap();
+    assert!(failed["inventory_error"]
+        .as_str()
+        .unwrap()
+        .contains("refresh failed"));
+    assert!(failed.get("etag").is_none());
+    assert!(failed.get("unchanged").is_none());
+
+    // The queried page contains only asset A and is unchanged, but revoking B
+    // must invalidate the tag because authorization is scoped to the snapshot.
+    state.store(404, Ordering::SeqCst);
+    assert_eq!(runtime.catalog.refresh().await["ok"], true);
+    let revoked = server
+        .dispatch("discover", args("compact", Some(tag)))
+        .await
+        .unwrap();
+    assert_eq!(revoked["assets"], first["assets"]);
+    assert_ne!(revoked["inventory_version"], version);
+    assert_ne!(revoked["etag"], tag);
+    assert!(revoked.get("unchanged").is_none());
+    runtime.shutdown().await;
+}

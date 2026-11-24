@@ -348,6 +348,14 @@ fn compact_inner(
                 {
                     out.insert("inventory_stale".into(), Value::Bool(true));
                 }
+                if let Some(inventory) = map.get("inventory") {
+                    if let Some(error) = inventory.get("last_error").and_then(Value::as_str) {
+                        out.insert("inventory_error".into(), Value::from(error));
+                    }
+                    if inventory["refresh_in_progress"] == true {
+                        out.insert("inventory_refresh_in_progress".into(), Value::Bool(true));
+                    }
+                }
                 return Value::Object(out);
             }
         }
@@ -627,7 +635,8 @@ mod tests {
             "assets": [{"id": "a", "name": "node-1", "address": "10.0.0.1",
                         "accounts": ["root"], "account": "root", "active": true}],
             "matched": 1, "next_offset": null,
-            "inventory": {"stale": true, "assets": 1},
+            "inventory": {"stale": true, "assets": 1, "last_error": "refresh failed",
+                          "refresh_in_progress": true},
         });
         let view = compact(
             "discover",
@@ -638,6 +647,8 @@ mod tests {
         assert!(view["assets"][0].get("name").is_none());
         assert!(view["assets"][0].get("accounts").is_none());
         assert_eq!(view["inventory_stale"], true);
+        assert_eq!(view["inventory_error"], "refresh failed");
+        assert_eq!(view["inventory_refresh_in_progress"], true);
         assert!(view.get("inventory").is_none());
     }
 

@@ -59,6 +59,7 @@ struct CatalogState {
     snapshot: Snapshot,
     inventory: Inventory,
     error: Option<String>,
+    verified_version: Option<String>,
 }
 
 pub struct AssetCatalog {
@@ -90,6 +91,7 @@ impl AssetCatalog {
             },
             inventory: Inventory::default(),
             error: None,
+            verified_version: None,
         };
         if let Ok(text) = std::fs::read_to_string(&cache) {
             match serde_json::from_str::<Value>(&text) {
@@ -170,9 +172,15 @@ impl AssetCatalog {
 
     pub fn status(&self) -> Value {
         let state = self.state.lock().expect("catalog lock");
+        self.status_for(&state, false)
+    }
+
+    fn status_for(&self, state: &CatalogState, refresh_in_progress: bool) -> Value {
         let refreshed = state.snapshot.refreshed_at;
         let warnings = &state.inventory.metadata_warnings;
-        let stale = refreshed <= 0.0 || now() - refreshed >= self.settings.refresh_interval as f64;
+        let age = now() - refreshed;
+        let stale =
+            refreshed <= 0.0 || !(0.0..self.settings.refresh_interval as f64).contains(&age);
         let mut out = json!({
             "source": "JumpServer REST",
             "refresh_interval_seconds": self.settings.refresh_interval,
@@ -186,7 +194,7 @@ impl AssetCatalog {
             "assets": state.snapshot.assets.len(),
             "ssh_targets": state.inventory.hosts.len(),
             "last_error": state.error.clone().map(Value::from).unwrap_or(Value::Null),
-            "refresh_in_progress": false,
+            "refresh_in_progress": refresh_in_progress,
         });
         if !warnings.is_empty() {
             let map = out.as_object_mut().expect("object");
@@ -274,6 +282,17 @@ impl AssetCatalog {
 
     pub fn search(&self, query: &str, offset: usize, limit: usize) -> Value {
         let state = self.state.lock().expect("catalog lock");
+        self.search_snapshot(&state, query, offset, limit, false)
+    }
+
+    fn search_snapshot(
+        &self,
+        state: &CatalogState,
+        query: &str,
+        offset: usize,
+        limit: usize,
+        refresh_in_progress: bool,
+    ) -> Value {
         let needle = query.to_lowercase();
         let rows: Vec<&Value> = state
             .snapshot
@@ -331,9 +350,51 @@ impl AssetCatalog {
                 Value::Null
             },
         );
-        drop(state);
-        out.insert("inventory".into(), self.status());
+        out.insert(
+            "inventory".into(),
+            self.status_for(state, refresh_in_progress),
+        );
         Value::Object(out)
+    }
+
+    /// Conditional discovery observes the page, version and refresh evidence
+    /// together. A disk-only or failing snapshot retains normal diagnostics,
+    /// but cannot certify the client's cached view.
+    pub(crate) async fn discover(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+        scope: &Value,
+        if_none_match: Option<&str>,
+    ) -> BridgeResult<Value> {
+        self.ensure().await?;
+        // When acquired, hold the lock through projection so a refresh
+        // cannot start after eligibility is checked.
+        let refresh_guard = self.refresh_lock.try_lock().ok();
+        let state = self.state.lock().expect("catalog lock");
+        let mut page = self.search_snapshot(&state, query, offset, limit, refresh_guard.is_none());
+        if refresh_guard.is_none() || state.error.is_some() || page["inventory"]["stale"] != false {
+            return Ok(page);
+        }
+        if let Some(version) = &state.verified_version {
+            let tag = format!(
+                "assetview-v1-{}",
+                hex::encode(Sha256::digest(serde_json::to_vec(&json!([
+                    scope, version
+                ]))?)),
+            );
+            if if_none_match == Some(tag.as_str()) {
+                return Ok(json!({
+                    "unchanged": true,
+                    "inventory_version": version,
+                    "last_success": state.snapshot.refreshed_at,
+                }));
+            }
+            page["inventory_version"] = json!(version);
+            page["etag"] = json!(tag);
+        }
+        Ok(page)
     }
 
     /// Fetch, build, persist, then publish — in that order.
@@ -352,16 +413,21 @@ impl AssetCatalog {
                 identity: self.identity.clone(),
             };
             let inventory = build_inventory(&snapshot, &self.settings, &self.cfg);
+            let version = format!(
+                "inventory-v1-{}",
+                hex::encode(Sha256::digest(serde_json::to_vec(&snapshot.assets)?)),
+            );
             atomic_json(&self.cache, &snapshot.to_json())?;
-            Ok::<_, BridgeError>((snapshot, inventory))
+            Ok::<_, BridgeError>((snapshot, inventory, version))
         }
         .await;
         match result {
-            Ok((snapshot, inventory)) => {
+            Ok((snapshot, inventory, version)) => {
                 let mut state = self.state.lock().expect("catalog lock");
                 state.snapshot = snapshot;
                 state.inventory = inventory;
                 state.error = None;
+                state.verified_version = Some(version);
                 drop(state);
                 let status = self.status();
                 tracing::info!(
@@ -1001,6 +1067,105 @@ mod tests {
             &None,
         );
         assert_eq!(ambiguous["account"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn conditional_pages_require_verified_fresh_snapshot_and_exact_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = BridgeSettings {
+            state_dir: directory.path().to_path_buf(),
+            ..BridgeSettings::default()
+        };
+        let catalog =
+            AssetCatalog::new(Arc::new(BastionConfig::default()), Arc::new(settings)).unwrap();
+        let row = asset("a", "asset-a", "10.0.0.1", vec!["root"], Some("root"));
+        let scope = json!(["bridge-a", "assets", "", null, "full", 0, 1]);
+        {
+            let mut state = catalog.state.lock().unwrap();
+            state.snapshot.refreshed_at = now();
+            state.snapshot.assets = vec![row.clone()];
+        }
+        let disk_only = catalog.discover("", 0, 1, &scope, None).await.unwrap();
+        assert_eq!(disk_only["matched"], 1);
+        assert!(disk_only.get("etag").is_none());
+
+        catalog.state.lock().unwrap().verified_version = Some("revision-a".into());
+        let first = catalog.discover("", 0, 1, &scope, None).await.unwrap();
+        let tag = first["etag"].as_str().unwrap();
+        assert_eq!(first["inventory_version"], "revision-a");
+        let hit = catalog.discover("", 0, 1, &scope, Some(tag)).await.unwrap();
+        assert_eq!(
+            hit,
+            json!({
+                "unchanged": true, "inventory_version": "revision-a",
+                "last_success": first["inventory"]["last_success"],
+            })
+        );
+
+        for (query, offset, limit, other_scope) in [
+            (
+                "",
+                0,
+                1,
+                json!(["bridge-b", "assets", "", null, "full", 0, 1]),
+            ),
+            (
+                "a",
+                0,
+                1,
+                json!(["bridge-a", "assets", "a", null, "full", 0, 1]),
+            ),
+            (
+                "",
+                0,
+                1,
+                json!(["bridge-a", "assets", "", null, "signature", 0, 1]),
+            ),
+            (
+                "",
+                1,
+                1,
+                json!(["bridge-a", "assets", "", null, "full", 1, 1]),
+            ),
+            (
+                "",
+                0,
+                2,
+                json!(["bridge-a", "assets", "", null, "full", 0, 2]),
+            ),
+        ] {
+            let page = catalog
+                .discover(query, offset, limit, &other_scope, Some(tag))
+                .await
+                .unwrap();
+            assert_ne!(page["etag"], tag);
+            assert!(page.get("unchanged").is_none());
+        }
+
+        {
+            let _refreshing = catalog.refresh_lock.lock().await;
+            let page = catalog.discover("", 0, 1, &scope, Some(tag)).await.unwrap();
+            assert_eq!(page["inventory"]["refresh_in_progress"], true);
+            assert!(page.get("etag").is_none());
+        }
+        {
+            let mut state = catalog.state.lock().unwrap();
+            state.error = Some("refresh failed".into());
+        }
+        let failed = catalog.discover("", 0, 1, &scope, Some(tag)).await.unwrap();
+        assert_eq!(failed["inventory"]["last_error"], "refresh failed");
+        assert!(failed.get("etag").is_none());
+
+        {
+            let mut state = catalog.state.lock().unwrap();
+            state.error = None;
+            state.snapshot.assets.clear();
+            state.verified_version = Some("revision-b".into());
+        }
+        let revoked = catalog.discover("", 0, 1, &scope, Some(tag)).await.unwrap();
+        assert_eq!(revoked["matched"], 0);
+        assert_eq!(revoked["inventory_version"], "revision-b");
+        assert_ne!(revoked["etag"], tag);
     }
 
     #[test]
