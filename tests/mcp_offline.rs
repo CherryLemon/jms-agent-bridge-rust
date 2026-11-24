@@ -373,6 +373,7 @@ max_parallel = 2\n",
     run_compact_ranges_reconstruct_fanout(&runtime, &server).await;
     legacy_partial_send_metadata_is_corrected_on_read(&runtime, &server).await;
     terminal_request_identity_is_shared(&runtime, &server).await;
+    numeric_bounds_match_active_dispatchers(&server).await;
     terminal_command_scoped_writes_are_rejected_before_claiming(&runtime, &server).await;
 
     // Failure counters stay visible in the receipts surface.
@@ -1090,6 +1091,82 @@ async fn terminal_command_scoped_writes_are_rejected_before_claiming(
         let error = server.dispatch("call", object(legacy)).await.unwrap_err();
         assert!(matches!(error, jms_bridge::errors::BridgeError::InvalidArguments { .. }), "{error}");
         assert!(!runtime.journal.directory(&id).unwrap().exists());
+    }
+}
+
+// Deliberately use fixed public contract values, not the implementation's constants.
+async fn numeric_bounds_match_active_dispatchers(server: &BridgeServer) {
+    use jms_bridge::errors::BridgeError;
+
+    for (tool, carrier, field, min, max, base, semantic_error) in [
+        (
+            "job", "", "max_bytes", 1024, 16384,
+            json!({"action":"logs","target":"fixture","job_id":"abcd1234","tail":true,"offset":0}),
+            "job logs takes tail or offset, not both",
+        ),
+        (
+            "call", "arguments", "max_bytes", 1024, 16384,
+            json!({"operation":"jms_job_logs","arguments":{"host":"fixture","job_id":"abcd1234","tail":true,"offset":0}}),
+            "job logs takes tail or offset, not both",
+        ),
+        (
+            "terminal", "options", "max_bytes", 1, 16384,
+            json!({"action":"read","session":"no-fixture-session","options":{}}),
+            "unknown terminal session",
+        ),
+        (
+            "call", "arguments", "max_bytes", 1, 16384,
+            json!({"operation":"terminal_read","arguments":{"session":"no-fixture-session"}}),
+            "unknown terminal session",
+        ),
+        (
+            "terminal", "options", "wait_ms", 0, 30000,
+            json!({"action":"read","session":"no-fixture-session","options":{}}),
+            "unknown terminal session",
+        ),
+        (
+            "call", "arguments", "wait_ms", 0, 30000,
+            json!({"operation":"terminal_read","arguments":{"session":"no-fixture-session"}}),
+            "unknown terminal session",
+        ),
+        (
+            "run", "", "max_output_bytes", 256, 16384,
+            json!({"targets":["fixture"]}),
+            "provide exactly one of script or script_path",
+        ),
+        (
+            "run", "options", "max_output_bytes", 256, 16384,
+            json!({"targets":["fixture"],"options":{}}),
+            "provide exactly one of script or script_path",
+        ),
+    ] {
+        let path = if carrier.is_empty() {
+            format!("/{field}")
+        } else {
+            format!("/{carrier}/{field}")
+        };
+        for value in [min - 1, min, max, max + 1] {
+            let mut arguments = base.clone();
+            let scope = if carrier.is_empty() {
+                &mut arguments
+            } else {
+                &mut arguments[carrier]
+            };
+            scope[field] = json!(value);
+            let failure = server.dispatch(tool, object(arguments)).await.unwrap_err();
+            if (min..=max).contains(&value) {
+                // These read-only requests reach the action's semantic checks;
+                // they stop before SSH and never need a real authorized asset.
+                assert_eq!(failure.message(), semantic_error, "{tool} {path}={value}");
+                assert!(!matches!(failure, BridgeError::InvalidArguments { .. }));
+            } else {
+                let BridgeError::InvalidArguments { validation, .. } = failure else {
+                    panic!("expected validation for {tool} {path}={value}, got {failure}");
+                };
+                assert_eq!(validation["path"], path, "{tool} {path}={value}");
+                assert_eq!(validation["expected"], json!({"minimum":min,"maximum":max}));
+            }
+        }
     }
 }
 
