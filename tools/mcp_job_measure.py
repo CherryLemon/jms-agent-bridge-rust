@@ -22,7 +22,7 @@ FIXTURE = Path(__file__).with_name("mcp-job-loopback-fixture.json")
 
 
 @contextmanager
-def connected(binary, root, config, mode):
+def connected(binary, root, config, mode, *, state="state"):
     command = [str(binary), "serve", "--config", str(config), "--no-lock"]
     if mode == "stdio":
         command.append("--stdio")
@@ -32,7 +32,7 @@ def connected(binary, root, config, mode):
             port = check.getsockname()[1]
         command += ["--host", "127.0.0.1", "--port", str(port)]
     env = {"HOME": str(root), "PATH": "/usr/bin:/bin", "JMS_LOG": "warn",
-           "JMS_BRIDGE_STATE_DIR": str(root / "state"),
+           "JMS_BRIDGE_STATE_DIR": str(root / state),
            "JMS_BRIDGE_CREDENTIALS": str(root / "absent.toml")}
     with tempfile.TemporaryFile() as errors, subprocess.Popen(
         command, env=env, bufsize=0, stdin=subprocess.PIPE,
@@ -86,6 +86,9 @@ class Client:
             arguments = {"action": step, **args}
         if request_id is not None:
             arguments["request_id"] = request_id
+        return self.tool(step, tool, **arguments)
+
+    def tool(self, step, tool, **arguments):
         result, sizes = self.rpc("tools/call", {"name": tool, "arguments": arguments})
         if result.get("isError"):
             raise RuntimeError(f"{step} MCP error: {result!r}")
@@ -103,6 +106,11 @@ def workflow(client, fixture):
                for row in submitted["jobs"]]
     if not submitted["ok"] or Counter(row["target"] for row in handles) != Counter(targets.keys()):
         raise RuntimeError(f"unexpected submission: {submitted!r}")
+    return follow_jobs(client, fixture, handles)
+
+
+def follow_jobs(client, fixture, handles, *, require_timeout=True):
+    targets = {row["id"]: row for row in fixture["targets"]}
     first = fixture["first_timeout"]
     followup = fixture["followup_timeout"]
     interval = fixture["interval"]
@@ -136,7 +144,7 @@ def workflow(client, fixture):
             if not result["finished"] or result["pending"]:
                 raise RuntimeError(f"public continuation did not finish: {result!r}")
             terminal.update((row["target"], row) for row in result["status"])
-    if not timed_out:
+    if require_timeout and not timed_out:
         raise RuntimeError("fixture did not exercise continuation after the first wait deadline")
     states = Counter()
     for handle in handles:
