@@ -915,6 +915,38 @@ max_parallel = 2\n",
             Value::Null,
             "Invalid operation arguments at max_bytes; discover this operation for its schema",
         ),
+        (
+            "call",
+            json!({"operation":"jms_fs_typo","arguments":{"target":"offline","action":"download"}}),
+            "/operation",
+            Value::Null,
+            Value::Null,
+            "unknown operation; discover its schema first",
+        ),
+        (
+            "fs",
+            json!({"target":"offline","action":"read_many","path":"/unused","options":{"paths":["/fixture"]}}),
+            "/path",
+            Value::Null,
+            Value::Null,
+            "parameters not applicable to action: path",
+        ),
+        (
+            "fs",
+            json!({"target":"offline","action":"download","path":"/fixture","options":{"local_path":"/output","line_count":2,"limit":4},"request_id":"invalid-fs-action-options"}),
+            "/options/limit",
+            Value::Null,
+            Value::Null,
+            "parameters not applicable to action: limit, line_count",
+        ),
+        (
+            "call",
+            json!({"operation":"jms_fs","arguments":{"target":"offline","action":"download","path":"/fixture","local_path":"/output","line_count":2,"request_id":"invalid-fs-action-options"}}),
+            "/arguments/line_count",
+            Value::Null,
+            Value::Null,
+            "parameters not applicable to action: line_count",
+        ),
     ] {
         let reply: Value = client
             .post(&endpoint)
@@ -960,6 +992,21 @@ max_parallel = 2\n",
         if path == "/arguments/timeout" && arguments["arguments"]["timeout"] == 901 {
             assert_eq!(body["validation"]["message"], "must be <= 120", "{body}");
         }
+    }
+    assert!(runtime.request_status("invalid-fs-action-options").await.is_err());
+    for (name, arguments) in [
+        (
+            "fs",
+            json!({"target":"*","action":"read_many","options":{"paths":["/fixture"]}}),
+        ),
+        (
+            "call",
+            json!({"operation":"jms_fs","arguments":{"target":"*","action":"read_many","paths":["/fixture"]}}),
+        ),
+    ] {
+        // Corrected arguments reach the explicit-target guard without any I/O.
+        let error = server.dispatch(name, object(arguments)).await.unwrap_err();
+        assert_eq!(error.message(), "jms_fs requires one explicit REST target");
     }
     http.abort();
 
