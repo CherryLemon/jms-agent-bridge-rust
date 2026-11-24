@@ -340,3 +340,43 @@ No outcome below is an estimate of production latency or model usage.
 | http | public | 10,610 | 3.622 / 3.667 | 1.175 / 1.467 | 0.985 / 1.111 | 0.728 / 0.811 |
 | stdio | legacy | 10,850 | 9.137 / 10.375 | 1.137 / 1.292 | 0.755 / 0.978 | 0.513 / 0.589 |
 | stdio | public | 10,650 | 9.271 / 10.065 | 0.986 / 1.182 | 0.836 / 0.994 | 0.405 / 0.458 |
+
+### Job result text token count
+
+The Job benchmark can optionally count the exact MCP result text block of
+each successful workload call using `tiktoken==0.12.0` and `o200k_base`.
+Install the optional dependency and populate its encoding cache before an
+offline run. Counting happens after measuring each workflow, without
+re-serializing the result text. This excludes requests, declarations,
+JSON-RPC framing, model message wrappers and provider or cache usage.
+The report leaves `model_tokens` unset (JSON null).
+
+```sh
+for case in one-target above-concurrency growing-log; do
+  python3 tools/mcp_job_measure.py --binary target/release/jms-bridge \
+    --server-git-sha 4b0e956aa9e4d7bb8a1173462744e76cc2587c7e --case "$case" --repeats 3 \
+    --result-tokenizer o200k_base > "$case-tokens.json"
+done
+```
+
+The measurement reused the preceding pinned release and binary SHA-256,
+with identical runtime sources and Cargo files. Python 3.13.5, Paramiko
+3.5.1; vocabulary SHA-256
+`446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d`.
+Each cell totals three completed workflows per façade, with no duplicate
+launches. Response bytes are HTTP bodies or stdio frames including LF.
+
+| Case | Transport | MCP calls, legacy → public | Response bytes, legacy → public | Result text tokens, legacy → public |
+| --- | --- | ---: | ---: | ---: |
+| One target | HTTP | 9 → 9 | 3,552 → 4,868 | 789 → 1,177 (+49.2%) |
+| One target | stdio | 9 → 9 | 3,559 → 4,874 | 783 → 1,165 (+48.8%) |
+| Above concurrency limit | HTTP | 39 → 24 | 15,768 → 16,904 | 3,722 → 4,721 (+26.8%) |
+| Above concurrency limit | stdio | 39 → 24 | 15,805 → 16,928 | 3,708 → 4,681 (+26.2%) |
+| Growing log | HTTP | 18 → 18 | 11,522 → 12,838 | 2,935 → 3,368 (+14.8%) |
+| Growing log | stdio | 18 → 18 | 11,540 → 12,857 | 2,963 → 3,365 (+13.6%) |
+
+The above-concurrency run reduces MCP calls by 38.5% while the returned
+text costs more tokens under the selected encoding. Submit accounts for
+most of the token increase in all six comparisons (e.g. 1,751 → 2,729
+tokens in the HTTP above-concurrency run). These are aggregate results,
+not guarantees about individual runs or the model's billed input.

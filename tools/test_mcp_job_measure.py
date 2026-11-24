@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import Mock, patch
 
-from mcp_job_measure import CASES, follow_growing_log, summarize, workflow
+from mcp_job_measure import CASES, Client, follow_growing_log, summarize, workflow
 
 
 class JobMeasurementTest(unittest.TestCase):
@@ -77,3 +77,18 @@ class JobMeasurementTest(unittest.TestCase):
                 client.job.side_effect = [replies[0], {**replies[1], field: invalid}]
                 with self.assertRaisesRegex(RuntimeError, "unexpected growing log page"):
                     follow_growing_log(client, handle, source)
+
+    def test_tokens_count_only_the_original_result_text_when_asked(self):
+        rpc = Mock()
+        with patch.object(Client, "rpc", return_value=({}, (0, 0))):
+            client = Client(Mock(), legacy=False, count_result_tokens=rpc)
+        client.rpc = Mock()
+        raw = '{ "x": "fixture text" }'
+        client.rpc.return_value = ({"content": [{"type": "text", "text": raw}],
+                                    "isError": False, "meta": "excluded"}, (13, 22))
+        rpc.return_value = 9
+        self.assertEqual(client.tool("logs", "job", action="logs"), {"x": "fixture text"})
+        rpc.assert_not_called()
+        self.assertEqual(client.result_tokens(), {"logs": 9})
+        rpc.assert_called_once_with(raw)
+        self.assertEqual(client.bytes["logs"], {"request_bytes": 13, "response_bytes": 22})

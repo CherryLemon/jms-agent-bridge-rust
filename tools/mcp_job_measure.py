@@ -61,7 +61,9 @@ def connected(binary, root, config, mode, *, state="state"):
 
 
 class Client:
-    def __init__(self, exchange, legacy):
+    def __init__(self, exchange, legacy, *, count_result_tokens=None):
+        self.count_result_tokens = count_result_tokens
+        self.result_texts = []
         self.exchange = exchange
         self.legacy = legacy
         self.counts = Counter()
@@ -102,7 +104,17 @@ class Client:
         self.counts[step] += 1
         stats = self.bytes.setdefault(step, Counter())
         stats.update({"request_bytes": sizes[0], "response_bytes": sizes[1]})
-        return json.loads(result["content"][0]["text"])
+        result_text = result["content"][0]["text"]
+        if self.count_result_tokens is not None:
+            self.result_texts.append((step, result_text))
+        return json.loads(result_text)
+
+    def result_tokens(self):
+        counts = Counter()
+        if self.count_result_tokens is not None:
+            for step, result_text in self.result_texts:
+                counts[step] += self.count_result_tokens(result_text)
+        return counts
 
 
 def workflow(client, fixture):
@@ -211,7 +223,7 @@ def summarize(samples):
     return result
 
 
-def measure(binary, fixture, repeats):
+def measure(binary, fixture, repeats, *, count_result_tokens=None):
     cohorts = {mode: {variant: [] for variant in ("legacy", "public")}
                for mode in ("stdio", "http")}
     for mode, variants in cohorts.items():
@@ -222,7 +234,8 @@ def measure(binary, fixture, repeats):
                     root = Path(directory)
                     with LoopbackJobs(root, fixture).serving() as server:
                         with connected(binary, root, server.config, mode) as exchange:
-                            client = Client(exchange, legacy=variant == "legacy")
+                            client = Client(exchange, legacy=variant == "legacy",
+                                            count_result_tokens=count_result_tokens)
                             start = time.perf_counter_ns()
                             try:
                                 states, timed_out = workflow(client, fixture)
@@ -252,6 +265,7 @@ def measure(binary, fixture, repeats):
                             "elapsed_ms": elapsed, "calls": client.counts, "timed_out": timed_out,
                             "terminal_jobs": states, "backend_requests": server.counts.copy(),
                             "peak_status_handlers": server.peak_status_handlers,
+                            "result_tokens": client.result_tokens(),
                             **{field: {step: size[field] for step, size in client.bytes.items()}
                                for field in ("request_bytes", "response_bytes")},
                         })
@@ -260,6 +274,10 @@ def measure(binary, fixture, repeats):
             variant: {
                 **summarize(samples),
                 "duplicate_launches": 0,  # Invalid workflows are rejected, not summarized.
+                **({"tool_result_tokens_by_operation": dict(sum(
+                    (row["result_tokens"] for row in samples), Counter())),
+                    "tool_result_tokens": sum(sum(row["result_tokens"].values()) for row in samples)}
+                   if count_result_tokens is not None else {}),
                 "observed_peak_backend_status_handlers": max(
                     row["peak_status_handlers"] for row in samples),
             }
@@ -275,6 +293,8 @@ def main():
     parser.add_argument("--server-git-sha", required=True)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--case", choices=CASES, default="mixed-timeout")
+    parser.add_argument("--result-tokenizer", choices=("o200k_base",),
+                        help="optional offline count for MCP tool result text (not provider usage)")
     args = parser.parse_args()
     if args.repeats < 1 or not re.fullmatch(r"[0-9a-fA-F]{40}", args.server_git_sha):
         parser.error("require positive repeats and a full server source SHA")
@@ -282,6 +302,18 @@ def main():
     fixture = json.loads(fixture_bytes)
     from paramiko import __version__ as paramiko_version
 
+    token_counter = None
+    token_scope = None
+    if args.result_tokenizer:
+        from importlib.metadata import version
+
+        import tiktoken
+        tokenizer = tiktoken.get_encoding(args.result_tokenizer)
+        token_counter = lambda text: len(tokenizer.encode_ordinary(text))
+        token_scope = {"library": "tiktoken", "version": version("tiktoken"),
+                       "encoding": args.result_tokenizer,
+                       "input": "one exact MCP text content block per successful workload call",
+                       "excludes": "tool declarations, requests, wrapping messages and provider usage"}
     result = {
         "client": {"python": platform.python_version(), "paramiko": paramiko_version},
         "scope": "real MCP and loopback backend requests; canned job execution",
@@ -295,7 +327,9 @@ def main():
         "targets_per_workflow": len(fixture["targets"]),
         "synthetic_status_delay_ms": fixture.get("status_delay_ms", 0),
         "model_tokens": None,
-        "transports": measure(args.binary.resolve(), fixture, args.repeats),
+        **({"tool_result_token_scope": token_scope} if token_scope is not None else {}),
+        "transports": measure(args.binary.resolve(), fixture, args.repeats,
+                              count_result_tokens=token_counter),
     }
     print(json.dumps(result, indent=2, sort_keys=True))
 
