@@ -249,12 +249,20 @@ impl ChannelWriter {
     }
 
     pub async fn write_eof(&self) {
+        let _ = self.try_write_eof().await;
+    }
+
+    pub(crate) async fn try_write_eof(&self) -> BridgeResult<()> {
+        if self.is_closed() {
+            return Err(BridgeError::ssh("channel is closed"));
+        }
         match &self.inner {
-            WriteChannel::Ssh(inner) => {
-                let _ = inner.eof().await;
-            }
+            WriteChannel::Ssh(inner) => inner
+                .eof()
+                .await
+                .map_err(|error| BridgeError::ssh(format!("channel EOF send failed: {error}"))),
             #[cfg(test)]
-            WriteChannel::Stalled { .. } => panic!("test sink does not support EOF"),
+            WriteChannel::Stalled { .. } => Err(BridgeError::ssh("mock EOF send failed")),
         }
     }
 
