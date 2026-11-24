@@ -559,3 +559,28 @@ and fixture SHA-256
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | HTTP | 3 | 6 | 3 | 3 | 6 | 3 | 0 |
 | stdio | 3 | 6 | 3 | 3 | 6 | 3 | 0 |
+
+### Oversized structured Job log across a local bridge restart
+
+Run `tools/mcp_job_staged_result.py` with the fixed release
+`4b0e956aa9e4d7bb8a1173462744e76cc2587c7e` (same SHA-256 as above).
+The one-target fixture's generated UTF-8 log includes escaped characters and
+four-byte code points. Its SHA-256 is
+`461340309e05987bf55c07a97703dc14b24839c550bb952efe7decdc5992ccc6`.
+The public `job/logs` operation stages **11,376 bytes** of structured JSON
+per run. Read the first `stream="result"` page and restart the bridge with
+the original state directory. Resume with the returned byte offset until EOF;
+the decoded log must match the fixture exactly. A third process with an
+independent state directory rejects the original local result ID. Only the
+initial launch and one log fetch reach the canned SSH emulator.
+
+| Transport | Workflows | Staged results | Local pages | Foreign result ID rejections | Canned launches/log fetches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HTTP | 3 | 3 | 9 | 3 | 3 / 3 |
+| stdio | 3 | 3 | 9 | 3 | 3 / 3 |
+
+The current summary advertises the stream in a note, not a structured
+`next_action`; the test builds the read call from the returned result ID and
+the documented stream. This does not make staged result IDs portable and does
+not test staged write outcomes, the separate job-handle continuation type, or
+any real service. The emulator never executes the received command.
