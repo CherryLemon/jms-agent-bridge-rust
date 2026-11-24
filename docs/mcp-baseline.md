@@ -301,3 +301,42 @@ estimated tokens; those tokens are not model usage.
 Repeated schema discovery is part of the workload, never of startup. These
 rows describe this exact release and fixture; they are not a same-run
 comparison to the historical debug-build numbers at the top of this page.
+
+### Warm terminal channel
+
+Run the separate benchmark for public Terminal versus legacy call on both
+transports. It opens one real loopback SSH channel, acknowledges READY and
+exactly two sequential canned terminal packets, and closes the channel.
+The fixture never starts a shell or executes a command. The first packet
+returns a small stdout payload; the second is silent. Both must produce
+terminal completion, exit zero, and distinct result IDs on the same session.
+The deterministic order is not a controlled test of the effect of output
+on latency. An extra packet or extra channel fails acceptance.
+
+```sh
+python3 tools/mcp_terminal_measure.py --binary target/release/jms-bridge \
+  --server-git-sha "$(git rev-parse HEAD)" --repeats 5 > warm-terminal.json
+```
+
+Five fresh processes per façade and transport, Python 3.13.5 / Paramiko
+3.5.1, server release `4b0e956aa9e4d7bb8a1173462744e76cc2587c7e`
+(SHA-256 `6d53b26e8ecf926d4c3d4458b4a11e5252f19c3a679d2ecfe99f3a0e88ddce7c`; fixture SHA-256
+`18d83199523ceab0736eb7f766d46956b26e1c799cb335f86478513c3bf9293f`). The measured binary is the same release
+used for the preceding startup/log snapshot. This documentation and tooling
+change does not rebuild that binary.
+
+Every workflow completed with four MCP calls (open, output, silent, close),
+one backend SSH channel, two acknowledged command packets on that channel,
+two catalog requests, and no duplicate command. A terminal command packet is
+not a fresh SSH exec-channel request. No startup RPCs, network headers or
+transport teardown time are counted here; stdio includes LF and HTTP counts
+only bodies. Per-step nearest-rank P95 is the maximum of five samples.
+Some local SSH connections logged a reset during teardown after acceptance.
+No outcome below is an estimate of production latency or model usage.
+
+| Transport | Façade | MCP bytes, five workflows | Cold open P50/P95 ms | Warm output P50/P95 ms | Warm silent P50/P95 ms | Close P50/P95 ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| http | legacy | 10,810 | 3.963 / 4.308 | 1.236 / 1.325 | 0.963 / 1.226 | 0.605 / 0.642 |
+| http | public | 10,610 | 3.622 / 3.667 | 1.175 / 1.467 | 0.985 / 1.111 | 0.728 / 0.811 |
+| stdio | legacy | 10,850 | 9.137 / 10.375 | 1.137 / 1.292 | 0.755 / 0.978 | 0.513 / 0.589 |
+| stdio | public | 10,650 | 9.271 / 10.065 | 0.986 / 1.182 | 0.836 / 0.994 | 0.405 / 0.458 |
