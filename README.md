@@ -120,7 +120,7 @@ service).
 | `fs` | Explore or transfer files on one exact asset: `list`, `stat`, `read`, `read_many`, `glob`, `search`, `tree`, `checksum`, `upload`, `download`. |
 | `terminal` | Bound interactive shells: `open`, `exec`, `read`, `write`, `close` — for REPLs and prompts that need stdin. |
 | `job` | Submit, wait, inspect, cancel or list detached jobs; pass submit handles to a batch wait. |
-| `read_result` | Page one saved stream by byte offset, `tail`, or literal `pattern` search. |
+| `read_result` | Page one saved stream by byte offset with optional `head_lines`, by `tail`, or by literal `pattern` search. |
 | `discover` | List operation categories, search hidden operations, and read one operation's full schema. Also lists assets (`topic="assets"`) and live status (`topic="status"`). |
 | `call` | Execute one whitelisted operation by name (jobs, inspection, inventory, sessions, receipts). |
 | `meta` | Service/result/request metadata: summary, timing, transport, policy. |
@@ -169,6 +169,12 @@ operation catalog etags.
 Listings are paged (`offset`/`limit`, `next_offset` in the answer) and a `call` or `job`
 response above 8 KiB is saved whole: the reply then carries `staged: true`, a
 business summary and a `result_id` that `read_result(stream="result")` reads back.
+
+For a saved stream, `read_result(head_lines=N)` stops at the Nth newline or the
+byte limit, whichever comes first (an ordinary UTF-8 page may extend by up to
+three bytes). Use the returned `next_offset` to continue even if the limit was
+reached in the middle of a line. Do not combine `head_lines` with `tail` or
+`pattern`.
 
 ### Execution contract
 

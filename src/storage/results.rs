@@ -684,6 +684,42 @@ impl ResultStore {
         tail: bool,
         pattern: Option<&str>,
     ) -> BridgeResult<Value> {
+        self.read_page(result_id, stream, offset, limit, tail, pattern, None)
+    }
+
+    pub fn read_head(
+        &self,
+        result_id: &str,
+        stream: &str,
+        offset: u64,
+        limit: usize,
+        head_lines: usize,
+    ) -> BridgeResult<Value> {
+        if !(1..=16384).contains(&head_lines) {
+            return Err(BridgeError::invalid("head_lines must be 1..16384"));
+        }
+        self.read_page(
+            result_id,
+            stream,
+            offset,
+            limit,
+            false,
+            None,
+            Some(head_lines),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_page(
+        &self,
+        result_id: &str,
+        stream: &str,
+        offset: u64,
+        limit: usize,
+        tail: bool,
+        pattern: Option<&str>,
+        head_lines: Option<usize>,
+    ) -> BridgeResult<Value> {
         let meta = self.metadata(result_id)?;
         if limit == 0 || limit > 16384 {
             return Err(BridgeError::invalid(
@@ -732,6 +768,18 @@ impl ResultStore {
             count += 1;
         }
         data.truncate(count);
+        // Apply the line cap to source bytes, not to the potentially lossy UTF-8
+        // representation, so next_offset resumes at exactly the omitted byte.
+        if let Some(lines) = head_lines {
+            if let Some((index, _)) = data
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'\n')
+                .nth(lines - 1)
+            {
+                data.truncate(index + 1);
+            }
+        }
         let end = start + data.len() as u64;
         let mut out = Map::new();
         out.insert("result_id".into(), Value::from(result_id));
@@ -1110,6 +1158,27 @@ mod tests {
         assert_eq!(second["text"], "é");
         assert_eq!(second["next_offset"], 3);
         assert_eq!(second["eof"], true);
+    }
+
+    #[test]
+    fn head_lines_use_source_bytes_and_resume_at_the_first_omitted_byte() {
+        let (_tmp, store) = store();
+        let result_id = store.create(Map::new()).unwrap();
+        write_streams(&store, &result_id, b"", b"a\xff\n\xc3\xa9zz");
+        store.finish(&result_id, Map::new()).unwrap();
+
+        let first = store.read_head(&result_id, "stderr", 0, 4096, 1).unwrap();
+        assert_eq!(first["text"], "a�\n");
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["next_offset"], 3);
+        assert_eq!(first["eof"], false);
+        let next = store.read_head(&result_id, "stderr", 3, 1, 2).unwrap();
+        assert_eq!(next["text"], "é");
+        assert_eq!(next["next_offset"], 5);
+        let last = store.read_head(&result_id, "stderr", 5, 4096, 1).unwrap();
+        assert_eq!(last["text"], "zz");
+        assert_eq!(last["next_offset"], 7);
+        assert_eq!(last["eof"], true);
     }
 
     #[test]
