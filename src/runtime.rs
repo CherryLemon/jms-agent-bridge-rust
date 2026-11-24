@@ -434,6 +434,42 @@ require allow_dangerous=true",
                     .ok_or_else(|| BridgeError::invalid("terminal open requires target"))?;
                 let env = string_pairs(arguments.get("env"));
                 let docker_args = string_list(arguments.get("docker_args"));
+                if let Some(request_id) = request_id {
+                    let target = target.to_owned();
+                    let container = arguments.get("container").and_then(Value::as_str).map(str::to_owned);
+                    let image = arguments.get("image").and_then(Value::as_str).map(str::to_owned);
+                    let cwd = arguments.get("cwd").and_then(Value::as_str).map(str::to_owned);
+                    // Object key order is not part of a request's execution identity.
+                    let canonical_env: std::collections::BTreeMap<_, _> = env.iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str()))
+                        .collect();
+                    let work = json!({
+                        "target":target, "container":container, "image":image,
+                        "cwd":cwd, "docker_args":docker_args, "env":canonical_env,
+                    });
+                    let terminals = self.terminals.clone();
+                    let receipt = self
+                        .journal
+                        .execute(&request_id, "terminal_open", &work, move |progress| async move {
+                            use crate::storage::journal::ProgressSink;
+                            // A full UUID distinguishes journal-managed handles from legacy opens.
+                            let session = uuid::Uuid::new_v4().simple().to_string();
+                            progress.record("terminal_sessions", json!({"session":session}))?;
+                            terminals
+                                .open_with_session(
+                                    &target,
+                                    container.as_deref(),
+                                    image.as_deref(),
+                                    &docker_args,
+                                    cwd.as_deref(),
+                                    &env,
+                                    Some(session),
+                                )
+                                .await
+                        })
+                        .await?;
+                    return Ok(self.reconcile_terminal_open(receipt).await);
+                }
                 self.terminals
                     .open(
                         target,
@@ -448,7 +484,8 @@ require allow_dangerous=true",
             "exec" => {
                 if let Some(request_id) = request_id {
                     let terminals = self.terminals.clone();
-                    let work = identity(&arguments);
+                    let mut work = identity(&arguments);
+                    work.remove("action");
                     let session = used_string(&work, "session")?;
                     let script = used_string(&work, "script")?;
                     let allow = work
@@ -1370,7 +1407,7 @@ require allow_dangerous=true",
     // --- request receipts ----------------------------------------------------
 
     pub async fn request_status(&self, request_id: &str) -> BridgeResult<Value> {
-        let mut receipt = self.journal.status(request_id, false)?;
+        let mut receipt = self.reconcile_terminal_open(self.journal.status(request_id, false)?).await;
         if let Some(rows) = receipt
             .get("execution_results")
             .and_then(Value::as_array)
@@ -1411,6 +1448,33 @@ require allow_dangerous=true",
             }
         }
         Ok(receipt)
+    }
+
+    async fn reconcile_terminal_open(&self, mut receipt: Value) -> Value {
+        if receipt["operation"] != "terminal_open" {
+            return receipt;
+        }
+        if receipt["request_state"] == "running" {
+            // The reserved handle is not usable until initial setup succeeds.
+            if let Some(map) = receipt.as_object_mut() {
+                map.remove("terminal_sessions");
+            }
+            receipt["state"] = Value::from("opening");
+            return receipt;
+        }
+        let Some(session) = receipt["terminal_sessions"][0]["session"]
+            .as_str()
+            .map(str::to_owned)
+        else {
+            return receipt;
+        };
+        let state = self.terminals.session_state(&session).await;
+        receipt["session"] = Value::from(session);
+        receipt["state"] = Value::from(state);
+        if matches!(state, "closed" | "lost") {
+            receipt["ok"] = Value::Bool(false);
+        }
+        receipt
     }
 
     /// Current state of one saved result, as reported inside a receipt.
@@ -1509,6 +1573,13 @@ require allow_dangerous=true",
             ] {
                 if let Some(item) = value.get(key) {
                     out.insert(key.to_string(), item.clone());
+                }
+            }
+            if value["operation"] == "terminal_open" {
+                for key in ["session", "state", "terminal_sessions"] {
+                    if let Some(item) = value.get(key) {
+                        out.insert(key.to_string(), item.clone());
+                    }
                 }
             }
             return Ok(Value::Object(out));
