@@ -431,3 +431,58 @@ usage. None of the projection is sent over MCP. The benchmark does not
 change defaults or persisted receipts. Keep #15 open for terminal and
 explicit text formats, actual compact/full consumption, and integrated
 staged and lost-reply evaluation. No conditional output is prototyped.
+
+### Offline: repeated canonical asset UUIDs
+
+This experiment for #14 counts occurrences of known fixture UUIDs in the
+structured result fields `target`, `targets`, `asset_id` and
+`expected_asset_id`. It substitutes short illustrative strings (`fx1`,
+`fx2`, ...) in a local copy and checks that inverse substitution restores
+the entire parsed object. Free-text fields and other IDs are untouched.
+An alias in an existing identity field or a non-bijective mapping fails
+the check. The client uses the original unmodified results to finish the
+workflow. No tools receive aliases and no lookup is added.
+
+```sh
+# Use the pinned release and pre-populated tiktoken 0.12.0 cache.
+for case in one-target growing-log above-concurrency; do
+  python3 tools/mcp_job_asset_tokens.py --binary target/release/jms-bridge \
+    --server-git-sha 4b0e956aa9e4d7bb8a1173462744e76cc2587c7e \
+    --case "$case" --repeats 3 > "$case-asset-tokens.json"
+done
+```
+
+Same release binary and vocabulary hashes as above. Each row totals three
+completed workflows; 36 completed with no duplicate launch. Text bytes are
+decoded UTF-8, not wire bytes. Both columns count the same captured result
+texts with `o200k_base`, before and after substitution. Requests, tool
+declarations, wrapper text, and any amortized handle discovery costs are
+excluded. This is independent of the submit projection above; the two
+savings must not be added.
+
+| Case | Transport / façade | UUID occurrences | Result text bytes | Result text tokens |
+| --- | --- | ---: | ---: | ---: |
+| One target | HTTP / legacy | 3 | 2,391 → 2,292 | 760 → 715 |
+| One target | HTTP / public | 15 | 3,570 → 3,075 | 1,160 → 935 |
+| One target | stdio / legacy | 3 | 2,393 → 2,294 | 782 → 737 |
+| One target | stdio / public | 15 | 3,570 → 3,075 | 1,168 → 943 |
+| Growing log | HTTP / legacy | 3 | 9,109 → 9,010 | 2,974 → 2,929 |
+| Growing log | HTTP / public | 15 | 10,285 → 9,790 | 3,335 → 3,110 |
+| Growing log | stdio / legacy | 3 | 9,108 → 9,009 | 2,936 → 2,891 |
+| Growing log | stdio / public | 15 | 10,288 → 9,793 | 3,319 → 3,094 |
+| Six targets | HTTP / legacy | 18 | 10,527 → 9,933 | 3,707 → 3,437 |
+| Six targets | HTTP / public | 72 | 12,850 → 10,474 | 4,628 → 3,548 |
+| Six targets | stdio / legacy | 18 | 10,528 → 9,934 | 3,716 → 3,446 |
+| Six targets | stdio / public | 72 | 12,852 → 10,476 | 4,658 → 3,578 |
+
+In the public six-target workload the difference is 1,080 result text
+tokens across three workflows (about 23%). The fixture UUIDs are
+zero-heavy and the aliases deliberately short, so this is a workload
+observation, not a production estimate. No model usage was measured.
+
+**Decision: defer exposing handles.** This local reversible transform
+checks text semantics only; it does not check live selection, deployment
+scope, retention across restart, inventory changes, or access revocation.
+Any future pilot must independently measure resolver behavior, selection
+accuracy and added discovery/lookup calls across authorized scopes before
+protocol adoption. #14 remains open.
