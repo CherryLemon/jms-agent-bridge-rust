@@ -75,6 +75,23 @@ max_parallel = 2\n",
         assert!(error.message().contains("tail or offset"), "{error}");
     }
 
+    for (tool, args) in [
+        (
+            "job",
+            json!({"action":"logs","target":"worker","job_id":"abcd1234",
+            "pattern":"[$?]","tail":true}),
+        ),
+        (
+            "call",
+            json!({"operation":"jms_job_logs","arguments":{
+                "host":"worker","job_id":"abcd1234","pattern":"[$?]","tail":true
+            }}),
+        ),
+    ] {
+        let error = server.dispatch(tool, object(args)).await.unwrap_err();
+        assert!(error.message().contains("tail or pattern"), "{error}");
+    }
+
     // Seed a mocked launch under the legacy operation, keeping it in-flight.
     // Both public entry points must attach to that receipt, not call a launcher.
     let request_id = "facade-legacy-shared-id";

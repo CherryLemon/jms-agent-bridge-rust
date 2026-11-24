@@ -1100,7 +1100,32 @@ require allow_dangerous=true",
                         "job logs takes tail or offset, not both",
                     ));
                 }
+                let pattern = arguments.get("pattern").and_then(Value::as_str);
+                let cursor = arguments.get("cursor").and_then(Value::as_str);
+                if tail && pattern.is_some() {
+                    return Err(BridgeError::invalid(
+                        "job logs takes tail or pattern, not both",
+                    ));
+                }
+                if cursor.is_some() && (pattern.is_none() || arguments.contains_key("offset")) {
+                    return Err(BridgeError::invalid(
+                        "job log cursor requires pattern and no offset",
+                    ));
+                }
+                if pattern
+                    .is_some_and(|p| p.is_empty() || p.len() > crate::jobs::JOB_LOG_PATTERN_BYTES)
+                {
+                    return Err(BridgeError::invalid(
+                        "job log search pattern must be 1–1024 UTF-8 bytes",
+                    ));
+                }
                 let host = self.resolve_one(&target).await?;
+                if let Some(pattern) = pattern {
+                    return self
+                        .jobs
+                        .search_logs(&host, &job_id, offset, max_bytes as usize, pattern, cursor)
+                        .await;
+                }
                 self.jobs
                     .logs(&host, &job_id, offset, max_bytes, tail)
                     .await
@@ -1934,6 +1959,9 @@ pub fn stage_if_large(
         "matched",
         "returned",
         "next_offset",
+        "next_cursor",
+        "eof",
+        "reset",
         "finished",
         "status",
     ] {

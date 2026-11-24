@@ -237,6 +237,19 @@ byte of the suffix. To follow later appends, omit `tail` and pass
 including when text decoding replaces a partial UTF-8 sequence.
 
 
+Search the same log with a literal `pattern` (up to 1024 UTF-8 bytes),
+instead of `tail`. Start with `offset` (default 0); repeat the same pattern
+and pass `next_cursor` as `cursor` on later calls. Each call scans at most
+1 MiB of source and returns at most 20 excerpted matches; `max_bytes`
+bounds the match-array JSON separately. Each match has a source `offset`
+and its excerpt starts at `text_offset`. A no-match page can still have
+a continuation. `eof` refers to the sampled file size, so the cursor can
+also be used after later appends to catch a literal crossing the append
+boundary. A changed file identity or observed truncation returns
+`reset: true`; restart without the cursor if you want to scan the
+replacement log. A cursor is scoped to the resolved job and pattern,
+and never grants access.
+
 Pass the returned `jobs` array directly to `wait`. `submissions` carries per-target
 launch evidence, including rejected launches that do not get a wait handle. A
 concurrent duplicate can report `request_state: "running"`; retry or reconcile

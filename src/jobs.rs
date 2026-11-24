@@ -10,6 +10,7 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::errors::{BridgeError, BridgeResult};
 use crate::execution::{ExecOutcome, Runner};
@@ -85,18 +86,39 @@ fn workdir_expr(workdir: Option<&str>) -> Option<String> {
 /// Open once so the watermark and bytes come from the same file even if the
 /// pathname is replaced. Encode bytes so UTF-8 replacement cannot affect the cursor.
 fn job_log_command(log_path: &str, offset: u64, max_bytes: u64, tail: bool) -> String {
+    job_log_command_with_generation(log_path, offset, max_bytes, tail, false)
+}
+
+fn job_log_command_with_generation(
+    log_path: &str,
+    offset: u64,
+    max_bytes: u64,
+    tail: bool,
+    generation: bool,
+) -> String {
     let position = if tail {
         format!("offset=$((size > {max_bytes} ? size - {max_bytes} : 0))")
     } else {
         format!("offset={offset}")
     };
+    let (missing_generation, read_generation) = if generation {
+        (
+            "printf 'generation=missing\\n'",
+            r#"generation=$(stat -Lc %d:%i "/proc/self/fd/3") || exit
+printf 'generation=%s\n' "$generation""#,
+        )
+    } else {
+        ("", "")
+    };
     format!(
         r#"(
 if [ ! -f {log_path} ]; then
+  {missing_generation}
   printf 'size=0\noffset={missing_offset}\n'
   exit 0
 fi
 exec 3< {log_path} || exit
+{read_generation}
 size=$(stat -Lc %s "/proc/self/fd/3") || exit
 {position}
 printf 'size=%s\noffset=%s\n' "$size" "$offset"
@@ -137,6 +159,144 @@ fn parse_job_log(
         return Err(malformed());
     }
     Ok((size, offset, body))
+}
+
+const JOB_LOG_SCAN_BYTES: u64 = 1024 * 1024;
+const JOB_LOG_MATCHES: usize = 20;
+pub(crate) const JOB_LOG_PATTERN_BYTES: usize = 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+struct JobLogCursor<'a> {
+    generation: &'a str,
+    offset: u64,
+    size: u64,
+}
+
+fn job_log_search_scope(host: &Host, job_id: &str, pattern: &str) -> String {
+    let key = json!([
+        host.asset_id.as_ref().unwrap_or(&host.name),
+        host.asset_id.is_none().then_some(&host.address),
+        host.account,
+        host.workdir,
+        job_id,
+        pattern
+    ]);
+    hex::encode(Sha256::digest(key.to_string()))
+}
+
+fn encode_search_cursor(generation: &str, offset: u64, size: u64, scope: &str) -> String {
+    format!("v1:{offset}:{size}:{generation}:{scope}")
+}
+
+fn job_log_generation(generation: &str) -> bool {
+    generation.split_once(':').is_some_and(|(dev, ino)| {
+        !dev.is_empty()
+            && !ino.is_empty()
+            && dev.bytes().all(|b| b.is_ascii_digit())
+            && ino.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+fn decode_search_cursor<'a>(cursor: &'a str, scope: &str) -> BridgeResult<JobLogCursor<'a>> {
+    let invalid =
+        || BridgeError::invalid("job log cursor does not match this target, job or pattern");
+    let (without_scope, cursor_scope) = cursor.rsplit_once(':').ok_or_else(invalid)?;
+    if cursor_scope != scope {
+        return Err(invalid());
+    }
+    let mut parts = without_scope.splitn(4, ':');
+    if parts.next() != Some("v1") {
+        return Err(invalid());
+    }
+    let offset = parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .ok_or_else(invalid)?;
+    let size = parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .ok_or_else(invalid)?;
+    let generation = parts
+        .next()
+        .filter(|s| job_log_generation(s))
+        .ok_or_else(invalid)?;
+    if offset > size || size > i64::MAX as u64 {
+        return Err(invalid());
+    }
+    Ok(JobLogCursor {
+        generation,
+        offset,
+        size,
+    })
+}
+
+fn parse_search_frame(output: &str, offset: u64) -> BridgeResult<(&str, u64, Vec<u8>)> {
+    let invalid = || BridgeError::invalid("invalid job log search frame");
+    let (prefix, body) = output.split_once('\n').ok_or_else(invalid)?;
+    let generation = prefix.strip_prefix("generation=").ok_or_else(invalid)?;
+    if generation != "missing" && !job_log_generation(generation) {
+        return Err(invalid());
+    }
+    let (size, _, bytes) = parse_job_log(body, offset, JOB_LOG_SCAN_BYTES, false)?;
+    Ok((generation, size, bytes))
+}
+
+fn search_page_needs_reset(
+    previous: Option<&JobLogCursor<'_>>,
+    generation: &str,
+    size: u64,
+    offset: u64,
+    read: usize,
+) -> bool {
+    previous.is_some_and(|c| c.generation != generation || c.size > size)
+        || read as u64 != JOB_LOG_SCAN_BYTES.min(size.saturating_sub(offset))
+}
+
+fn find_literals(
+    body: &[u8],
+    needle: &[u8],
+    offset: u64,
+    output_limit: usize,
+) -> (Vec<Value>, u64, bool) {
+    // Matches starting in this deferred suffix did not yet have enough bytes
+    // to be decided. Start there on the next page or after an append.
+    let decided = body.len().saturating_sub(needle.len() - 1);
+    let mut rows = Vec::new();
+    let mut spent = 2; // JSON array brackets
+    let mut matched = 0;
+    let mut failure = vec![0; needle.len()];
+    for i in 1..needle.len() {
+        while matched > 0 && needle[i] != needle[matched] {
+            matched = failure[matched - 1];
+        }
+        matched += usize::from(needle[i] == needle[matched]);
+        failure[i] = matched;
+    }
+    matched = 0;
+    for (i, byte) in body.iter().enumerate() {
+        while matched > 0 && *byte != needle[matched] {
+            matched = failure[matched - 1];
+        }
+        matched += usize::from(*byte == needle[matched]);
+        if matched != needle.len() {
+            continue;
+        }
+        let at = i + 1 - needle.len();
+        let absolute = offset + at as u64;
+        let lo = at.saturating_sub(24);
+        let hi = (at + 72).min(body.len());
+        let row = json!({"offset":absolute, "text_offset":offset + lo as u64,
+            "text":String::from_utf8_lossy(&body[lo..hi])});
+        let cost = row.to_string().len() + usize::from(!rows.is_empty());
+        if rows.len() == JOB_LOG_MATCHES || spent + cost > output_limit {
+            // Re-read the first unreturned match, rather than skipping it.
+            return (rows, absolute, false);
+        }
+        spent += cost;
+        rows.push(row);
+        matched = failure[matched - 1];
+    }
+    (rows, offset + decided as u64, true)
 }
 
 /// The remote bash script that wraps one job.
@@ -677,6 +837,62 @@ else echo 'status=missing'; fi"
         }))
     }
 
+    pub async fn search_logs(
+        &self,
+        host: &Host,
+        job_id: &str,
+        offset: u64,
+        output_limit: usize,
+        pattern: &str,
+        cursor: Option<&str>,
+    ) -> BridgeResult<Value> {
+        if let Some(error) = validate_job_id(job_id) {
+            return Err(BridgeError::invalid(error));
+        }
+        if pattern.is_empty() || pattern.len() > JOB_LOG_PATTERN_BYTES {
+            return Err(BridgeError::invalid(
+                "job log search pattern must be 1–1024 UTF-8 bytes",
+            ));
+        }
+        let scope = job_log_search_scope(host, job_id, pattern);
+        let previous = cursor
+            .map(|c| decode_search_cursor(c, &scope))
+            .transpose()?;
+        let offset = previous.as_ref().map_or(offset, |c| c.offset);
+        let log_path = format!("{}/stdout.log", job_root(host, job_id));
+        let command =
+            job_log_command_with_generation(&log_path, offset, JOB_LOG_SCAN_BYTES, false, true);
+        let outcome = self
+            .runner
+            .exec_on(host, &command, 60.0, false, false, false)
+            .await?;
+        if !outcome.ok() {
+            return Ok(json!({"ok":false,"host":host.name,"job_id":job_id,
+                "matches":[],"next_offset":offset,"next_cursor":cursor,
+                "exit_code":outcome.exit_code,
+                "error":outcome.stderr.trim().chars().take(400).collect::<String>()}));
+        }
+        let (generation, size, body) = parse_search_frame(&outcome.stdout, offset)?;
+        if search_page_needs_reset(previous.as_ref(), generation, size, offset, body.len()) {
+            return Ok(
+                json!({"ok":false,"host":host.name,"job_id":job_id,"size":size,
+                "matches":[],"reset":true,"reason":"log_replaced_or_truncated","next_offset":0}),
+            );
+        }
+        let (matches, next_offset, complete) =
+            find_literals(&body, pattern.as_bytes(), offset, output_limit);
+        let next_cursor = if generation != "missing" && next_offset <= size {
+            Some(encode_search_cursor(generation, next_offset, size, &scope))
+        } else {
+            None
+        };
+        Ok(
+            json!({"ok":true,"host":host.name,"job_id":job_id,"size":size,
+            "matches":matches,"offset":offset,"next_offset":next_offset,"next_cursor":next_cursor,
+            "scan_bytes":body.len(),"eof":complete && offset + body.len() as u64 >= size}),
+        )
+    }
+
     pub async fn cancel(&self, host: &Host, job_id: &str) -> BridgeResult<Value> {
         if let Some(error) = validate_job_id(job_id) {
             return Err(BridgeError::invalid(error));
@@ -785,6 +1001,156 @@ mod tests {
             workdir: workdir.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn search_paginates_without_matches_then_finds_a_boundary_literal_after_append() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("search ' log");
+        let mut body = vec![b'.'; JOB_LOG_SCAN_BYTES as usize - 2];
+        body.extend_from_slice(b"[$");
+        std::fs::write(&path, &body).unwrap();
+        let literal = b"[$?]";
+        let log = shell_quote(path.to_str().unwrap());
+        let read = |offset| {
+            let output = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(job_log_command_with_generation(
+                    &log,
+                    offset,
+                    JOB_LOG_SCAN_BYTES,
+                    false,
+                    true,
+                ))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+
+        let page = read(0);
+        let (generation, size, body) = parse_search_frame(&page, 0).unwrap();
+        assert_eq!(size, JOB_LOG_SCAN_BYTES);
+        let (rows, next, complete) = find_literals(&body, literal, 0, 1024);
+        assert!(complete && rows.is_empty());
+        assert_eq!(next, size - 3);
+        let marker = encode_search_cursor(generation, next, size, "scope");
+        let previous = decode_search_cursor(&marker, "scope").unwrap();
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"?]more")
+            .unwrap();
+        let page = read(next);
+        let (new_generation, new_size, body) = parse_search_frame(&page, next).unwrap();
+        assert!(!search_page_needs_reset(
+            Some(&previous),
+            new_generation,
+            new_size,
+            next,
+            body.len()
+        ));
+        let (rows, next_again, complete) = find_literals(&body, literal, next, 1024);
+        assert!(complete);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["offset"], size - 2);
+        assert_eq!(next_again, new_size - 3);
+
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, &body).unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        let page = read(next);
+        let (new_generation, new_size, body) = parse_search_frame(&page, next).unwrap();
+        assert_ne!(generation, new_generation);
+        assert!(search_page_needs_reset(
+            Some(&previous),
+            new_generation,
+            new_size,
+            next,
+            body.len()
+        ));
+        assert!(search_page_needs_reset(
+            Some(&previous),
+            generation,
+            size - 1,
+            next,
+            2
+        ));
+        assert!(search_page_needs_reset(
+            Some(&previous),
+            generation,
+            size,
+            next,
+            2
+        ));
+    }
+
+    #[test]
+    fn search_finds_a_literal_near_the_end_of_a_full_one_mib_page() {
+        let mut body = vec![b'.'; JOB_LOG_SCAN_BYTES as usize];
+        let needle = b"[$?]";
+        let at = body.len() - needle.len();
+        body[at..].copy_from_slice(needle);
+        let (rows, next, complete) = find_literals(&body, needle, 0, 1024);
+        assert!(complete);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["offset"], at);
+        assert_eq!(next, at as u64 + 1);
+    }
+
+    #[test]
+    fn search_cursor_binds_target_job_and_filter() {
+        let prior = host(None);
+        let token_scope = job_log_search_scope(&prior, "abcd1234", "[$?]");
+        let token = encode_search_cursor("2:987", 32, 33, &token_scope);
+        assert_eq!(
+            decode_search_cursor(&token, &token_scope).unwrap(),
+            JobLogCursor {
+                generation: "2:987",
+                offset: 32,
+                size: 33,
+            }
+        );
+        for different_scope in [
+            job_log_search_scope(
+                &Host {
+                    name: "different".into(),
+                    ..prior.clone()
+                },
+                "abcd1234",
+                "[$?]",
+            ),
+            job_log_search_scope(&prior, "abcd1235", "[$?]"),
+            job_log_search_scope(&prior, "abcd1234", "other"),
+        ] {
+            assert!(decode_search_cursor(&token, &different_scope).is_err());
+        }
+        assert!(decode_search_cursor(
+            &encode_search_cursor("2:987", 34, 33, &token_scope),
+            &token_scope
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn search_next_offset_is_first_unreturned_match_and_counts_source_bytes() {
+        let body = vec![b'a'; 200];
+        let (rows, next, completed) = find_literals(&body, b"aa", 100, 16 * 1024);
+        assert_eq!(rows.len(), JOB_LOG_MATCHES);
+        assert_eq!(next, 100 + JOB_LOG_MATCHES as u64);
+        assert!(!completed);
+        let (next_rows, _, _) = find_literals(&body[(next - 100) as usize..], b"aa", next, 1024);
+        assert_eq!(next_rows[0]["offset"], next);
+        assert!(json!(next_rows).to_string().len() <= 1024);
+        let (_, partial, _) = find_literals(&[0xe2, 0x82], "€".as_bytes(), 800, 1024);
+        assert_eq!(partial, 800);
     }
 
     #[test]
