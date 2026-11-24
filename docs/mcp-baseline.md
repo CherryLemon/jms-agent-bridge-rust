@@ -251,3 +251,53 @@ fixture's 80 ms status-handler delay in the six-target case and any bridge
 submit scheduling. The reported P95 is the maximum of three observations.
 These figures do not estimate live SSH or production latency, HTTP wire
 bytes or model token usage.
+
+### Growing log / offset replay
+
+`--case growing-log` uses one canned job, a small initial log, then a
+deterministic append before the second read. It validates the exact content,
+reported size, job ID and advancing byte offset on every page (including a
+final empty read at EOF). This exercises an increasing watermark and page
+continuation without process creation on the emulator or actual wall-clock log
+writes. It is an offset example, not a generation-cursor or file-rotation test.
+
+Measured on both façades and transports, three fresh runs per arm, server
+`4b0e956aa9e4d7bb8a1173462744e76cc2587c7e`; release SHA-256
+`6d53b26e8ecf926d4c3d4458b4a11e5252f19c3a679d2ecfe99f3a0e88ddce7c`;
+fixture SHA-256
+`96a3ef5bd4a1dc8a87a791238b206711b834a290f9ecb3d1e652a7dfac7319bc`.
+Python 3.13.5 / Paramiko 3.5.1. All arms completed all workflows,
+with no wait timeout or duplicate launch. Per workflow: 6 MCP calls
+(1 submit, 1 wait, 4 log reads), 6 corresponding SSH execs, and 2 synthetic
+REST catalog requests; these counts did not change between façades.
+
+| Transport | Three-task MCP bytes legacy → public | Legacy P50/P95 ms | Public P50/P95 ms |
+| --- | ---: | ---: | ---: |
+| stdio | 15,672 → 16,570 | 14.728 / 16.772 | 14.880 / 15.704 |
+| HTTP | 15,636 → 16,535 | 10.803 / 11.358 | 10.889 / 11.716 |
+
+Bytes and elapsed time exclude initialization, as in the other matched
+job workflow reports. These are protocol observations, not model tokens
+or production latency. A larger response for submit does not imply that
+the logging read itself sends a larger response.
+
+### Startup budget snapshot
+
+The same `4b0e956aa9e4d7bb8a1173462744e76cc2587c7e` release was measured
+with the standard-library harness and fixture SHA-256
+`41a47f923725a2423043886879be8e5197e18ef89486b032a74553ec3412be56`.
+Each transport had one startup (three messages) followed by 30 validated
+iterations (150 calls, 30 expected missing-terminal errors). Both returned
+eight tools in a 6,441-byte JSON `tools/list` reply and an 829-byte
+initialize JSON reply, without transport framing. The existing declaration
+budget test is a separate full-envelope budget of 7,168 bytes and 1,800
+estimated tokens; those tokens are not model usage.
+
+| Transport | Startup request / response bytes | 30-iteration request / response bytes |
+| --- | ---: | ---: |
+| stdio frames | 260 / 7,272 | 20,266 / 83,836 |
+| HTTP bodies | 257 / 7,270 | 20,116 / 83,686 |
+
+Repeated schema discovery is part of the workload, never of startup. These
+rows describe this exact release and fixture; they are not a same-run
+comparison to the historical debug-build numbers at the top of this page.
