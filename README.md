@@ -251,8 +251,14 @@ against the current permitted inventory before probing it. Legacy
 `call(operation="jms_job_wait")` with a single ID is unchanged.
 
 An inline `jobs` or `pending` array marked `remote_job` can be copied to another
-bridge. The receiving bridge still needs access to the same asset and the
-remote job state. For one usable handle the response can include a read-only
+bridge. The receiving bridge must resolve the same asset, use an account that
+can read the same remote job state, and resolve the same job directory. The
+directory is derived from the target working directory, falling back to
+the remote account's `$HOME`. If bridge A uses a different working directory
+or bridge B resolves a different home, B may report `missing` even with the
+same asset and job ID. Verify the directory and account on both bridges
+before interpreting that status; it is not a reason to resubmit.
+For one usable handle the response can include a read-only
 `next_action` invoking `jms_job_status`; it does not re-submit the command.
 Save the inline handles with your task before switching execution machines.
 A staged `ref`, `request_id`, or `result_id` marked `bridge_local` depends on
