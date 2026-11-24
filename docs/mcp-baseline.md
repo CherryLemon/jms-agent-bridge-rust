@@ -486,3 +486,42 @@ scope, retention across restart, inventory changes, or access revocation.
 Any future pilot must independently measure resolver behavior, selection
 accuracy and added discovery/lookup calls across authorized scopes before
 protocol adoption. #14 remains open.
+
+### Portable receipt across local bridge instances
+
+This is the single-job portability check for #9. Instance A makes one
+synthetic submission and receives the real MCP acknowledgement. Then A
+exits; B starts with a separate HOME, state directory and absent
+credentials path. A and B use the same authorized synthetic endpoint,
+but B receives only the inline remote handle and invokes the exact
+read-only `next_action` through the MCP dispatcher. It then retrieves the
+matching log from the portable handle, repeating both reads twice.
+Neither the original command nor a write is sent by B. Trying the
+bridge-local request ID on B returns an error.
+
+Instance C has another synthetic catalog with the same display name and a
+different canonical UUID. Invoking the portable status action there is
+rejected after catalog access and before any SSH action. The local
+fixture opens loopback listeners only. The SSH emulator returns canned
+data; it does not run a shell or interpret user commands.
+
+```sh
+python3 tools/mcp_job_portable_receipt.py --binary target/release/jms-bridge \
+  --server-git-sha 4b0e956aa9e4d7bb8a1173462744e76cc2587c7e --repeats 3
+```
+
+Same release binary as above; fixture
+`0f63ff03bc9f98417b56d6d26c68e53c55c995e1df30b43d20d9636c056170ac`.
+
+| Transport | Complete workflows | Synthetic launches | Status reads | Log reads | Foreign local IDs rejected | Out-of-scope assets rejected | Duplicate launches |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HTTP | 3 | 3 | 6 | 6 | 3 | 3 | 0 |
+| stdio | 3 | 3 | 6 | 6 | 3 | 3 | 0 |
+
+This differs from the lost-reply experiment: B does not reopen the
+original journal and recovery starts from an acknowledged inline receipt.
+The instances are separate processes on one machine, not a distributed
+environment. This run covers a single authorized job and two rejection
+cases. Mixed outcomes, staged results, and the full failure-state
+reconciliation matrix still need their own evidence. No production
+access, server change or deployment.
