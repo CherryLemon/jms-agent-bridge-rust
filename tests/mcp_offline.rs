@@ -372,6 +372,7 @@ max_parallel = 2\n",
     run_saved_view_fanout_and_paging(&runtime, &server).await;
     legacy_partial_send_metadata_is_corrected_on_read(&runtime, &server).await;
     terminal_request_identity_is_shared(&runtime, &server).await;
+    terminal_command_scoped_writes_are_rejected_before_claiming(&runtime, &server).await;
 
     // Failure counters stay visible in the receipts surface.
     let status = runtime.status().await;
@@ -962,6 +963,37 @@ max_parallel = 2\n",
     http.abort();
 
     runtime.shutdown().await;
+}
+
+async fn terminal_command_scoped_writes_are_rejected_before_claiming(
+    runtime: &BridgeRuntime,
+    server: &BridgeServer,
+) {
+    for (kind, value) in [("input", json!("yes")), ("signal", json!("INT")), ("eof", json!(true))] {
+        let id = format!("guarded-write-{kind}");
+        let mut modern = json!({
+            "action":"write", "session":"not-live",
+            "options":{"request_id":id,"expected_result_id":"prior"}
+        });
+        let mut legacy = json!({
+            "operation":"terminal_write",
+            "arguments":{"session":"not-live","request_id":id,"expected_result_id":"prior"}
+        });
+        if kind == "input" {
+            modern[kind] = value.clone();
+        } else {
+            modern["options"][kind] = value.clone();
+        }
+        legacy["arguments"][kind] = value;
+        let error = server
+            .dispatch("terminal", object(modern))
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("command-scoped terminal write is unsupported"));
+        let error = server.dispatch("call", object(legacy)).await.unwrap_err();
+        assert!(matches!(error, jms_bridge::errors::BridgeError::InvalidArguments { .. }), "{error}");
+        assert!(!runtime.journal.directory(&id).unwrap().exists());
+    }
 }
 
 async fn terminal_request_identity_is_shared(runtime: &BridgeRuntime, server: &BridgeServer) {

@@ -506,9 +506,14 @@ require allow_dangerous=true",
             return Err(BridgeError::invalid("result_id is only for terminal read"));
         }
         if action != "close" && arguments.contains_key("expected_result_id") {
-            return Err(BridgeError::invalid(
-                "expected_result_id is only for terminal close",
-            ));
+            // The persistent SSH channel does not bind input to a remote
+            // foreground command. Reject a requested guard before any claim.
+            let message = if action == "write" {
+                "command-scoped terminal write is unsupported: expected_result_id is only for terminal close"
+            } else {
+                "expected_result_id is only for terminal close"
+            };
+            return Err(BridgeError::invalid(message));
         }
         if matches!(action, "open" | "close") && arguments.contains_key("wait_for") {
             return Err(BridgeError::invalid(
