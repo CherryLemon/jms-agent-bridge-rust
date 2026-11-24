@@ -285,7 +285,10 @@ numeric `next_offset` are still returned. A replacement or observed
 truncation returns `reset: true` and no bytes; start a fresh cursor to
 read the new log. If the log does not exist yet or the initial offset
 is beyond the sampled end, `next_cursor` is null; retry the initial
-request after the file is available or grows. The opt-in cursor does
+request after the file is available or grows. If enrollment fails,
+`next_cursor` is null: retry with `cursor="start"` and the returned
+`next_offset`. A failed continuation retains its encoded cursor.
+The opt-in cursor does
 not combine with `tail` or with search cursors.
 
 Search the same log with a literal `pattern` (up to 1024 UTF-8 bytes),

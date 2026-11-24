@@ -278,6 +278,21 @@ fn raw_generation_page(
     Ok((size, body, cursor, false))
 }
 
+fn failed_raw_log(job_id: &str, offset: u64, cursor: Option<&str>, outcome: &ExecOutcome) -> Value {
+    let mut response = json!({
+        "ok": false, "host": outcome.host, "job_id": job_id,
+        "offset": offset, "size": 0, "next_offset": offset, "log": "",
+        "exit_code": outcome.exit_code,
+        "error": outcome.stderr.trim().chars().take(400).collect::<String>(),
+    });
+    if let Some(cursor) = cursor {
+        // "start" enrolls a numeric offset and is not a continuation. A
+        // failed enrollment must be retried with that same offset.
+        response["next_cursor"] = json!((cursor != JOB_LOG_CURSOR_START).then_some(cursor));
+    }
+    response
+}
+
 fn find_literals(
     body: &[u8],
     needle: &[u8],
@@ -856,8 +871,11 @@ else echo 'status=missing'; fi"
             .runner
             .exec_on(host, &command, 60.0, false, false, false)
             .await?;
-        let mut next_cursor = cursor.map(str::to_string);
-        let (size, offset, body) = if let (Some(scope), true) = (scope.as_deref(), outcome.ok()) {
+        if !outcome.ok() {
+            return Ok(failed_raw_log(job_id, offset, cursor, &outcome));
+        }
+        let mut next_cursor = None;
+        let (size, offset, body) = if let Some(scope) = scope.as_deref() {
             let page =
                 raw_generation_page(&outcome.stdout, offset, max_bytes, previous.as_ref(), scope)?;
             next_cursor = page.2;
@@ -868,14 +886,12 @@ else echo 'status=missing'; fi"
                     "error":"log changed since the previous cursor"}));
             }
             (page.0, offset, page.1)
-        } else if outcome.ok() {
-            parse_job_log(&outcome.stdout, offset, max_bytes, tail)?
         } else {
-            (0, offset, Vec::new())
+            parse_job_log(&outcome.stdout, offset, max_bytes, tail)?
         };
         let consumed = body.len() as u64;
         let mut response = json!({
-            "ok": outcome.ok(),
+            "ok": true,
             "host": host.name,
             "job_id": job_id,
             "offset": offset,
@@ -883,9 +899,7 @@ else echo 'status=missing'; fi"
             "next_offset": offset + consumed,
             "log": String::from_utf8_lossy(&body),
             "exit_code": outcome.exit_code,
-            "error": if outcome.ok() { String::new() } else {
-                outcome.stderr.trim().chars().take(400).collect::<String>()
-            },
+            "error": "",
         });
         if cursor.is_some() {
             response["next_cursor"] = json!(next_cursor);
@@ -1065,6 +1079,36 @@ mod tests {
             workdir: workdir.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn raw_log_failure_retries_enrollment_at_the_requested_offset() {
+        let outcome = ExecOutcome {
+            host: "worker".into(),
+            exit_code: 7,
+            stdout: "partial log".into(),
+            stderr: "read failed".into(),
+            timed_out: false,
+            result_id: "test".into(),
+            preview: None,
+            rejection: Map::new(),
+            recovery: Map::new(),
+            meta: Map::new(),
+        };
+        let start = failed_raw_log("abcd1234", 17, Some(JOB_LOG_CURSOR_START), &outcome);
+        assert_eq!(start["ok"], false);
+        assert_eq!(start["log"], "");
+        assert_eq!(start["next_offset"], 17);
+        assert!(start["next_cursor"].is_null());
+
+        let cursor = encode_job_log_cursor("1:2", 17, 20, "scope");
+        let continued = failed_raw_log("abcd1234", 17, Some(&cursor), &outcome);
+        assert_eq!(continued["next_offset"], 17);
+        assert_eq!(continued["next_cursor"], cursor);
+
+        let legacy = failed_raw_log("abcd1234", 17, None, &outcome);
+        assert_eq!(legacy["next_offset"], 17);
+        assert!(legacy.get("next_cursor").is_none());
     }
 
     #[test]
