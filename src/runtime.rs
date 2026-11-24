@@ -301,6 +301,22 @@ impl BridgeRuntime {
 
     pub async fn tool_run(self: &Arc<Self>, arguments: Map<String, Value>) -> BridgeResult<Value> {
         let mut arguments = arguments;
+        // Presentation options never enter the journal or the execution closure.
+        let output_view = arguments.remove("output_view");
+        let preview_budget = arguments
+            .get("max_output_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(4096) as usize;
+        if let Some(pattern) = output_view
+            .as_ref()
+            .and_then(|view| view["pattern"].as_str())
+        {
+            if pattern.is_empty() || pattern.len() > 1024 {
+                return Err(BridgeError::invalid(
+                    "output_view pattern must be 1..1024 UTF-8 bytes",
+                ));
+            }
+        }
         let script = arguments.get("script").and_then(Value::as_str);
         let script_path = arguments.get("script_path").and_then(Value::as_str);
         if script.is_some() == script_path.is_some() {
@@ -335,7 +351,7 @@ impl BridgeRuntime {
 require allow_dangerous=true",
             ));
         }
-        if let Some(request_id) = arguments
+        let mut value = if let Some(request_id) = arguments
             .get("request_id")
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -346,14 +362,77 @@ require allow_dangerous=true",
             let identity = normalize_run_arguments(&arguments);
             let runtime = self.clone();
             let work = arguments.clone();
-            return self
-                .journal
+            self.journal
                 .execute(&request_id, "run", &identity, move |progress| async move {
                     runtime.run_inner(work, Some(progress)).await
                 })
-                .await;
+                .await?
+        } else {
+            self.run_inner(arguments, None).await?
+        };
+        if let Some(view) = output_view.as_ref() {
+            self.project_run_output_view(&mut value, view, preview_budget);
         }
-        self.run_inner(arguments, None).await
+        Ok(value)
+    }
+
+    fn project_run_output_view(&self, value: &mut Value, view: &Value, budget: usize) {
+        let Some(rows) = value.get_mut("results").and_then(Value::as_array_mut) else {
+            return;
+        };
+        // A normal UTF-8 page may consume three extra bytes. Reserve that slack
+        // within each share, also when other rows keep their default previews.
+        let row_budget = (budget / rows.len().max(1)).min(16384);
+        let limit = if view.get("head_lines").is_some() {
+            row_budget.saturating_sub(3)
+        } else {
+            row_budget
+        };
+        if limit == 0 {
+            return;
+        }
+        for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+            let Some(result_id) = row.get("result_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(mut args) = view.as_object().cloned() else {
+                return;
+            };
+            args.insert("result_id".into(), json!(result_id));
+            args.insert(
+                "stream".into(),
+                json!(view["stream"].as_str().unwrap_or("stdout")),
+            );
+            args.insert("limit".into(), json!(limit));
+            match self.tool_read_result(&args) {
+                Ok(mut page) => {
+                    if page["eof"] == false {
+                        if let Some(offset) = page["next_offset"]
+                            .as_u64()
+                            .filter(|&offset| (1..=1_099_511_627_776).contains(&offset))
+                        {
+                            args.insert("offset".into(), json!(offset));
+                            page["next_action"] = json!({"tool":"read_result","arguments":args});
+                        }
+                    }
+                    for key in [
+                        "stdout",
+                        "stderr",
+                        "stdout_truncated",
+                        "stderr_truncated",
+                        "preview_ranges",
+                    ] {
+                        row.remove(key);
+                    }
+                    row.insert("output_view".into(), page);
+                }
+                Err(error) => {
+                    // A missing/expired saved stream must not erase evidence of a
+                    // command's execution or turn a successful run into a retry.
+                    row.insert("output_view_error".into(), json!(error.message()));
+                }
+            }
+        }
     }
 
     // --- fs ------------------------------------------------------------------

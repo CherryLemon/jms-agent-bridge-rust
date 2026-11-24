@@ -223,6 +223,15 @@ byte budget still applies across all targets; a row with no preview bytes
 can still give ranges for its retained output. Older receipts may lack ranges.
 
 
+Use `run(options={"output_view":{"head_lines":5}})` for an initial line page
+from retained stdout, or `{"output_view":{"stream":"stderr","pattern":"ERROR"}}`
+for literal search. The selected stream's page appears as `output_view` in
+each result row in place of the default head/tail previews; use the original
+`result_id` and `read_result` for all other output or follow the page's
+`next_action` when present. A read failure keeps the original preview and
+execution status. Changing or omitting the view on a same-ID retry does not
+change the fingerprint or execute the command again.
+
 For a saved stream, `read_result(head_lines=N)` stops at the Nth newline or the
 byte limit, whichever comes first (an ordinary UTF-8 page may extend by up to
 three bytes). Use the returned `next_offset` to continue even if the limit was

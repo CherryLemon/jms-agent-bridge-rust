@@ -55,6 +55,19 @@ fn array_of_strings(description: &str, maximum: Option<u64>) -> Value {
     value
 }
 
+fn run_output_view_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "description": "Select the first page of one saved stream; does not change the run.",
+        "properties": {
+            "stream": {"type":"string","enum":["stdout","stderr"],"default":"stdout"},
+            "head_lines": {"type":"integer","minimum":1,"maximum":16384},
+            "pattern": {"type":"string","minLength":1,"maxLength":1024}
+        },
+        "oneOf": [{"required":["head_lines"]},{"required":["pattern"]}]
+    })
+}
+
 /// Complete tool definitions: every accepted field, used for validation.
 pub fn full_specs() -> Vec<ToolSpec> {
     vec![
@@ -99,6 +112,7 @@ Full output is saved; read_result fetches it. Advanced fields may also be passed
                             "session_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$"},
                             "timeout": {"type": "number", "minimum": 1, "maximum": 600, "default": 60},
                             "max_output_bytes": integer(256, 16384, 4096, "Preview budget."),
+                            "output_view": run_output_view_schema(),
                             "cwd": string("Remote working directory."),
                             "env": {"type": "object", "additionalProperties": {"type": "string"}},
                         }},
