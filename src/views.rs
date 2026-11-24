@@ -24,7 +24,7 @@ fn get_bool(row: &Map<String, Value>, key: &str) -> bool {
 
 fn execution(row: &Map<String, Value>, addresses: &HashMap<String, String>) -> Map<String, Value> {
     // Keep the stable keys clients use; transport diagnostics stay in metadata.
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 13] = [
         "host",
         "result_id",
         "ok",
@@ -34,6 +34,7 @@ fn execution(row: &Map<String, Value>, addresses: &HashMap<String, String>) -> M
         "stderr",
         "stdout_truncated",
         "stderr_truncated",
+        "preview_ranges",
         "warning",
         "error",
         "message",

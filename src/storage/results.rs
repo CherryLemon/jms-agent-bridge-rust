@@ -167,6 +167,14 @@ fn set_mode(path: &Path, mode: u32) -> BridgeResult<()> {
     Ok(())
 }
 
+fn trim_incomplete_utf8_suffix(data: &mut Vec<u8>) {
+    if let Some(start) = data.iter().rposition(|byte| !(0x80..0xc0).contains(byte)) {
+        if std::str::from_utf8(&data[start..]).is_err_and(|error| error.error_len().is_none()) {
+            data.truncate(start);
+        }
+    }
+}
+
 fn valid_result_id(value: &str) -> bool {
     value.len() == 32
         && value
@@ -637,6 +645,20 @@ impl ResultStore {
 
     /// Read a saved stream with an explicit byte budget; stderr keeps tail errors.
     pub fn preview(&self, result_id: &str, budget: usize) -> BridgeResult<Map<String, Value>> {
+        self.preview_page(result_id, budget, false)
+    }
+
+    /// Like the legacy preview, with exact byte ranges and read-only continuations.
+    pub fn run_preview(&self, result_id: &str, budget: usize) -> BridgeResult<Map<String, Value>> {
+        self.preview_page(result_id, budget, true)
+    }
+
+    fn preview_page(
+        &self,
+        result_id: &str,
+        budget: usize,
+        with_ranges: bool,
+    ) -> BridgeResult<Map<String, Value>> {
         let meta = self.metadata(result_id)?;
         let mut sizes = BTreeMap::new();
         if let Some(Value::Object(map)) = meta.get("bytes") {
@@ -653,24 +675,69 @@ impl ResultStore {
         err_budget = err_size.min(budget.saturating_sub(out_budget) as u64) as usize;
 
         let mut out = Map::new();
+        let mut ranges = Map::new();
         for (stream, limit) in [("stdout", out_budget), ("stderr", err_budget)] {
             let size = sizes.get(stream).copied().unwrap_or(0);
-            if size > 0 && limit > 0 {
+            let mut start = if stream == "stderr" {
+                size.saturating_sub(limit as u64)
+            } else {
+                0
+            };
+            let mut data = vec![0u8; limit];
+            if limit > 0 {
                 let path = self.path(result_id, stream)?;
                 let mut file = File::open(&path)?;
-                if stream == "stderr" {
-                    file.seek(SeekFrom::Start(size.saturating_sub(limit as u64)))?;
-                }
-                let mut data = vec![0u8; limit];
+                file.seek(SeekFrom::Start(start))?;
                 let read = read_full(&mut file, &mut data)?;
+                data.truncate(read);
+            }
+            if with_ranges {
+                // Do not claim a contiguous omitted prefix or suffix if the
+                // snapshot failed to supply the bytes promised by its metadata.
+                if data.len() != limit {
+                    return Err(BridgeError::storage("result stream changed during preview"));
+                }
+                if stream == "stderr" && start > 0 {
+                    let skip = data
+                        .iter()
+                        .take_while(|&&b| (0x80..0xc0).contains(&b))
+                        .count();
+                    data.drain(..skip);
+                    start += skip as u64;
+                } else if stream == "stdout" && size > data.len() as u64 {
+                    trim_incomplete_utf8_suffix(&mut data);
+                }
+            }
+            if !data.is_empty() {
                 out.insert(
-                    stream.to_string(),
-                    Value::from(String::from_utf8_lossy(&data[..read]).to_string()),
+                    stream.into(),
+                    Value::from(String::from_utf8_lossy(&data).into_owned()),
                 );
             }
-            if size > limit as u64 {
+            let preview_len = if with_ranges { data.len() } else { limit };
+            if size > preview_len as u64 {
                 out.insert(format!("{stream}_truncated"), Value::Bool(true));
+                if with_ranges {
+                    let end = start + data.len() as u64;
+                    let (first, last) = if stream == "stderr" {
+                        (0, start)
+                    } else {
+                        (end, size)
+                    };
+                    let mut range = json!({"shown":[start,end],"omitted":[first,last]});
+                    if first <= 1_099_511_627_776 {
+                        range["next_action"] = json!({
+                            "tool":"read_result",
+                            "arguments":{"result_id":result_id,"stream":stream,
+                                         "offset":first,"limit":(last-first).min(16384)}
+                        });
+                    }
+                    ranges.insert(stream.into(), range);
+                }
             }
+        }
+        if !ranges.is_empty() {
+            out.insert("preview_ranges".into(), Value::Object(ranges));
         }
         Ok(out)
     }
@@ -1179,6 +1246,73 @@ mod tests {
         assert_eq!(last["text"], "zz");
         assert_eq!(last["next_offset"], 7);
         assert_eq!(last["eof"], true);
+    }
+
+    #[test]
+    fn run_preview_ranges_restore_both_streams_without_splitting_utf8() {
+        let (_tmp, store) = store();
+        let result_id = store.create(Map::new()).unwrap();
+        write_streams(&store, &result_id, "xéab".as_bytes(), "aéz".as_bytes());
+        store.finish(&result_id, Map::new()).unwrap();
+        let preview = store.run_preview(&result_id, 4).unwrap();
+        assert_eq!(preview["stdout"], "x");
+        assert_eq!(preview["stderr"], "z");
+        assert_eq!(preview["preview_ranges"]["stdout"]["shown"], json!([0, 1]));
+        assert_eq!(
+            preview["preview_ranges"]["stdout"]["omitted"],
+            json!([1, 5])
+        );
+        assert_eq!(preview["preview_ranges"]["stderr"]["shown"], json!([3, 4]));
+        assert_eq!(
+            preview["preview_ranges"]["stderr"]["omitted"],
+            json!([0, 3])
+        );
+        for (stream, missing) in [("stdout", "éab"), ("stderr", "aé")] {
+            let action = &preview["preview_ranges"][stream]["next_action"];
+            let args = &action["arguments"];
+            let spec = crate::schemas::advertised()
+                .into_iter()
+                .find(|spec| spec.name == "read_result")
+                .unwrap();
+            crate::schema::validate(&spec.input_schema, args).unwrap();
+            assert_eq!(action["tool"], spec.name);
+            let recovered = store
+                .read(
+                    args["result_id"].as_str().unwrap(),
+                    args["stream"].as_str().unwrap(),
+                    args["offset"].as_u64().unwrap(),
+                    args["limit"].as_u64().unwrap() as usize,
+                    false,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(recovered["text"], missing);
+        }
+    }
+
+    #[test]
+    fn fanout_without_text_budget_keeps_full_ranges() {
+        let (_tmp, store) = store();
+        let metas: Vec<_> = (0..2)
+            .map(|_| {
+                let result_id = store.create(Map::new()).unwrap();
+                write_streams(&store, &result_id, b"abc", b"");
+                store.finish(&result_id, Map::new()).unwrap()
+            })
+            .collect();
+        let rows = crate::execution::fanout_rows(&store, &metas, 1).unwrap();
+        assert_eq!(rows.len(), 2);
+        for (meta, row) in metas.iter().zip(rows) {
+            assert!(row.get("stdout").is_none());
+            assert_eq!(row["stdout_truncated"], true);
+            assert_eq!(row["preview_ranges"]["stdout"]["shown"], json!([0, 0]));
+            assert_eq!(row["preview_ranges"]["stdout"]["omitted"], json!([0, 3]));
+            assert_eq!(
+                row["preview_ranges"]["stdout"]["next_action"]["arguments"]["result_id"],
+                meta["result_id"]
+            );
+            assert!(row["preview_ranges"].get("stderr").is_none());
+        }
     }
 
     #[test]
