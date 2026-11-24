@@ -370,6 +370,7 @@ max_parallel = 2\n",
     // Both terminal and general metadata reads clarify it without migrating the file.
     run_saved_views_do_not_change_receipt_identity(&runtime, &server).await;
     run_saved_view_fanout_and_paging(&runtime, &server).await;
+    run_compact_ranges_reconstruct_fanout(&runtime, &server).await;
     legacy_partial_send_metadata_is_corrected_on_read(&runtime, &server).await;
     terminal_request_identity_is_shared(&runtime, &server).await;
     terminal_command_scoped_writes_are_rejected_before_claiming(&runtime, &server).await;
@@ -1507,4 +1508,102 @@ async fn run_saved_view_fanout_and_paging(runtime: &BridgeRuntime, server: &Brid
 
 fn object(value: Value) -> Map<String, Value> {
     value.as_object().cloned().expect("object")
+}
+
+// Exercise the emitted range actions through the public dispatcher, not just
+// the store's internal paging functions. All streams are local fixtures.
+async fn run_compact_ranges_reconstruct_fanout(runtime: &BridgeRuntime, server: &BridgeServer) {
+    const BUDGET: u64 = 256;
+    let fixtures = [
+        (
+            "wide",
+            format!("{}界\\\n{}", "a".repeat(31), "尾🌕\n".repeat(23)),
+            format!("{}🌕{}", "警告\n\\\"".repeat(3_001), "z".repeat(30)),
+        ),
+        ("fits", "小\\\n".into(), String::new()),
+        ("empty", String::new(), String::new()),
+        ("stderr-only", String::new(), "錯\\\n".repeat(32)),
+    ];
+    let targets: Vec<_> = fixtures.iter().map(|(host, _, _)| host.to_string()).collect();
+    let mut metas = Vec::new();
+    for (host, stdout, stderr) in &fixtures {
+        let id = runtime.store.create(object(json!({"host":host}))).unwrap();
+        for (stream, contents) in [("stdout", stdout), ("stderr", stderr)] {
+            if !contents.is_empty() {
+                std::fs::write(runtime.store.path(&id, stream).unwrap(), contents).unwrap();
+            }
+        }
+        metas.push(
+            runtime.store.finish(
+                &id,
+                object(json!({"ok":true,"exit_code":0,"execution_state":"completed"})),
+            ).unwrap(),
+        );
+    }
+    let rows = jms_bridge::execution::fanout_rows(&runtime.store, &metas, BUDGET as usize).unwrap();
+    let request = "compact-fanout-utf8-ranges";
+    seed_saved_run(runtime, request, &targets, BUDGET, json!({"ok":true,"results":rows})).await;
+    let compact = server.dispatch("run", object(json!({
+        "targets":targets,"script":":","request_id":request,
+        "options":{"max_output_bytes":BUDGET}
+    }))).await.unwrap();
+    let rows = compact["results"].as_array().unwrap();
+    assert_eq!(rows.len(), fixtures.len());
+    let mut preview_bytes = 0;
+    for (row, (host, stdout, stderr)) in rows.iter().zip(fixtures.iter()) {
+        assert_eq!(row["host"], *host);
+        assert_eq!(row["exit_code"], 0);
+        assert_eq!(row["execution_state"], "completed");
+        for (stream, expected) in [("stdout", stdout), ("stderr", stderr)] {
+            let preview = row[stream].as_str().unwrap_or("");
+            preview_bytes += preview.len();
+            let range = &row["preview_ranges"][stream];
+            if range.is_null() {
+                assert_eq!(preview, expected);
+                continue;
+            }
+            let pair = |key: &str| {
+                let items = range[key].as_array().unwrap();
+                assert_eq!(items.len(), 2);
+                (items[0].as_u64().unwrap(), items[1].as_u64().unwrap())
+            };
+            let (shown_start, shown_end) = pair("shown");
+            let (start, end) = pair("omitted");
+            assert_eq!(preview.len() as u64, shown_end - shown_start);
+            assert!(expected.is_char_boundary(start as usize));
+            assert!(expected.is_char_boundary(end as usize));
+            let action = &range["next_action"];
+            assert_eq!(action["tool"], "read_result");
+            let mut args = object(action["arguments"].clone());
+            assert_eq!(args["result_id"], row["result_id"]);
+            assert_eq!(args["stream"], stream);
+            assert_eq!(args["offset"], start);
+            let mut offset = start;
+            let mut omitted = String::new();
+            while offset < end {
+                let page = server.dispatch("read_result", args.clone()).await.unwrap();
+                assert_eq!(page["offset"], offset);
+                offset = page["next_offset"].as_u64().unwrap();
+                assert!(offset <= end);
+                let chunk = page["text"].as_str().unwrap();
+                assert!(!chunk.is_empty());
+                omitted.push_str(chunk);
+                assert_eq!(offset - start, omitted.len() as u64);
+                if offset < end {
+                    args.insert("offset".into(), json!(offset));
+                    args.insert("limit".into(), json!((end - offset).min(16_384)));
+                }
+            }
+            let reconstructed = if stream == "stdout" {
+                assert_eq!((shown_start, shown_end, end), (0, start, expected.len() as u64));
+                format!("{preview}{omitted}")
+            } else {
+                assert_eq!((start, shown_start, shown_end), (0, end, expected.len() as u64));
+                format!("{omitted}{preview}")
+            };
+            assert_eq!(&reconstructed, expected);
+        }
+    }
+    assert!(preview_bytes > 0);
+    assert!(preview_bytes <= BUDGET as usize);
 }
