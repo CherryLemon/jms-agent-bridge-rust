@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import Mock, patch
 
-from mcp_job_measure import CASES, summarize, workflow
+from mcp_job_measure import CASES, follow_growing_log, summarize, workflow
 
 
 class JobMeasurementTest(unittest.TestCase):
@@ -48,3 +48,32 @@ class JobMeasurementTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unexpectedly needed a continuation"):
             workflow(client, fixture)
         self.assertEqual(follow.call_args.kwargs, {"require_timeout": False})
+
+    def test_growing_log_reconstructs_each_page_and_eof(self):
+        from unittest.mock import call
+
+        source = json.loads(CASES["growing-log"].read_text())["targets"][0]
+        combined = source["log"] + source["append_log"]
+        start = len(source["log"])
+        offsets = [0, start, start + 1024, len(combined)]
+        bodies = [source["log"], combined[start:start+1024],
+                  combined[start+1024:], ""]
+        handle = {"target": source["id"], "job_id": "00123456"}
+        replies = [
+            {"ok": True, "job_id": handle["job_id"], "offset": offset,
+             "next_offset": offset + len(body), "size": start if not offset else len(combined),
+             "log": body}
+            for offset, body in zip(offsets, bodies, strict=True)
+        ]
+        client = Mock()
+        client.job.side_effect = replies
+        follow_growing_log(client, handle, source)
+        self.assertEqual(client.job.call_args_list, [
+            call("logs", **handle, offset=offset, max_bytes=1024) for offset in offsets
+        ])
+        for field, invalid in (("log", "wrong"), ("size", 1), ("next_offset", 2),
+                               ("job_id", "99999999")):
+            with self.subTest(field=field):
+                client.job.side_effect = [replies[0], {**replies[1], field: invalid}]
+                with self.assertRaisesRegex(RuntimeError, "unexpected growing log page"):
+                    follow_growing_log(client, handle, source)

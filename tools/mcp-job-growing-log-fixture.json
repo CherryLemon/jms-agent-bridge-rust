@@ -1,0 +1,17 @@
+{
+  "command": "printf synthetic-workload",
+  "targets": [
+    {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "name": "fixture-b",
+      "pending_seconds": 0,
+      "exit_code": 0,
+      "log": "initial metric=17\n",
+      "append_log": "append row=000 metric=0\nappend row=001 metric=1\nappend row=002 metric=2\nappend row=003 metric=3\nappend row=004 metric=4\nappend row=005 metric=5\nappend row=006 metric=6\nappend row=007 metric=7\nappend row=008 metric=8\nappend row=009 metric=9\nappend row=010 metric=10\nappend row=011 metric=11\nappend row=012 metric=12\nappend row=013 metric=13\nappend row=014 metric=14\nappend row=015 metric=15\nappend row=016 metric=16\nappend row=017 metric=0\nappend row=018 metric=1\nappend row=019 metric=2\nappend row=020 metric=3\nappend row=021 metric=4\nappend row=022 metric=5\nappend row=023 metric=6\nappend row=024 metric=7\nappend row=025 metric=8\nappend row=026 metric=9\nappend row=027 metric=10\nappend row=028 metric=11\nappend row=029 metric=12\nappend row=030 metric=13\nappend row=031 metric=14\nappend row=032 metric=15\nappend row=033 metric=16\nappend row=034 metric=0\nappend row=035 metric=1\nappend row=036 metric=2\nappend row=037 metric=3\nappend row=038 metric=4\nappend row=039 metric=5\nappend row=040 metric=6\nappend row=041 metric=7\nappend row=042 metric=8\nappend row=043 metric=9\nappend row=044 metric=10\nappend row=045 metric=11\nappend row=046 metric=12\nappend row=047 metric=13\nappend row=048 metric=14\nappend row=049 metric=15\nappend row=050 metric=16\nappend row=051 metric=0\nappend row=052 metric=1\nappend row=053 metric=2\nappend row=054 metric=3\nappend row=055 metric=4\nappend row=056 metric=5\nappend row=057 metric=6\nappend row=058 metric=7\nappend row=059 metric=8\nappend row=060 metric=9\nappend row=061 metric=10\nappend row=062 metric=11\nappend row=063 metric=12\nappend row=064 metric=13\nappend row=065 metric=14\nappend row=066 metric=15\nappend row=067 metric=16\nappend row=068 metric=0\nappend row=069 metric=1\nappend row=070 metric=2\nappend row=071 metric=3\nappend row=072 metric=4\n"
+    }
+  ],
+  "first_timeout": 3,
+  "followup_timeout": 4,
+  "interval": 0.5,
+  "require_timeout": false
+}

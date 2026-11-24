@@ -222,10 +222,19 @@ class LoopbackJobs:
                 exit_code = row["exit_code"]
                 state = "failed" if exit_code else "done"
                 return f"status={state}\nalive=no\nexit_code={exit_code}\nlog_bytes={len(log)}\n".encode()
-            if b"base64 -w0" in packet and b"offset=0" in packet:
+            if b"base64 -w0" in packet:
+                pos = re.search(rb"(?m)^offset=([0-9]+)$", packet)
+                limit = re.search(rb"count=\$\(\(([0-9]+) < remaining", packet)
+                if pos is None or limit is None:
+                    raise ValueError("expected a numeric fixture log offset and limit")
+                offset, count = int(pos.group(1)), int(limit.group(1))
+                previous = self.per_asset["ssh_logs"][asset]
+                if previous and "append_log" in row:
+                    log += row["append_log"].encode()
                 self.counts["ssh_logs"] += 1
                 self.per_asset["ssh_logs"][asset] += 1
-                return f"size={len(log)}\noffset=0\n".encode() + base64.b64encode(log)
+                return f"size={len(log)}\noffset={offset}\n".encode() + base64.b64encode(
+                    log[offset:offset + count])
             raise ValueError("unrecognized fixture operation")
 
     @contextmanager

@@ -24,6 +24,7 @@ CASES = {
     "mixed-timeout": FIXTURE,
     "one-target": Path(__file__).with_name("mcp-job-one-target-fixture.json"),
     "above-concurrency": Path(__file__).with_name("mcp-job-above-concurrency-fixture.json"),
+    "growing-log": Path(__file__).with_name("mcp-job-growing-log-fixture.json"),
 }
 
 
@@ -165,11 +166,38 @@ def follow_jobs(client, fixture, handles, *, require_timeout=True):
         if (not row["ok"] or row["job_id"] != handle["job_id"] or row["status"] != expected
                 or int(row["exit_code"]) != source["exit_code"]):
             raise RuntimeError(f"unexpected terminal receipt: {row!r}")
-        page = client.job("logs", **handle, offset=0, max_bytes=1024)
-        if not page["ok"] or page["log"] != source["log"]:
-            raise RuntimeError(f"unexpected log page: {page!r}")
+        if "append_log" in source:
+            follow_growing_log(client, handle, source)
+        else:
+            page = client.job("logs", **handle, offset=0, max_bytes=1024)
+            if not page["ok"] or page["log"] != source["log"]:
+                raise RuntimeError(f"unexpected log page: {page!r}")
         states[expected] += 1
     return states, timed_out
+
+
+LOG_PAGE_BYTES = 1024
+
+
+def follow_growing_log(client, handle, source):
+    initial = source["log"].encode("ascii")
+    appended = source["append_log"].encode("ascii")
+    if not (0 < len(initial) <= LOG_PAGE_BYTES < len(appended)):
+        raise ValueError("growing fixture must exercise more than one append page")
+    total = initial + appended
+    expected_pages = [(len(initial), initial)] + [
+        (len(total), appended[i:i + LOG_PAGE_BYTES])
+        for i in range(0, len(appended), LOG_PAGE_BYTES)
+    ] + [(len(total), b"")]
+    offset = 0
+    for expected_size, body in expected_pages:
+        page = client.job("logs", **handle, offset=offset, max_bytes=LOG_PAGE_BYTES)
+        if (not page["ok"] or page["job_id"] != handle["job_id"]
+                or page["offset"] != offset or page["size"] != expected_size
+                or page["next_offset"] != offset + len(body)
+                or page["log"].encode("ascii") != body):
+            raise RuntimeError(f"unexpected growing log page at {offset}: {page!r}")
+        offset = page["next_offset"]
 
 
 def summarize(samples):
@@ -204,13 +232,19 @@ def measure(binary, fixture, repeats):
                         if server.errors:
                             raise RuntimeError(f"loopback SSH fixture errors: {server.errors!r}")
                         expected_jobs = len(fixture["targets"])
+                        expected_log_counts = Counter({
+                            row["id"]: 2 + math.ceil(len(row["append_log"].encode("ascii")) / LOG_PAGE_BYTES)
+                            if "append_log" in row else 1
+                            for row in fixture["targets"]
+                        })
                         if (server.counts["ssh_launch"] != expected_jobs
-                                or server.counts["ssh_logs"] != expected_jobs
+                                or server.counts["ssh_logs"] != sum(expected_log_counts.values())
                                 or server.counts["ssh_status"] < expected_jobs):
                             raise RuntimeError(f"unexpected backend request counts: {server.counts!r}")
                         expected_counts = Counter({row["id"]: 1 for row in fixture["targets"]})
-                        for operation in ("ssh_launch", "ssh_logs"):
-                            if server.per_asset[operation] != expected_counts:
+                        for operation, expected in (("ssh_launch", expected_counts),
+                                                    ("ssh_logs", expected_log_counts)):
+                            if server.per_asset[operation] != expected:
                                 raise RuntimeError(f"unexpected per-asset {operation}: {server.per_asset[operation]!r}")
                         if server.per_asset["ssh_status"].keys() != expected_counts.keys():
                             raise RuntimeError("status probes did not cover exactly the expected targets")
