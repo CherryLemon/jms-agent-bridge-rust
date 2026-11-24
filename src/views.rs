@@ -179,11 +179,13 @@ pub fn compact(
 }
 
 /// Staging fields worth keeping, in the order they are attached.
-const STAGING_KEYS: [&str; 6] = [
+const STAGING_KEYS: [&str; 8] = [
     "staged",
     "operation",
     "bytes",
     "result_id",
+    "result_id_scope",
+    "next_action",
     "preview",
     "note",
 ];
@@ -511,6 +513,10 @@ mod tests {
             "operation": "jms_fs",
             "bytes": 40000,
             "result_id": "abc",
+            "result_id_scope": "bridge_local",
+            "next_action": {"tool":"read_result","arguments":{
+                "result_id":"abc","stream":"result","offset":0,"limit":4096
+            }},
             "preview": "{\"ok\":true",
             "note": "response exceeded 8192 bytes; full payload saved as abc (read_result with stream='result')",
         });
@@ -522,6 +528,8 @@ mod tests {
         );
         assert_eq!(out["staged"], true);
         assert_eq!(out["result_id"], "abc");
+        assert_eq!(out["result_id_scope"], "bridge_local");
+        assert_eq!(out["next_action"], value["next_action"]);
         assert!(out["note"].as_str().unwrap().contains("read_result"));
         assert_eq!(out["bytes"], 40000);
     }
