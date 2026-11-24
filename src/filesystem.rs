@@ -164,14 +164,22 @@ pub fn validate(arguments: &Map<String, Value>) -> BridgeResult<()> {
     if !unused.is_empty() {
         let mut unused = unused;
         unused.sort();
-        return Err(BridgeError::invalid(format!(
-            "parameters not applicable to action: {}",
-            unused.join(", ")
-        )));
+        let field = &unused[0];
+        return Err(BridgeError::invalid_arguments(
+            format!("parameters not applicable to action: {}", unused.join(", ")),
+            serde_json::json!({
+                "path": crate::schema::pointer_token(field),
+                "message": format!("{field} is not applicable to fs action {action}"),
+            }),
+        ));
     }
     if action == "read_many" && arguments.contains_key("path") {
-        return Err(BridgeError::invalid(
+        return Err(BridgeError::invalid_arguments(
             "parameters not applicable to action: path",
+            serde_json::json!({
+                "path": "/path",
+                "message": "path is not applicable to fs action read_many; use paths",
+            }),
         ));
     }
     Ok(())

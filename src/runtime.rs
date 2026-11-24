@@ -1050,7 +1050,10 @@ require allow_dangerous=true",
             .map(str::to_string);
         let schema = schemas::operations()
             .get(&operation)
-            .ok_or_else(|| BridgeError::invalid("unknown operation; discover its schema first"))?;
+            .ok_or_else(|| BridgeError::invalid_arguments(
+                "unknown operation; discover its schema first",
+                json!({"path":"/operation", "message":"unknown operation; use discover to find an operation name"}),
+            ))?;
         let input = schema
             .get("inputSchema")
             .ok_or_else(|| BridgeError::storage("operation schema is missing inputSchema"))?;
