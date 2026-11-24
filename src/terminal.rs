@@ -639,6 +639,31 @@ struct Binding {
 }
 
 impl Binding {
+    /// The caller holds the binding lock also used by exec admission. Keep the
+    /// match and the liveness fence inside that same critical section.
+    async fn begin_close(
+        &mut self,
+        expected_result_id: Option<&str>,
+    ) -> BridgeResult<Option<Arc<AsyncMutex<Command>>>> {
+        if let Some(expected) = expected_result_id {
+            let current_matches = if self.closed {
+                false
+            } else if let Some(current) = &self.command {
+                current.lock().await.result_id == expected
+            } else {
+                false
+            };
+            if !current_matches {
+                return Err(BridgeError::invalid(
+                    "terminal close expected_result_id does not match the live current command",
+                ));
+            }
+        }
+        self.closed = true;
+        self.shell.mark_lost();
+        Ok(self.command.clone())
+    }
+
     async fn check_exec_admission(&self) -> BridgeResult<()> {
         let busy = match &self.command {
             Some(current) => current.lock().await.is_busy(),
@@ -1460,12 +1485,23 @@ impl Interactive {
     }
 
     pub async fn close(&self, session: &str) -> BridgeResult<Value> {
-        if self
-            .lost
-            .lock()
-            .expect("lost lock")
-            .remove(session)
-            .is_some()
+        self.close_with_expected_result(session, None).await
+    }
+
+    pub(crate) async fn close_with_expected_result(
+        &self,
+        session: &str,
+        expected_result_id: Option<&str>,
+    ) -> BridgeResult<Value> {
+        // History is not the live binding. A guarded close must not clear a
+        // recovered/lost session entry just because its old result once matched.
+        if expected_result_id.is_none()
+            && self
+                .lost
+                .lock()
+                .expect("lost lock")
+                .remove(session)
+                .is_some()
         {
             self.save().await?;
             return Ok(json!({"ok": true, "session": session, "state": "closed"}));
@@ -1473,9 +1509,8 @@ impl Interactive {
         let binding = self.binding(session).await?;
         let (shell, command) = {
             let mut guard = binding.lock().await;
-            guard.closed = true;
-            guard.shell.mark_lost();
-            (guard.shell.clone(), guard.command.clone())
+            let command = guard.begin_close(expected_result_id).await?;
+            (guard.shell.clone(), command)
         };
         let verdict = if let Some(command) = command {
             let mut guard = command.lock().await;
@@ -1507,7 +1542,11 @@ impl Interactive {
         verdict?;
         self.bindings.lock().await.remove(session);
         self.save().await?;
-        Ok(json!({"ok": true, "session": session, "state": "closed"}))
+        let mut response = json!({"ok": true, "session": session, "state": "closed"});
+        if let Some(result_id) = expected_result_id {
+            response["result_id"] = json!(result_id);
+        }
+        Ok(response)
     }
 
     /// Close every shell before shutdown, leaving recovery records behind.
@@ -2340,6 +2379,71 @@ mod tests {
             assert_eq!(live[key], archived[key], "{key}");
             assert_eq!(archived[key], replay[key], "{key}");
         }
+    }
+
+    #[tokio::test]
+    async fn stale_guarded_close_cannot_close_a_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (interactive, _, mut frames) = terminal_with_stalled_writer(dir.path(), 1).await;
+        let store = &interactive.store;
+        let a = test_command(store, "terminal", "s", b"A");
+        let b = test_command(store, "terminal", "s", b"B");
+        let binding = interactive.binding("s").await.unwrap();
+        let mut lock = binding.lock().await;
+        let mut original = Command::new(a.clone());
+        original.state = CmdState::Completed;
+        original.exit_code = Some(0);
+        original.persist_verdict(store, None).unwrap();
+        lock.command = Some(Arc::new(AsyncMutex::new(original)));
+        let mut stale = Box::pin(interactive.close_with_expected_result("s", Some(&a)));
+        assert!(futures::poll!(stale.as_mut()).is_pending());
+        let successor = Arc::new(AsyncMutex::new(Command::new(b.clone())));
+        lock.command = Some(successor.clone());
+        drop(lock);
+        let error = stale.await.unwrap_err();
+        assert!(error.message().contains("does not match"));
+        assert!(!binding.lock().await.shell.is_closing());
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(successor.lock().await.state, CmdState::Queued);
+        assert_eq!(store.metadata(&a).unwrap()["execution_state"], "completed");
+
+        let closed = interactive
+            .close_with_expected_result("s", Some(&b))
+            .await
+            .unwrap();
+        assert_eq!(closed["result_id"], b);
+        assert_eq!(closed["state"], "closed");
+        assert_eq!(frames.try_recv().unwrap(), None);
+        let page = interactive
+            .read_result("s", &b, 0, 4096, None)
+            .await
+            .unwrap();
+        assert_eq!(page["state"], "not_started");
+        assert_eq!(page["executed"], false);
+    }
+
+    #[tokio::test]
+    async fn guarded_close_does_not_close_an_idle_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let (interactive, _, mut frames) = terminal_with_stalled_writer(dir.path(), 1).await;
+        let e = interactive
+            .close_with_expected_result("s", Some("stale"))
+            .await
+            .unwrap_err();
+        assert!(e.message().contains("does not match"));
+        let binding = interactive.binding("s").await.unwrap();
+        assert!(!binding.lock().await.shell.is_closing());
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let closed = interactive.close("s").await.unwrap();
+        assert_eq!(closed["state"], "closed");
+        assert!(closed.get("result_id").is_none());
+        assert_eq!(frames.try_recv().unwrap(), None);
     }
 
     #[tokio::test]

@@ -190,6 +190,7 @@ reuse handle. Running is not completion; reads honour cursors.",
                                                       "stderr": {"type": "integer", "minimum": 0}},
                                        "description": "Re-read from absolute byte offsets."},
                             "result_id": string("read: bind to this command."),
+                            "expected_result_id": terminal_close_expectation(),
                             "signal": {"type": "string", "enum": ["INT", "TERM"]},
                             "eof": boolean(false, "write: close stdin."),
                             "allow_dangerous": boolean(false, DANGEROUS_FLAG_DESCRIPTION),
@@ -597,6 +598,11 @@ fn terminal_wait_policy() -> Value {
            "description": "Return on output or completion (default), or wait only for terminal state."})
 }
 
+fn terminal_close_expectation() -> Value {
+    json!({"type": "string", "minLength": 1,
+           "description": "close: require this result ID to be the live current command."})
+}
+
 fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
     let pages = || {
         json!({
@@ -659,8 +665,8 @@ fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
         ),
         (
             "terminal_close",
-            "Close this shell, possibly interrupting its command. Saved outputs remain.",
-            json!({"session": {"type": "string"}}),
+            "Close this shell, optionally requiring the expected current command. Saved outputs remain.",
+            json!({"session": {"type": "string"}, "expected_result_id": terminal_close_expectation()}),
             json!(["session"]),
         ),
     ]
@@ -1108,6 +1114,34 @@ mod tests {
                 assert_eq!(validate(schema, &args).is_ok(), valid);
             }
         }
+    }
+
+    #[test]
+    fn both_close_schemas_accept_an_optional_nonempty_expected_result_id() {
+        let terminal = full_specs()
+            .into_iter()
+            .find(|tool| tool.name == "terminal")
+            .unwrap();
+        let legacy = operations();
+        let close = &legacy["terminal_close"]["inputSchema"];
+        validate(
+            &terminal.input_schema,
+            &json!({"action":"close","session":"s","options":{"expected_result_id":"r"}}),
+        )
+        .unwrap();
+        validate(close, &json!({"session":"s","expected_result_id":"r"})).unwrap();
+        validate(close, &json!({"session":"s"})).unwrap();
+        assert!(validate(close, &json!({"session":"s","expected_result_id":""})).is_err());
+        assert!(validate(
+            &terminal.input_schema,
+            &json!({"action":"close","session":"s","options":{"expected_result_id":""}})
+        )
+        .is_err());
+        assert!(validate(
+            &legacy["terminal_write"]["inputSchema"],
+            &json!({"session":"s","expected_result_id":"r","input":"yes"})
+        )
+        .is_err());
     }
 
     #[test]

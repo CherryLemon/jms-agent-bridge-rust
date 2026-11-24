@@ -149,6 +149,16 @@ within the observation budget; `wait_ms=0` reads immediately and the maximum is
 still includes the observed state, result ID and cursor; if it has `more`,
 continue reading that same command with its `result_id` and cursor. Changing
 wait or paging options does not change a journaled request's execution identity.
+
+For a delayed close, use
+`terminal(action="close", session=..., options={"expected_result_id":"..."})`
+(or legacy `terminal_close` with `expected_result_id` directly). If that result
+is still the current command, the close response includes its ID. If the
+session has a different command, no live command, or was already closed, the
+guarded request does not close or remove it. Omitting `expected_result_id`
+retains whole-session close. The guard is available only for close; stdin,
+signals and EOF are unchanged.
+
 If sending a command fails or times out, that shell is marked lost and cannot
 accept another command. Keep the result ID to reconcile the uncertain outcome;
 open a new terminal explicitly rather than replaying the command automatically.
