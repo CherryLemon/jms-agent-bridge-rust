@@ -15,6 +15,8 @@ import subprocess
 import tempfile
 import time
 
+from mcp_job_workflow import mock_workflow_report
+
 
 PROTOCOL = "2025-06-18"
 TIMEOUT = 5
@@ -285,7 +287,7 @@ def main():
         for chunk in iter(lambda: binary.read(1024 * 1024), b""):
             binary_sha256.update(chunk)
     data = {
-        "report_version": 3,
+        "report_version": 4,
         "server_git_sha": options.server_git_sha.lower(),
         "binary_sha256": binary_sha256.hexdigest(),
         "fixture": FIXTURE.name,
@@ -293,6 +295,7 @@ def main():
         "repeats": options.repeats,
         "model_tokens": None,
         "ssh_probes": None,
+        "mock_job_workflow": mock_workflow_report(options.repeats),
         "byte_scope": {"stdio": "UTF-8 JSON + LF", "http": "HTTP bodies only"},
         "transports": {},
     }

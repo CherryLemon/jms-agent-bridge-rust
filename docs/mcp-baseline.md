@@ -1,4 +1,4 @@
-# Offline MCP transport baseline (v3)
+# Offline MCP transport baseline (v4)
 
 Build the bridge from the revision being compared and run the same fixture on
 the same machine for both revisions. The Python 3.9+ harness uses the standard
@@ -58,6 +58,23 @@ the offline fixture, excluding startup. First and subsequent iterations have
 separate task counts, calls, expected errors, payload bytes and wall-clock
 P50/P95. A one-repeat run leaves the subsequent group null. This metric does
 not stand in for a real submit → wait → logs replay or a remote SSH probe.
+
+Report v4 adds a separate `mock_job_workflow` section. It replays a pinned
+three-asset scenario in process, using one submit, two waits (the second
+watches only the pending handle), and three log reads, including the failed
+job. It checks all terminal states, exit codes, and logs before counting a
+workflow as complete. In this fixture, each complete workflow has two done
+jobs and one failed job (exit 7), and models 3 launch, 4 status, and 3 log
+probes. The probe denominator is completed workflows; the reported
+`targets_per_workflow` also allows per-target normalization.
+
+These are **mock counts**, not observed server calls or backend probes. They
+are deliberately reported once outside both real transport summaries. The
+real stdio/HTTP fixture and its hash are unchanged; actual SSH probes and
+model tokens are still unmeasured. Use the report to validate counting and
+workflow semantics, not to infer server latency, probe savings or bytes
+for multi-target jobs. A deterministic loopback backend and instrumented
+actual dispatch remain necessary for those comparisons.
 
 The existing unit-test limit on the advertised declaration stays in place:
 `cargo test --lib advertised_tools_stay_within_their_token_budget`.
