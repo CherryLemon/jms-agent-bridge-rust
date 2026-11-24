@@ -1530,14 +1530,52 @@ impl JobBatch {
 
 const JOB_BATCH_RESULT: &str = "job_batch";
 
+/// Mark where each identifier is usable. Inline job handles are data, not
+/// authorization; the receiving bridge still resolves the permitted asset.
+fn mark_job_recovery(value: &mut Value, section: &str) {
+    if value.get("request_id").is_some_and(Value::is_string) {
+        value["request_id_scope"] = json!("bridge_local");
+    }
+    if value.get("result_id").is_some_and(Value::is_string) {
+        value["result_id_scope"] = json!("bridge_local");
+    }
+    if let Some(handles) = value.get(section).and_then(Value::as_array) {
+        if handles.is_empty() {
+            return;
+        }
+        let next = if handles.len() == 1 {
+            validate_job_handles(handles)
+                .ok()
+                .and_then(|mut pairs| pairs.pop())
+                .map(|(target, job_id)| {
+                    json!({"tool":"call","arguments":{
+                        "operation":"jms_job_status",
+                        "arguments":{"targets":[target],"job_id":job_id}
+                    }})
+                })
+        } else {
+            None
+        };
+        let key = format!("{section}_scope");
+        value[key.as_str()] = json!("remote_job");
+        if let Some(action) = next {
+            value["next_action"] = action;
+        }
+    } else if value.get(section).is_some_and(Value::is_object) {
+        let key = format!("{section}_scope");
+        value[key.as_str()] = json!("bridge_local");
+    }
+}
+
 /// Stage bulky diagnostic rows first. Pass the inline handles (or a typed
 /// continuation reference when the handles alone are too large) directly to wait.
-fn stage_job_batch(store: &ResultStore, scope: JobBatch, value: Value) -> BridgeResult<Value> {
+fn stage_job_batch(store: &ResultStore, scope: JobBatch, mut value: Value) -> BridgeResult<Value> {
+    let (operation, section) = scope.scope();
+    mark_job_recovery(&mut value, section);
     let bytes = serde_json::to_vec(&value)?;
     if bytes.len() <= OPERATION_BUDGET {
         return Ok(value);
     }
-    let (operation, section) = scope.scope();
     let metadata = json!({"kind":JOB_BATCH_RESULT,"operation":operation,
                           "handle_section":section,"bytes":bytes.len()})
     .as_object()
@@ -1568,8 +1606,17 @@ fn stage_job_batch(store: &ResultStore, scope: JobBatch, value: Value) -> Bridge
     }
     if let Some(handles) = value.get(section) {
         result[section] = handles.clone();
+    }
+    mark_job_recovery(&mut result, section);
+    if serde_json::to_vec(&result)?.len() > OPERATION_BUDGET {
+        // Prefer the portable handle over duplicate convenience arguments.
+        result
+            .as_object_mut()
+            .expect("staged object")
+            .remove("next_action");
         if serde_json::to_vec(&result)?.len() > OPERATION_BUDGET {
             result[section] = json!({"ref": result_id});
+            mark_job_recovery(&mut result, section);
         }
     }
     Ok(result)
@@ -2035,7 +2082,72 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        let mut raw = raw;
+        mark_job_recovery(&mut raw, "jobs");
         assert_eq!(full, raw);
+    }
+
+    #[test]
+    fn portable_job_recovery_emits_a_read_only_valid_action_without_local_ids() {
+        let (_dir, store) = job_test_store();
+        let response = stage_job_batch(
+            &store,
+            JobBatch::Submit,
+            json!({"ok":true,"request_id":"bridge-a-local-id","jobs":job_test_handles(1)}),
+        )
+        .unwrap();
+        assert_eq!(response["jobs_scope"], "remote_job");
+        assert_eq!(response["request_id_scope"], "bridge_local");
+        let action = &response["next_action"];
+        assert_eq!(action["tool"], "call");
+        let invocation = &action["arguments"];
+        let operation = invocation["operation"].as_str().unwrap();
+        assert_eq!(operation, "jms_job_status");
+        let operations = schemas::operations();
+        let spec = &operations[operation];
+        assert_eq!(spec["annotations"]["readOnlyHint"], true);
+        crate::schema::validate(&spec["inputSchema"], &invocation["arguments"]).unwrap();
+        assert_eq!(
+            invocation["arguments"],
+            json!({"targets":["asset-000000000000"],"job_id":"00000000"})
+        );
+        let (_other_dir, other_store) = job_test_store();
+        let inline = load_job_handles(&other_store, &response["jobs"]).unwrap();
+        assert_eq!(
+            validate_job_handles(&inline).unwrap(),
+            vec![("asset-000000000000".into(), "00000000".into())]
+        );
+    }
+
+    #[test]
+    fn no_remote_action_without_an_exact_job_handle() {
+        let (_dir, store) = job_test_store();
+        for jobs in [json!([]), json!([{"target":"all","job_id":"abcd1234"}])] {
+            let response = stage_job_batch(
+                &store,
+                JobBatch::Submit,
+                json!({"completion_unknown":true,"jobs":jobs}),
+            )
+            .unwrap();
+            assert!(response.get("next_action").is_none());
+        }
+    }
+
+    #[test]
+    fn portable_handle_is_retained_before_the_optional_action() {
+        let (_dir, store) = job_test_store();
+        let handles = json!([{"target":"x".repeat(4500),"job_id":"abcd1234"}]);
+        let response = stage_job_batch(
+            &store,
+            JobBatch::Submit,
+            json!({"jobs":handles,"submissions":["x".repeat(9000)]}),
+        )
+        .unwrap();
+        assert_eq!(response["staged"], true);
+        assert_eq!(response["jobs"], handles);
+        assert_eq!(response["jobs_scope"], "remote_job");
+        assert_eq!(response["result_id_scope"], "bridge_local");
+        assert!(response.get("next_action").is_none());
     }
 
     #[test]
@@ -2075,6 +2187,8 @@ mod tests {
             let staged = stage_job_batch(&store, scope, raw.clone()).unwrap();
             assert!(staged.to_string().len() <= OPERATION_BUDGET);
             assert_eq!(staged[field]["ref"], staged["result_id"]);
+            assert_eq!(staged[format!("{field}_scope").as_str()], "bridge_local");
+            assert!(staged.get("next_action").is_none());
             let restored = load_job_handles(&store, &staged[field]).unwrap();
             assert_eq!(restored, handles);
             assert!(validate_job_handles(&restored).is_ok());
