@@ -815,6 +815,30 @@ max_parallel = 2\n",
             Value::Null,
             "Invalid arguments at options.timeout: must be <= 900",
         ),
+        (
+            "job",
+            json!({"action":"wait","jobs":[{"target":"worker","job_id":"abcd1234"}],"targets":["worker"]}),
+            "/targets",
+            Value::Null,
+            Value::Null,
+            "job wait takes jobs or targets/job_id, not both",
+        ),
+        (
+            "job",
+            json!({"action":"wait","jobs":{"ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"job_id":"abcd1234"}),
+            "/job_id",
+            Value::Null,
+            Value::Null,
+            "job wait takes jobs or targets/job_id, not both",
+        ),
+        (
+            "job",
+            json!({"action":"wait","jobs":[{"target":"worker","job_id":"abcd1234"}],"pattern":"unused"}),
+            "/pattern",
+            Value::Null,
+            Value::Null,
+            "job wait takes jobs or targets/job_id, not both",
+        ),
     ] {
         let reply: Value = client
             .post(&endpoint)
@@ -838,6 +862,15 @@ max_parallel = 2\n",
         assert_eq!(body["validation"]["path"], path, "{body}");
         assert_eq!(body["validation"]["expected"], expected, "{body}");
         assert_eq!(body["validation"]["suggestion"], suggestion, "{body}");
+        if old_error == "job wait takes jobs or targets/job_id, not both" {
+            let message = match path {
+                "/targets" => "targets cannot be combined with jobs",
+                "/job_id" => "job_id cannot be combined with jobs",
+                "/pattern" => "pattern is not applicable when waiting on jobs",
+                _ => unreachable!(),
+            };
+            assert_eq!(body["validation"]["message"], message, "{body}");
+        }
         if path == "/target" {
             assert_eq!(
                 body["validation"]["message"], "missing required: target",
