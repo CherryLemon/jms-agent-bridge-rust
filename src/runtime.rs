@@ -2458,6 +2458,13 @@ pub fn stage_if_large(
     summary.insert("operation".into(), Value::from(operation));
     summary.insert("result_id".into(), Value::from(result_id.clone()));
     summary.insert("bytes".into(), json!(bytes.len()));
+    summary.insert("result_id_scope".into(), json!("bridge_local"));
+    summary.insert(
+        "next_action".into(),
+        json!({"tool":"read_result","arguments":{
+            "result_id":result_id,"stream":"result","offset":0,"limit":4096
+        }}),
+    );
 
     // Business-level shape the caller usually needs, without the bulk.
     // Short state fields stay on top: a staged reply must still tell the caller whether

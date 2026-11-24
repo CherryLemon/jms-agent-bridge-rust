@@ -1792,16 +1792,18 @@ async fn run_saved_view_fanout_and_paging(runtime: &BridgeRuntime, server: &Brid
     let staged =
         jms_bridge::runtime::stage_if_large(&runtime.store, "fixture_stage", body.clone()).unwrap();
     assert_eq!(staged["staged"], true);
-    let mut offset = 0;
+    assert_eq!(staged["result_id_scope"], "bridge_local");
+    let action = &staged["next_action"];
+    assert_eq!(action["tool"], "read_result");
+    assert_eq!(
+        action["arguments"],
+        json!({"result_id":staged["result_id"], "stream":"result", "offset":0, "limit":4096})
+    );
+    let mut args = object(action["arguments"].clone());
     let mut text = String::new();
     loop {
         let page = server
-            .dispatch(
-                "read_result",
-                object(json!({
-                    "result_id":staged["result_id"],"stream":"result","offset":offset,"limit":4096
-                })),
-            )
+            .dispatch(action["tool"].as_str().unwrap(), args.clone())
             .await
             .unwrap();
         text.push_str(page["text"].as_str().unwrap());
@@ -1809,8 +1811,8 @@ async fn run_saved_view_fanout_and_paging(runtime: &BridgeRuntime, server: &Brid
             break;
         }
         let next = page["next_offset"].as_u64().unwrap();
-        assert!(next > offset);
-        offset = next;
+        assert!(next > args["offset"].as_u64().unwrap());
+        args.insert("offset".into(), json!(next));
     }
     assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), body);
 }

@@ -579,8 +579,19 @@ initial launch and one log fetch reach the canned SSH emulator.
 | HTTP | 3 | 3 | 9 | 3 | 3 / 3 |
 | stdio | 3 | 3 | 9 | 3 | 3 / 3 |
 
-The current summary advertises the stream in a note, not a structured
+In that baseline the summary advertises the stream in a note, not a structured
 `next_action`; the test builds the read call from the returned result ID and
 the documented stream. This does not make staged result IDs portable and does
 not test staged write outcomes, the separate job-handle continuation type, or
 any real service. The emulator never executes the received command.
+
+The generic staged operation summary now also emits
+`result_id_scope="bridge_local"` and
+`next_action={tool:"read_result", arguments:{result_id, stream:"result", offset:0, limit:4096}}`.
+Pass that first action directly to the MCP tool, then replace only the byte
+offset with the returned `next_offset` until EOF. The structured result cursor
+is independent of any remote log cursor. The existing summary note and fields
+remain available to older clients. Use `--require-next-action` in the staged Job
+log test to verify the emitted action against a candidate release. This applies
+to generic staged operations; job batch continuation keeps its existing
+pending/handle semantics.

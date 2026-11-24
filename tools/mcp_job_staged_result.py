@@ -33,8 +33,11 @@ def check_page(page, result_id, offset, total):
     return next_offset
 
 
-def guarded_page(exchange, client, result_id, offset, total):
-    action = read_action(result_id, offset)
+def guarded_page(exchange, client, result_id, offset, total, *, emitted=None):
+    expected = read_action(result_id, offset)
+    action = expected if emitted is None else emitted
+    if action != expected:
+        raise RuntimeError("staged action changed stream, result identity, or first byte cursor")
     # Restrict this call to the exact local result ID and current byte cursor.
     client.exchange = guarded(exchange, action)
     try:
@@ -44,7 +47,7 @@ def guarded_page(exchange, client, result_id, offset, total):
     return page["text"], check_page(page, result_id, offset, total)
 
 
-def sample(binary, fixture, mode, root):
+def sample(binary, fixture, mode, root, *, require_next_action=False):
     origin, foreign = root / "origin", root / "foreign"
     origin.mkdir()
     foreign.mkdir()
@@ -66,7 +69,10 @@ def sample(binary, fixture, mode, root):
                     or not 8192 < total <= 32768 or "log" in staged
                     or staged["next_offset"] != len(LOG.encode())):
                 raise RuntimeError("expected defined staged log summary")
-            piece, offset = guarded_page(exchange, client, rid, 0, total)
+            emitted = staged.get("next_action")
+            if require_next_action and (emitted is None or staged.get("result_id_scope") != "bridge_local"):
+                raise RuntimeError("staged reply omitted the local result scope or read-only action")
+            piece, offset = guarded_page(exchange, client, rid, 0, total, emitted=emitted)
         chunks = [piece]
         with connected(binary, origin, backend.config, mode) as exchange:
             client = Client(exchange, legacy=False)
@@ -95,6 +101,7 @@ def main():
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--server-git-sha", required=True)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--require-next-action", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.repeats <= 20 or not re.fullmatch(r"[0-9a-fA-F]{40}", args.server_git_sha):
         parser.error("require 1 to 20 repeats and a full server source SHA")
@@ -105,13 +112,15 @@ def main():
         events = Counter()
         for _ in range(args.repeats):
             with tempfile.TemporaryDirectory(prefix="jms-staged-") as directory:
-                events.update(sample(args.binary.resolve(), fixture, mode, Path(directory)))
+                events.update(sample(args.binary.resolve(), fixture, mode, Path(directory),
+                                     require_next_action=args.require_next_action))
         results[mode] = {"workflows": args.repeats, **events}
     with args.binary.open("rb") as binary:
         sha = hashlib.file_digest(binary, "sha256").hexdigest()
     print(json.dumps({"scope": "local canned loopback only", "server_git_sha": args.server_git_sha,
                       "binary_sha256": sha, "fixture_sha256": hashlib.sha256(source).hexdigest(),
                       "log_sha256": hashlib.sha256(LOG.encode()).hexdigest(),
+                      "required_next_action": args.require_next_action,
                       "transports": results}, indent=2, sort_keys=True))
 
 
