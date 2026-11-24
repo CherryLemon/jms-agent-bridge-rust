@@ -154,6 +154,7 @@ Put advanced fields in options; discover(operation='jms_fs', query=action) lists
                     "options": {"type": "object", "additionalProperties": false,
                         "description": "Action fields: paths, local_path, overwrite, paging, filters, timeout.",
                         "properties": {
+                            "expected_asset_id": string("Exact mode: must equal target and match one permitted canonical asset ID."),
                             "paths": array_of_strings("read_many: absolute paths.", Some(16)),
                             "local_path": string("upload/download: absolute path on the MCP machine."),
                             "overwrite": boolean(false, "Replace existing destination files when true."),
@@ -228,7 +229,7 @@ reuse handle. Running is not completion; reads honour cursors.",
         },
         ToolSpec {
             name: "job",
-            description: "Submit, wait, logs, status, cancel or list detached jobs. Submit needs request_id; pass its jobs to wait. See discover(operation='job').",
+            description: "Detached jobs. Submit needs request_id. Pass returned jobs to wait. See discover.",
             input_schema: json!({
                 "type":"object",
                 "additionalProperties":false,
@@ -239,6 +240,7 @@ reuse handle. Running is not completion; reads honour cursors.",
                     "targets":array_of_strings("", None),
                     "target":{"type":"string","minLength":1},
                     "command":{"type":"string","maxLength":1048576},
+                    "artifact_paths":{"type":"array"},
                     "job_id":{"type":"string","pattern":"^[0-9a-f]{8}$"},
                     "jobs":{"oneOf":[job_pairs_schema(),job_batch_ref_schema()]},
                     "allow_dangerous":boolean(false, DANGEROUS_FLAG_DESCRIPTION),
@@ -699,11 +701,16 @@ fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
     ]
 }
 
+fn artifact_paths_schema() -> Value {
+    json!({"type":"array","maxItems":4,"items":{"type":"string","minLength":2,"maxLength":256,"pattern":"^/"}})
+}
+
 fn job_pairs_schema() -> Value {
     json!({"type":"array","minItems":1,"items":{
         "type":"object","additionalProperties":false,"required":["target","job_id"],
         "properties":{"target":{"type":"string","minLength":1},
-                      "job_id":{"type":"string","pattern":"^[0-9a-f]{8}$"}}
+                      "job_id":{"type":"string","pattern":"^[0-9a-f]{8}$"},
+                      "artifact_paths":{"type":"array"}}
     }})
 }
 
@@ -721,6 +728,7 @@ fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool
                 "targets": array_of_strings("Targets to launch on.", None),
                 "command": {"type": "string", "maxLength": 1048576},
                 "allow_dangerous": boolean(false, DANGEROUS_FLAG_DESCRIPTION),
+                "artifact_paths": artifact_paths_schema(),
             }),
             json!(["targets", "command"]),
             false,
@@ -813,6 +821,7 @@ fn fs_schema() -> Value {
             "required": ["target", "action"],
             "properties": {
                 "target": {"type": "string", "minLength": 1},
+                "expected_asset_id": {"type":"string","minLength":1,"description":"Exact mode: must equal target and match one permitted canonical asset ID."},
                 "action": {"type": "string", "enum": ["list", "stat", "read", "read_many", "glob",
                     "search", "tree", "checksum", "upload", "download"]},
                 "path": {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -906,8 +915,9 @@ pub fn categories() -> BTreeMap<&'static str, Vec<&'static str>> {
 }
 
 /// Fields that are common to every fs action.
-pub const FS_COMMON: [&str; 6] = [
+pub const FS_COMMON: [&str; 7] = [
     "target",
+    "expected_asset_id",
     "action",
     "path",
     "container",
@@ -1064,6 +1074,7 @@ fn public_view(name: &str, schema: Value) -> Value {
             "targets",
             "target",
             "command",
+            "artifact_paths",
             "allow_dangerous",
             "job_id",
             "jobs",

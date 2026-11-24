@@ -12,7 +12,7 @@ use crate::execution::{startup_failed, ExecOutcome, ExecSpec, Runner};
 use crate::fsprobe::{
     decode, fs_timeout_limits, remote_script, FsOptions, DEFAULT_BYTES, FS_TIMEOUT_MIN, WIRE_LIMIT,
 };
-use crate::inventory::Host;
+use crate::inventory::{Host, Inventory};
 use crate::rest::AssetCatalog;
 use crate::scheduler::queue_rejection;
 use crate::storage::results::ResultStore;
@@ -32,12 +32,39 @@ pub const ACTIONS: [&str; 10] = [
     "download",
 ];
 
+// Exact mode only searches the current authorized inventory by canonical identity;
+// do not try name, address, alias, or tag resolution if that identity is missing.
+fn resolve_fs_target(inventory: &Inventory, target: &str, expected: Option<&str>) -> BridgeResult<Host> {
+    if let Some(expected) = expected {
+        let mut matches = inventory.hosts.iter().filter(|host| host.asset_id.as_deref() == Some(expected));
+        if let Some(host) = matches.next() {
+            if matches.next().is_none() && target == expected {
+                return Ok(host.clone());
+            }
+        }
+        return Err(BridgeError::invalid("expected_asset_id must identify exactly one permitted SSH asset"));
+    }
+    let mut hosts = inventory.resolve(&[target.to_string()])?;
+    if hosts.len() != 1 {
+        return Err(BridgeError::invalid("jms_fs requires exactly one permitted SSH asset"));
+    }
+    Ok(hosts.pop().expect("one host"))
+}
+
 /// Reject arguments no action reads, and combinations that cannot mean anything.
 pub fn validate(arguments: &Map<String, Value>) -> BridgeResult<()> {
     let action = arguments
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| BridgeError::invalid("action is required"))?;
+    if let Some(expected) = arguments.get("expected_asset_id") {
+        let expected = expected.as_str().filter(|id| !id.is_empty() && !id.chars().any(char::is_control));
+        if expected.is_none() || arguments.get("target").and_then(Value::as_str) != expected {
+            return Err(BridgeError::invalid(
+                "exact Fs mode requires target and expected_asset_id to be the same canonical asset ID",
+            ));
+        }
+    }
     let paths: Vec<String> = if action == "read_many" {
         arguments
             .get("paths")
@@ -124,14 +151,7 @@ pub fn validate(arguments: &Map<String, Value>) -> BridgeResult<()> {
             ));
         }
     }
-    let mut allowed: Vec<&str> = vec![
-        "target",
-        "action",
-        "path",
-        "container",
-        "timeout",
-        "max_bytes",
-    ];
+    let mut allowed = crate::schemas::FS_COMMON.to_vec();
     allowed.extend(
         crate::schemas::fs_action_options(action)
             .ok_or_else(|| BridgeError::invalid("unknown fs action"))?,
@@ -629,13 +649,11 @@ impl Filesystem {
             ));
         }
         let inventory = self.catalog.ensure().await?;
-        let hosts = inventory.resolve(&[target])?;
-        if hosts.len() != 1 {
-            return Err(BridgeError::invalid(
-                "jms_fs requires exactly one permitted SSH asset",
-            ));
-        }
-        let host = hosts.into_iter().next().expect("one host");
+        let host = resolve_fs_target(
+            &inventory,
+            &target,
+            arguments.get("expected_asset_id").and_then(Value::as_str),
+        )?;
         let action = arguments
             .get("action")
             .and_then(Value::as_str)
@@ -877,6 +895,25 @@ mod tests {
     ///
     /// `-a` copies a symlink as a link and a directory recursively, so following either
     /// would report a size that has nothing to do with what rsync sends.
+    #[test]
+    fn guarded_fs_uses_only_one_exact_current_permitted_asset() {
+        let make_host = |name: &str, id: &str| Host {
+            name: name.into(), asset_id: Some(id.into()), ..Host::default()
+        };
+        let current = make_host("new-display-name", "canonical");
+        let old_selector = make_host("canonical", "different");
+        let mut inventory = Inventory {
+            hosts: vec![current.clone(), old_selector], ..Inventory::default()
+        };
+        assert_eq!(resolve_fs_target(&inventory, "canonical", Some("canonical")).unwrap().name, current.name);
+        assert_eq!(resolve_fs_target(&inventory, "canonical", None).unwrap().asset_id.as_deref(), Some("different"));
+        assert!(resolve_fs_target(&inventory, "new-display-name", Some("canonical")).is_err());
+        inventory.hosts.push(make_host("duplicate", "canonical"));
+        assert!(resolve_fs_target(&inventory, "canonical", Some("canonical")).is_err());
+        inventory.hosts.retain(|host| host.asset_id.as_deref() != Some("canonical"));
+        assert!(resolve_fs_target(&inventory, "canonical", Some("canonical")).is_err());
+    }
+
     #[test]
     fn only_regular_files_provide_an_upload_size() {
         let directory = tempfile::tempdir().unwrap();
