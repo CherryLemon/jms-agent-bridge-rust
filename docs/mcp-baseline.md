@@ -170,3 +170,41 @@ recovery after a **fully received and acknowledged** response, not mid-frame
 loss, in-flight process failure, transport cancellation or SSH outage.
 The workload report above and the seeded interrupted-receipt test are
 unchanged and cover different failure boundaries.
+
+### Additional matched shapes
+
+The default `--case mixed-timeout` keeps the existing fixture. Two other
+pinned cases use the same legacy/public comparison, independently over stdio
+and Streamable HTTP:
+
+| Case | Targets | Expected terminal outcomes | Wait behavior |
+| --- | ---: | --- | --- |
+| `one-target` | 1 | One success | No continuation expected |
+| `above-concurrency` | 6 | Four successes and two failures (exit 7) | No continuation expected; emulator holds each status handler for 80 ms |
+
+Six targets exceed the four in-flight public job-wait status probes in
+the pinned server; the synthetic delay makes overlap visible without
+requiring remote work. The observed peak counts overlapping handlers in
+the loopback emulator, not server internals or a limit inferred from one
+timing sample. The one-target run is a control for façade overhead when
+no batching is possible. Each completed workflow requires one launch and
+one log read per target and status coverage for every target; unexpected
+errors, duplicate launches and missing logs fail the run.
+
+Run the same case, server binary, repeat count and machine for both
+façades. The CLI does that within one invocation and reports the case,
+fixture hash, Python and Paramiko versions, and repeat count per
+transport and façade. For example:
+
+```sh
+for shape in one-target above-concurrency; do
+  python3 tools/mcp_job_measure.py --binary target/release/jms-bridge \
+    --server-git-sha "$(git rev-parse HEAD)" --case "$shape" --repeats 5 \
+    > "matched-job-$shape.json"
+done
+```
+
+Separate MCP call counts from REST/catalog and SSH request counts. A
+shorter workflow or fewer MCP rounds need not use fewer SSH probes or
+fewer MCP bytes. The synthetic handler delay is part of the measured
+elapsed time; it is not a production latency estimate.

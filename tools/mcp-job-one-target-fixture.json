@@ -1,0 +1,16 @@
+{
+  "command": "printf synthetic-workload",
+  "targets": [
+    {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "name": "fixture-b",
+      "pending_seconds": 0,
+      "exit_code": 0,
+      "log": "fixture complete\n"
+    }
+  ],
+  "first_timeout": 3,
+  "followup_timeout": 4,
+  "interval": 0.5,
+  "require_timeout": false
+}
