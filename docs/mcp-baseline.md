@@ -142,3 +142,31 @@ one successful job, one failed job, first-wait timeout, and both logs.
 The public path saved one call in this scenario, with unchanged SSH probe
 counts and more MCP bytes. These small-sample, deadline-dominated measurements
 do not establish a latency or model-token improvement.
+
+### Opt-in acknowledged submit reply discard
+
+```sh
+python3 tools/mcp_job_lost_reply.py --binary target/release/jms-bridge \
+  --server-git-sha "$(git rev-parse HEAD)" --repeats 2 > lost-job-reply.json
+```
+
+This separate probe uses the same canned assets and real public job calls over
+both transports. It reads one exact, successful submit response from the
+transport, quarantines it in a test oracle, then fails that call at the
+application boundary. The caller never sees the submit payload and never
+issues a replacement submit. It restarts the bridge, queries its durable
+receipt using only the original request ID, and reads the saved launch command
+results using the recovered result IDs. This recovery phase must issue no
+SSH requests; any catalog requests (including HTTP bridge startup) are
+counted separately. A bridge with a different local state directory then follows only the
+recovered asset/job handles, validating both terminal exit codes and both
+logs. The oracle finally verifies exact ID equality and the backend counters
+must show exactly one launch per asset.
+
+The report includes the discarded reply's bytes because they were transferred,
+even though the application did not receive them. Elapsed time includes the
+simulated discard, two bridge restarts and follow-up. The result demonstrates
+recovery after a **fully received and acknowledged** response, not mid-frame
+loss, in-flight process failure, transport cancellation or SSH outage.
+The workload report above and the seeded interrupted-receipt test are
+unchanged and cover different failure boundaries.
