@@ -136,8 +136,26 @@ def declared_tools(listed, fixture):
     return sorted(declared)
 
 
+def task_summary(samples):
+    """Summarize only complete, validated fixture iterations."""
+    count = len(samples)
+    if not count:
+        return None
+    elapsed = sorted(sample["elapsed_ms"] for sample in samples)
+    return {
+        "completed": count,
+        "tool_calls": sum(sample["tool_calls"] for sample in samples),
+        "expected_mcp_errors": sum(sample["expected_mcp_errors"] for sample in samples),
+        "request_bytes": sum(sample["request_bytes"] for sample in samples),
+        "response_bytes": sum(sample["response_bytes"] for sample in samples),
+        "p50_ms": round(elapsed[math.ceil(0.50 * count) - 1], 3),
+        "p95_ms": round(elapsed[math.ceil(0.95 * count) - 1], 3),
+    }
+
+
 def benchmark(exchange, fixture, repeats):
     samples = defaultdict(list)
+    tasks = []
     rpc_id = 0
 
     def call(label, method, params=None, reply=True, expect=None, error_contains=None):
@@ -188,6 +206,8 @@ def benchmark(exchange, fixture, repeats):
     startup_labels = set(samples)
     tool_calls = {step["name"] for step in fixture["steps"]}
     for iteration in range(repeats):
+        iteration_rows = []
+        iteration_started = time.perf_counter_ns()
         for step in fixture["steps"]:
             label = step["name"]
             if label == "lost_reply_receipt" and iteration == 0:
@@ -198,6 +218,14 @@ def benchmark(exchange, fixture, repeats):
             call(label, "tools/call", {
                 "name": step["tool"], "arguments": step["arguments"],
             }, expect=step.get("expect"), error_contains=step.get("error_contains"))
+            iteration_rows.append(samples[label][-1])
+        tasks.append({
+            "elapsed_ms": (time.perf_counter_ns() - iteration_started) / 1e6,
+            "tool_calls": len(iteration_rows),
+            "request_bytes": sum(row[1] for row in iteration_rows),
+            "response_bytes": sum(row[2] for row in iteration_rows),
+            "expected_mcp_errors": sum(row[3] for row in iteration_rows),
+        })
 
     def summarize(label, rows):
         elapsed, tx, rx, errors, _ = zip(*rows)
@@ -226,6 +254,11 @@ def benchmark(exchange, fixture, repeats):
         "bridge_version": bridge_version,
         "startup": phase(startup_labels),
         "workload": phase(samples.keys() - startup_labels),
+        "fixture_tasks": {
+            "scope": "one complete offline fixture iteration",
+            "first_iteration": task_summary(tasks[:1]),
+            "subsequent_iterations": task_summary(tasks[1:]),
+        },
         "declarations": {
             "tools": declared,
             "initialize_response_json_bytes": samples["initialize"][0][4],
@@ -252,7 +285,7 @@ def main():
         for chunk in iter(lambda: binary.read(1024 * 1024), b""):
             binary_sha256.update(chunk)
     data = {
-        "report_version": 2,
+        "report_version": 3,
         "server_git_sha": options.server_git_sha.lower(),
         "binary_sha256": binary_sha256.hexdigest(),
         "fixture": FIXTURE.name,
