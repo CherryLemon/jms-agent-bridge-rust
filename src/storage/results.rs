@@ -17,6 +17,9 @@ use uuid::Uuid;
 
 use crate::errors::{BridgeError, BridgeResult};
 
+const LEGACY_TERMINAL_PARTIAL_SEND: &str =
+    "the command may have reached the terminal only partially; check the session before retrying";
+
 pub fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -352,6 +355,26 @@ impl ResultStore {
     }
 
     pub fn metadata(&self, result_id: &str) -> BridgeResult<Map<String, Value>> {
+        let mut meta = self.metadata_with_progress(result_id)?;
+        // Older terminal workers wrote `executed: true` when the packet write
+        // failed, before capture ever checked for START. Correct only that exact
+        // finished verdict when reading it; preserve the original record on disk.
+        if meta.get("kind").and_then(Value::as_str) == Some("terminal")
+            && meta.get("status").and_then(Value::as_str) == Some("complete")
+            && meta.get("ok").and_then(Value::as_bool) == Some(false)
+            && meta.get("execution_state").and_then(Value::as_str) == Some("unknown")
+            && meta.get("completion_unknown").and_then(Value::as_bool) == Some(true)
+            && meta.get("failure_stage").and_then(Value::as_str) == Some("channel")
+            && meta.get("executed").and_then(Value::as_bool) == Some(true)
+            && meta.get("error").and_then(Value::as_str) == Some(LEGACY_TERMINAL_PARTIAL_SEND)
+            && !meta.contains_key("exit_code")
+        {
+            meta.insert("executed".into(), Value::Null);
+        }
+        Ok(meta)
+    }
+
+    fn metadata_with_progress(&self, result_id: &str) -> BridgeResult<Map<String, Value>> {
         let mut meta = self.metadata_on_disk(result_id)?;
         if meta.get("status").and_then(Value::as_str) == Some("running") {
             if let Some(live) = self.live_progress(result_id) {
@@ -483,7 +506,7 @@ impl ResultStore {
         values: Map<String, Value>,
     ) -> BridgeResult<Map<String, Value>> {
         let _guard = self.io.lock().expect("result store lock");
-        let mut meta = self.metadata(result_id)?;
+        let mut meta = self.metadata_with_progress(result_id)?;
         for (key, value) in values {
             meta.insert(key, value);
         }
@@ -504,7 +527,7 @@ impl ResultStore {
         values: Map<String, Value>,
     ) -> BridgeResult<Map<String, Value>> {
         let _guard = self.io.lock().expect("result store lock");
-        let mut meta = self.metadata(result_id)?;
+        let mut meta = self.metadata_with_progress(result_id)?;
         if meta.get("status").and_then(Value::as_str) != Some("running") {
             return Ok(meta);
         }

@@ -1,0 +1,18 @@
+{
+  "kind": "terminal",
+  "host": "test-host",
+  "asset_id": "11111111-1111-1111-1111-111111111111",
+  "session_id": "legacy-shell",
+  "result_id": "5ac94eb9e70748b591362c7048410797",
+  "created_at": 1795000000.0,
+  "status": "complete",
+  "ok": false,
+  "executed": true,
+  "execution_state": "unknown",
+  "completion_unknown": true,
+  "failure_stage": "channel",
+  "error": "the command may have reached the terminal only partially; check the session before retrying",
+  "finished_at": 1795000120.0,
+  "expires_at": 1795604920.0,
+  "bytes": {"stdout": 0, "stderr": 0}
+}
