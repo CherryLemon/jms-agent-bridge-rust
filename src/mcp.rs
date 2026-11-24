@@ -128,6 +128,10 @@ impl BridgeServer {
                 );
                 let diagnostic = if name == "fs" {
                     crate::schema::fs_diagnostic(error, &flat, "")
+                } else if name == "terminal" {
+                    crate::schema::terminal_diagnostic(error, &flat)
+                } else if name == "job" {
+                    crate::schema::job_diagnostic(error, &flat)
                 } else {
                     error.diagnostic("")
                 };

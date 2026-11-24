@@ -91,6 +91,57 @@ pub(crate) fn fs_diagnostic(
     diagnostic
 }
 
+/// Public Terminal shares a schema across actions. Filter only top-level
+/// suggestions; cursor and environment children retain their own schemas.
+pub(crate) fn terminal_diagnostic(
+    error: SchemaError,
+    flat: &serde_json::Map<String, Value>,
+) -> Value {
+    let action = match flat.get("action") {
+        None => "exec",
+        Some(Value::String(action)) => action,
+        Some(_) => return error.diagnostic(""),
+    };
+    let mut diagnostic = error.diagnostic("");
+    let Some(path) = diagnostic["path"].as_str() else {
+        return diagnostic;
+    };
+    let is_option = path.starts_with("/options/");
+    let field_path = path.strip_prefix("/options/").or_else(|| path.strip_prefix('/'));
+    if !field_path.is_some_and(|field| !field.contains('/')) || path == "/action" {
+        return diagnostic;
+    }
+    if let Some(field) = diagnostic["suggestion"].as_str() {
+        if !crate::schemas::terminal_suggestion_applies(action, field, is_option) {
+            diagnostic.as_object_mut().unwrap().remove("suggestion");
+        }
+    }
+    diagnostic
+}
+
+/// Direct Job uses one public schema for every action and both wait shapes.
+pub(crate) fn job_diagnostic(error: SchemaError, args: &serde_json::Map<String, Value>) -> Value {
+    let mut diagnostic = error.diagnostic("");
+    let Some(action) = args.get("action").and_then(Value::as_str) else {
+        return diagnostic;
+    };
+    if !diagnostic["path"]
+        .as_str()
+        .and_then(|path| path.strip_prefix('/'))
+        .is_some_and(|field| !field.contains('/'))
+    {
+        return diagnostic;
+    }
+    if let Some(field) = diagnostic["suggestion"].as_str() {
+        let paired_wait = args.contains_key("jobs");
+        let already_legacy = args.contains_key("targets") || args.contains_key("job_id");
+        if !crate::schemas::job_suggestion_applies(action, field, paired_wait, already_legacy) {
+            diagnostic.as_object_mut().unwrap().remove("suggestion");
+        }
+    }
+    diagnostic
+}
+
 pub(crate) fn pointer_token(field: &str) -> String {
     format!("/{}", field.replace('~', "~0").replace('/', "~1"))
 }

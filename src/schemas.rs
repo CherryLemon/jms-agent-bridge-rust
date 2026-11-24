@@ -638,6 +638,24 @@ fn terminal_close_expectation() -> Value {
            "description": "close: require this result ID to be the live current command."})
 }
 
+pub(crate) fn terminal_suggestion_applies(action: &str, field: &str, is_option: bool) -> bool {
+    if !is_option && matches!(field, "action" | "options") {
+        return true;
+    }
+    let op = match action {
+        "open" => "terminal_open",
+        "exec" => "terminal_exec",
+        "read" => "terminal_read",
+        "write" => "terminal_write",
+        "close" => "terminal_close",
+        _ => return false,
+    };
+    terminal_operations()
+        .into_iter()
+        .find(|(name, ..)| *name == op)
+        .is_some_and(|entry| entry.2.get(field).is_some())
+}
+
 fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
     let pages = || {
         json!({
@@ -724,6 +742,40 @@ fn job_pairs_schema() -> Value {
 pub(crate) fn job_batch_ref_schema() -> Value {
     json!({"type":"object","additionalProperties":false,"required":["ref"],
            "properties":{"ref":{"type":"string","pattern":"^[0-9a-f]{32}$"}}})
+}
+
+pub(crate) fn job_suggestion_applies(
+    action: &str,
+    field: &str,
+    paired_wait: bool,
+    legacy_wait: bool,
+) -> bool {
+    if field == "action" {
+        return true;
+    }
+    if field == "request_id" {
+        return matches!(action, "submit" | "cancel");
+    }
+    let op = match action {
+        "submit" => "jms_submit_job",
+        "wait" if paired_wait => return matches!(field, "jobs" | "timeout" | "interval" | "tail"),
+        "wait" if field == "jobs" => return !legacy_wait,
+        "wait" => "jms_job_wait",
+        "logs" => "jms_job_logs",
+        "status" => "jms_job_status",
+        "cancel" => "jms_job_cancel",
+        "list" => "jms_job_list",
+        _ => return false,
+    };
+    let field = if field == "target" && matches!(action, "logs" | "cancel") {
+        "host"
+    } else {
+        field
+    };
+    job_operations()
+        .into_iter()
+        .find(|(name, ..)| *name == op)
+        .is_some_and(|entry| entry.2.get(field).is_some())
 }
 
 fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool)> {
