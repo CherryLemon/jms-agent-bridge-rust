@@ -607,6 +607,14 @@ require allow_dangerous=true",
     // --- discover ------------------------------------------------------------
 
     pub async fn tool_discover(&self, arguments: &Map<String, Value>) -> BridgeResult<Value> {
+        self.tool_discover_with_detail(arguments, "full").await
+    }
+
+    pub(crate) async fn tool_discover_with_detail(
+        &self,
+        arguments: &Map<String, Value>,
+        detail: &str,
+    ) -> BridgeResult<Value> {
         let raw_query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
         let query = raw_query.trim();
         let topic = arguments
@@ -621,16 +629,11 @@ require allow_dangerous=true",
         if topic == "status" {
             return Ok(self.status().await);
         }
-        if topic == "assets" {
-            self.catalog.ensure().await?;
-            return Ok(self.catalog.search(query, offset, limit));
-        }
         let operation = arguments.get("operation").and_then(Value::as_str);
         let view = arguments
             .get("view")
             .and_then(Value::as_str)
             .unwrap_or("full");
-        let body = Self::discover_operations(query, operation, view, offset, limit)?;
         // Never compare a global catalog version or a token for another representation.
         let scope = json!([
             self.discovery_scope.to_string(),
@@ -641,8 +644,17 @@ require allow_dangerous=true",
             offset,
             limit,
         ]);
+        let if_none_match = arguments.get("if_none_match").and_then(Value::as_str);
+        if topic == "assets" {
+            let scope = json!([scope, detail]);
+            return self
+                .catalog
+                .discover(query, offset, limit, &scope, if_none_match)
+                .await;
+        }
+        let body = Self::discover_operations(query, operation, view, offset, limit)?;
         let etag = schemas::operation_discovery_etag(&scope, &body);
-        if arguments.get("if_none_match").and_then(Value::as_str) == Some(&etag) {
+        if if_none_match == Some(etag.as_str()) {
             return Ok(json!({"unchanged": true}));
         }
         let mut body = body;
