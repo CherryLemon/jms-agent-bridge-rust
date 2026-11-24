@@ -343,7 +343,7 @@ against the current permitted inventory before probing it. Legacy
 
 In paired-handle wait, an asset not visible in this bridge's current permitted
 inventory yields a per-row `status:"unknown", probed:false, reason:"asset_not_visible"`
-without blocking visible jobs. A known selector naming multiple targets reports
+without blocking visible jobs. A name or address shared by multiple assets in a current snapshot reports
 `target_ambiguous` without expanding it. A lookup miss against a stale retained inventory
 reports `inventory_stale`; a refresh failure without a usable snapshot remains an
 inventory error. Unobservable rows are omitted from `pending` and do not receive a

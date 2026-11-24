@@ -116,6 +116,8 @@ pub struct Inventory {
     pub hosts: Vec<Host>,
     /// Unique names/addresses that resolve to exactly one asset id.
     pub groups: BTreeMap<String, Vec<String>>,
+    /// Snapshot-only diagnostics; never consulted by general selector resolution.
+    pub ambiguous_job_selectors: std::collections::BTreeSet<String>,
     pub excluded: BTreeMap<String, String>,
     pub metadata_warnings: Vec<String>,
 }
@@ -457,6 +459,7 @@ mod tests {
         Inventory {
             hosts,
             groups,
+            ambiguous_job_selectors: Default::default(),
             excluded: BTreeMap::new(),
             metadata_warnings: Vec::new(),
         }

@@ -891,10 +891,18 @@ fn build_inventory(
             }
         })
         .collect();
+    // Preserve only the labels, not member identities. This metadata is
+    // diagnostic for paired job observations; resolution never expands it.
+    let ambiguous_job_selectors = name_counts
+        .into_iter()
+        .chain(address_counts)
+        .filter_map(|(label, count)| (count > 1 && !label.is_empty()).then_some(label))
+        .collect();
     let _ = settings;
     Inventory {
         hosts,
         groups,
+        ambiguous_job_selectors,
         excluded,
         metadata_warnings: warnings,
     }

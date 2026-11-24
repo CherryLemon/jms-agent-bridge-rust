@@ -2243,10 +2243,12 @@ fn split_job_observation(
             visible_jobs.push(handle.clone());
         } else {
             let target = handle["target"].as_str().expect("validated target");
-            let reason = if inventory.groups.get(target).is_some_and(|members| members.len() > 1) {
-                "target_ambiguous"
-            } else if stale {
+            let reason = if stale {
                 "inventory_stale"
+            } else if inventory.ambiguous_job_selectors.contains(target)
+                || inventory.groups.get(target).is_some_and(|members| members.len() > 1)
+            {
+                "target_ambiguous"
             } else {
                 "asset_not_visible"
             };
