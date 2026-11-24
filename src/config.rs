@@ -88,6 +88,7 @@ impl BastionConfig {
 #[derive(Debug, Clone)]
 pub struct BridgeSettings {
     pub state_dir: PathBuf,
+    pub require_request_id: bool,
     pub refresh_interval: u64,
     pub execution_limit: Option<usize>,
     pub inspection_reserved: usize,
@@ -117,6 +118,7 @@ impl Default for BridgeSettings {
     fn default() -> Self {
         Self {
             state_dir: default_state_dir(),
+            require_request_id: false,
             refresh_interval: 3600,
             execution_limit: None,
             inspection_reserved: 0,
@@ -437,6 +439,11 @@ pub fn load_settings(explicit: Option<&Path>) -> BridgeResult<BridgeSettings> {
     let data = read_toml(&path)?;
     let bridge = table(&data, "bridge");
 
+    let require_request_id = match bridge.get("require_request_id") {
+        None => false,
+        Some(toml::Value::Boolean(value)) => *value,
+        Some(_) => return Err(BridgeError::config("bridge.require_request_id must be true or false")),
+    };
     let interval = match as_i64(&bridge, "refresh_interval") {
         Some(value) if value >= 1 => value as u64,
         Some(_) => {
@@ -538,6 +545,7 @@ pub fn load_settings(explicit: Option<&Path>) -> BridgeResult<BridgeSettings> {
 
     Ok(BridgeSettings {
         state_dir,
+        require_request_id,
         refresh_interval: interval,
         execution_limit,
         inspection_reserved,

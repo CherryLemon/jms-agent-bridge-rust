@@ -261,6 +261,15 @@ the bridge never substitutes it or sends the rejected call.
   `execution_replayed: false` plus the stored result; it does not run again.
   Recover a lost reply with `call(operation="request_status")` or
   `meta(ref="request:<id>")`.
+* Set `[bridge].require_request_id = true` in the server config to reject mutations
+  without a caller-generated ID. It covers run, Fs upload/download (download
+  writes a local file), terminal open/exec/write/close, and job submit/cancel.
+  Read-only operations, including reconciliation, do not need an ID. Direct
+  terminal uses `options.request_id`; legacy terminal and Fs use
+  `arguments.request_id`; job submit/cancel and legacy `jms_exec` /
+  `session_close` use the top-level ID in their respective tool call.
+  Generate a fresh ID per intended execution, and reuse it only to reconcile
+  that execution. The default remains off.
 * For `job(action="cancel")` and `call(operation="jms_job_cancel")`, supply
   the optional top-level `request_id` to claim the canonical asset and job pair
   before sending a cancellation. An identical ID reconciles the first attempt;

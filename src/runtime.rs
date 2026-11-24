@@ -309,7 +309,18 @@ impl BridgeRuntime {
         Ok(Value::Object(value))
     }
 
+    fn enforce_request_id(&self, mutation: bool, id: Option<&Value>, path: &str) -> BridgeResult<()> {
+        if self.settings.require_request_id && mutation && id.and_then(Value::as_str).is_none() {
+            return Err(BridgeError::invalid_arguments(
+                "strict request ID policy requires a caller-provided request_id for this mutation",
+                json!({"path":path, "message":"missing required: request_id"}),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn tool_run(self: &Arc<Self>, arguments: Map<String, Value>) -> BridgeResult<Value> {
+        self.enforce_request_id(true, arguments.get("request_id"), "/request_id")?;
         let mut arguments = arguments;
         // Presentation options never enter the journal or the execution closure.
         let output_view = arguments.remove("output_view");
@@ -448,12 +459,17 @@ require allow_dangerous=true",
     // --- fs ------------------------------------------------------------------
 
     pub async fn tool_fs(self: &Arc<Self>, arguments: Map<String, Value>) -> BridgeResult<Value> {
-        crate::filesystem::validate(&arguments)?;
         let action = arguments
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        self.enforce_request_id(
+            matches!(action.as_str(), "upload" | "download"),
+            arguments.get("request_id"),
+            "/request_id",
+        )?;
+        crate::filesystem::validate(&arguments)?;
         if let Some(request_id) = arguments
             .get("request_id")
             .and_then(Value::as_str)
@@ -520,6 +536,11 @@ require allow_dangerous=true",
                 "wait_for is only for terminal exec, read or write",
             ));
         }
+        self.enforce_request_id(
+            terminal_mutation(action),
+            arguments.get("request_id"),
+            "/request_id",
+        )?;
         match action {
             "open" => {
                 let target = arguments
@@ -724,6 +745,15 @@ require allow_dangerous=true",
                     .contains_key("expected_result_id")
                     .then(|| used_string(&arguments, "expected_result_id"))
                     .transpose()?;
+                if let Some(request_id) = request_id {
+                    let work = json!({"session":session, "expected_result_id":expected});
+                    let terminals = self.terminals.clone();
+                    return self.journal.execute(
+                        &request_id, "terminal_close", &work, move |_| async move {
+                            terminals.close_with_expected_result(&session, expected.as_deref()).await
+                        },
+                    ).await;
+                }
                 self.terminals
                     .close_with_expected_result(&session, expected.as_deref())
                     .await
@@ -926,7 +956,7 @@ require allow_dangerous=true",
         }
         let operation = match action.as_str() {
             "submit" => {
-                if request_id.as_ref().and_then(Value::as_str).is_none() {
+                if !self.settings.require_request_id && request_id.as_ref().and_then(Value::as_str).is_none() {
                     return Err(BridgeError::invalid("job submit requires request_id"));
                 }
                 "jms_submit_job"
@@ -1052,6 +1082,20 @@ require allow_dangerous=true",
             }
             BridgeError::invalid_arguments(message, validation)
         })?;
+        let (mutation, id, path) = match operation.as_str() {
+            "jms_submit_job" | "jms_job_cancel" | "jms_exec" | "session_close" =>
+                (true, arguments.get("request_id"), "/request_id"),
+            "jms_fs" => (
+                matches!(payload.get("action").and_then(Value::as_str), Some("upload" | "download")),
+                payload.get("request_id"), "/arguments/request_id"
+            ),
+            op if op.starts_with("terminal_") => (
+                terminal_mutation(op.trim_start_matches("terminal_")),
+                payload.get("request_id"), "/arguments/request_id"
+            ),
+            _ => (false, None, "/request_id"),
+        };
+        self.enforce_request_id(mutation, id, path)?;
         if operation == "jms_submit_job" {
             artifact_paths(payload.get("artifact_paths"))?;
         }
@@ -1067,9 +1111,18 @@ require allow_dangerous=true",
                     runtime.jobs.cancel(&host, &id).await
                 }).await;
             }
+            if matches!(operation.as_str(), "jms_exec" | "session_close") {
+                let runtime = self.clone();
+                let operation_for_work = operation.clone();
+                let work = Value::Object(payload.clone());
+                let value = self.journal.execute(&request_id, &operation, &work, move |_| async move {
+                    runtime.dispatch_operation(&operation_for_work, payload).await
+                }).await?;
+                return self.stage_operation_result(&operation, value);
+            }
             if operation != "jms_submit_job" {
                 return Err(BridgeError::invalid(
-                    "call request_id supports only jms_submit_job or jms_job_cancel",
+                    "outer call request_id applies to job submit/cancel, jms_exec, or session_close",
                 ));
             }
             let runtime = self.clone();
@@ -1833,6 +1886,10 @@ fn unknown_row(host: &str, message: &str) -> Map<String, Value> {
     .as_object()
     .cloned()
     .unwrap_or_default()
+}
+
+fn terminal_mutation(action: &str) -> bool {
+    matches!(action, "open" | "exec" | "write" | "close")
 }
 
 /// Claim the canonical job identity and save reconciliation data before resolving
