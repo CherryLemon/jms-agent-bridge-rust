@@ -1925,6 +1925,20 @@ closed and must not be reused. Inspect before rerunning."
         env_setup: bool,
         preview_only: bool,
     ) -> BridgeResult<ExecOutcome> {
+        self.exec_on_with_progress(host, command, timeout, workdir, env_setup, preview_only, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn exec_on_with_progress(
+        &self,
+        host: &Host,
+        command: &str,
+        timeout: f64,
+        workdir: bool,
+        env_setup: bool,
+        preview_only: bool,
+        progress: Option<&dyn ProgressSink>,
+    ) -> BridgeResult<ExecOutcome> {
         let script = wrap_command(
             if env_setup {
                 host.env_setup.as_deref()
@@ -1943,7 +1957,7 @@ closed and must not be reused. Inspect before rerunning."
             ..Default::default()
         };
         let meta = self
-            .execute_to_store(host, &script, timeout, &spec, None)
+            .execute_to_store(host, &script, timeout, &spec, progress)
             .await
             .map_err(|failure| failure.error)?;
         Ok(self.outcome_from_meta(host, meta, preview_only))

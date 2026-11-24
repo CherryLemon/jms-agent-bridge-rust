@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{load_config, load_settings, BastionConfig, BridgeSettings, StateLock};
 use crate::errors::{BridgeError, BridgeResult};
-use crate::execution::{ExecSpec, Runner};
+use crate::execution::{ExecOutcome, ExecSpec, Runner};
 use crate::filesystem::Filesystem;
 use crate::guard;
 use crate::inspection::AcceleratorInspector;
@@ -539,7 +539,7 @@ require allow_dangerous=true",
         self.enforce_request_id(
             terminal_mutation(action),
             arguments.get("request_id"),
-            "/request_id",
+            "/options/request_id",
         )?;
         match action {
             "open" => {
@@ -1115,8 +1115,12 @@ require allow_dangerous=true",
                 let runtime = self.clone();
                 let operation_for_work = operation.clone();
                 let work = Value::Object(payload.clone());
-                let value = self.journal.execute(&request_id, &operation, &work, move |_| async move {
-                    runtime.dispatch_operation(&operation_for_work, payload).await
+                let value = self.journal.execute(&request_id, &operation, &work, move |sink| async move {
+                    if operation_for_work == "jms_exec" {
+                        runtime.legacy_exec(payload, Some(sink.as_ref())).await
+                    } else {
+                        runtime.dispatch_operation(&operation_for_work, payload).await
+                    }
                 }).await?;
                 return self.stage_operation_result(&operation, value);
             }
@@ -1179,7 +1183,7 @@ require allow_dangerous=true",
                     .unwrap_or(90);
                 self.inspector.inspect(&targets, timeout).await
             }
-            "jms_exec" => self.legacy_exec(arguments).await,
+            "jms_exec" => self.legacy_exec(arguments, None).await,
             "jms_list_assets" => {
                 let search = arguments
                     .get("search")
@@ -1542,7 +1546,11 @@ require allow_dangerous=true",
         Ok(value)
     }
 
-    async fn legacy_exec(&self, arguments: Map<String, Value>) -> BridgeResult<Value> {
+    async fn legacy_exec(
+        &self,
+        arguments: Map<String, Value>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
+    ) -> BridgeResult<Value> {
         let command = used_string(&arguments, "command")?;
         let allow_dangerous = arguments
             .get("allow_dangerous")
@@ -1565,15 +1573,11 @@ require allow_dangerous=true",
         for host in hosts {
             outcomes.push(
                 self.runner
-                    .exec_on(&host, &command, timeout, true, true, true)
+                    .exec_on_with_progress(&host, &command, timeout, true, true, true, progress)
                     .await?,
             );
         }
-        let rows = crate::filesystem::exec_rows(&self.store, &outcomes, 4096);
-        let ok = rows
-            .iter()
-            .all(|row| row.get("ok").and_then(Value::as_bool).unwrap_or(false));
-        Ok(json!({"ok": ok, "results": rows}))
+        Ok(legacy_exec_response(&self.store, &outcomes, progress.is_some()))
     }
 
     // --- request receipts ----------------------------------------------------
@@ -1886,6 +1890,19 @@ fn unknown_row(host: &str, message: &str) -> Map<String, Value> {
     .as_object()
     .cloned()
     .unwrap_or_default()
+}
+
+fn legacy_exec_response(store: &ResultStore, outcomes: &[ExecOutcome], journaled: bool) -> Value {
+    let mut rows = crate::filesystem::exec_rows(store, outcomes, 4096);
+    if journaled {
+        for (row, outcome) in rows.iter_mut().zip(outcomes) {
+            for key in ["executed", "execution_state", "timed_out", "completion_unknown"] {
+                row[key] = outcome.meta.get(key).cloned().unwrap_or(Value::Null);
+            }
+        }
+    }
+    let ok = rows.iter().all(|row| row.get("ok").and_then(Value::as_bool).unwrap_or(false));
+    json!({"ok": ok, "results": rows})
 }
 
 fn terminal_mutation(action: &str) -> bool {
@@ -3185,6 +3202,54 @@ mod tests {
         assert_eq!(reply["request_state"], "interrupted");
         assert_eq!(reply["completion_unknown"], true);
         assert_eq!(reply["execution_replayed"], false);
+    }
+
+    #[tokio::test]
+    async fn journaled_legacy_exec_preserves_mixed_outcomes_and_reopened_uncertainty() {
+        let (directory, store) = job_test_store();
+        let outcome = |id: &str, state: &str, executed: Value, timed_out: bool, unknown: bool| {
+            let mut outcome = ExecOutcome::failure(id, "");
+            outcome.result_id = id.to_owned();
+            outcome.exit_code = if state == "completed" { 0 } else { 75 };
+            outcome.meta = json!({
+                "execution_state":state, "executed":executed, "timed_out":timed_out,
+                "completion_unknown":unknown
+            }).as_object().unwrap().clone();
+            outcome
+        };
+        let known = [
+            outcome("completed", "completed", json!(true), false, false),
+            outcome("not-started", "not_started", json!(false), false, false),
+        ];
+        let response = legacy_exec_response(&store, &known, true);
+        assert_eq!(response["results"][0]["executed"], true);
+        assert_eq!(response["results"][1]["execution_state"], "not_started");
+        assert_eq!(response["results"][1]["completion_unknown"], false);
+        let mixed = [
+            outcome("completed", "completed", json!(true), false, false),
+            outcome("not-started", "not_started", json!(false), false, false),
+            outcome("unknown", "unknown", Value::Null, true, true),
+        ];
+        let legacy = legacy_exec_response(&store, &mixed, false);
+        assert!(legacy["results"][2].get("execution_state").is_none());
+        assert!(legacy["results"][2].get("completion_unknown").is_none());
+        let response = legacy_exec_response(&store, &mixed, true);
+        assert_eq!(response["results"][2]["executed"], Value::Null);
+        assert_eq!(response["results"][2]["timed_out"], true);
+        let journal_path = directory.path().join("requests");
+        let journal = Arc::new(RequestJournal::new(journal_path.clone()).unwrap());
+        let payload = json!({"targets":["fixture"],"command":"true"});
+        let first = journal.execute("mixed", "jms_exec", &payload, |_| async { Ok(response) }).await.unwrap();
+        assert_eq!(first["completion_unknown"], true);
+        let reopened = Arc::new(RequestJournal::new(journal_path).unwrap());
+        assert_eq!(reopened.status("mixed", false).unwrap()["completion_unknown"], true);
+        let replay = reopened.execute("mixed", "jms_exec", &payload, |_| async {
+            panic!("journaled legacy execution must not replay")
+        }).await.unwrap();
+        assert_eq!(replay["completion_unknown"], true);
+        assert_eq!(replay["duplicate"], true);
+        assert_eq!(replay["results"][2]["result_id"], "unknown");
+        assert_eq!(replay["results"][2]["execution_state"], "unknown");
     }
 
     #[test]

@@ -18,11 +18,11 @@ async fn strict_policy_rejects_before_dispatch_and_reconciles_both_terminal_clos
     assert!(runtime.settings.require_request_id);
     for (tool, args, path) in [
         ("run", json!({"targets":["fixture"],"script_path":"/never-read"}), "/request_id"),
-        ("fs", json!({"action":"download","target":"fixture","path":"/source","options":{"local_path":"/unused"}}), "/request_id"),
-        ("terminal", json!({"action":"open","target":"fixture"}), "/request_id"),
-        ("terminal", json!({"action":"exec","session":"unallocated","script":"true"}), "/request_id"),
-        ("terminal", json!({"action":"write","session":"unallocated","options":{"eof":true}}), "/request_id"),
-        ("terminal", json!({"action":"close","session":"unallocated"}), "/request_id"),
+        ("fs", json!({"action":"download","target":"fixture","path":"/source","options":{"local_path":"/unused","timeout":50}}), "/request_id"),
+        ("terminal", json!({"action":"open","target":"fixture"}), "/options/request_id"),
+        ("terminal", json!({"action":"exec","session":"unallocated","script":"true"}), "/options/request_id"),
+        ("terminal", json!({"action":"write","session":"unallocated","options":{"eof":true}}), "/options/request_id"),
+        ("terminal", json!({"action":"close","session":"unallocated"}), "/options/request_id"),
         ("job", json!({"action":"submit","targets":["fixture"],"command":"true"}), "/request_id"),
         ("job", json!({"action":"cancel","target":"fixture","job_id":"abcd1234"}), "/request_id"),
         ("call", json!({"operation":"jms_job_cancel","arguments":{"host":"fixture","job_id":"abcd1234"}}), "/request_id"),
@@ -33,7 +33,10 @@ async fn strict_policy_rejects_before_dispatch_and_reconciles_both_terminal_clos
     ] {
         let error = server.dispatch(tool, args.as_object().unwrap().clone()).await.unwrap_err();
         assert!(error.message().contains("strict request ID"), "{tool} {args}: {error:?}");
-        assert!(format!("{error:?}").contains(path), "{error:?}");
+        let jms_bridge::errors::BridgeError::InvalidArguments { validation, .. } = error else {
+            panic!("expected structured validation");
+        };
+        assert_eq!(validation["path"], path);
     }
     assert_eq!(runtime.journal.active_tasks(), 0);
     for (tool, args) in [

@@ -138,11 +138,12 @@ impl BridgeServer {
             "run" => self.runtime.tool_run(flat.clone()).await?,
             "job" => self.runtime.tool_job(flat.clone()).await?,
             "fs" => self.runtime.tool_fs(flat.clone()).await.map_err(|error| {
-                if arguments
-                    .get("options")
-                    .and_then(|options| options.get("timeout"))
-                    .is_some()
-                {
+                if matches!(
+                    &error,
+                    BridgeError::InvalidArguments { validation, .. }
+                        if validation["path"].as_str().and_then(|pointer| pointer.strip_prefix('/'))
+                            .is_some_and(|key| arguments.get("options").is_some_and(|opts| opts.get(key).is_some()))
+                ) {
                     error.with_validation_prefix("/options")
                 } else {
                     error
