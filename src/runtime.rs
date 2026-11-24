@@ -600,6 +600,16 @@ require allow_dangerous=true",
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let pattern = arguments.get("pattern").and_then(Value::as_str);
+        if let Some(lines) = arguments.get("head_lines").and_then(Value::as_u64) {
+            if tail || pattern.is_some() {
+                return Err(BridgeError::invalid(
+                    "head_lines cannot be combined with tail or pattern",
+                ));
+            }
+            return self
+                .store
+                .read_head(&result_id, stream, offset, limit, lines as usize);
+        }
         self.store
             .read(&result_id, stream, offset, limit, tail, pattern)
     }

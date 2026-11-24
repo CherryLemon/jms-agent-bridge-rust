@@ -318,6 +318,27 @@ max_parallel = 2\n",
     assert_eq!(page["text"], json!("beta\n"));
     assert_eq!(page["next_offset"], json!(11));
 
+    let first_lines = server
+        .dispatch(
+            "read_result",
+            object(json!({"result_id": result_id, "head_lines": 2})),
+        )
+        .await
+        .expect("read first two saved lines");
+    assert_eq!(first_lines["text"], "alpha\nbeta\n");
+    assert_eq!(first_lines["next_offset"], 11);
+    assert_eq!(first_lines["eof"], false);
+    for args in [
+        json!({"result_id": result_id, "head_lines": 1, "pattern": "alpha"}),
+        json!({"result_id": result_id, "head_lines": 1, "tail": true}),
+    ] {
+        let error = server
+            .dispatch("read_result", object(args))
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("head_lines cannot be combined"));
+    }
+
     let meta = server
         .dispatch(
             "meta",
