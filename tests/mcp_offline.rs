@@ -947,6 +947,54 @@ max_parallel = 2\n",
             Value::Null,
             "parameters not applicable to action: line_count",
         ),
+        (
+            "terminal",
+            json!({"action":"exec","session":"offline-terminal-guard","script":":","options":{"result_id":"old","request_id":"terminal-option-rejected"}}),
+            "/options/result_id",
+            Value::Null,
+            Value::Null,
+            "result_id is only for terminal read",
+        ),
+        (
+            "terminal",
+            json!({"action":"write","session":"offline-terminal-guard","input":"x","options":{"expected_result_id":"old","request_id":"terminal-option-rejected"}}),
+            "/options/expected_result_id",
+            Value::Null,
+            Value::Null,
+            "command-scoped terminal write is unsupported: expected_result_id is only for terminal close",
+        ),
+        (
+            "terminal",
+            json!({"action":"close","session":"offline-terminal-guard","options":{"wait_for":"completed","request_id":"terminal-option-rejected"}}),
+            "/options/wait_for",
+            Value::Null,
+            Value::Null,
+            "wait_for is only for terminal exec, read or write",
+        ),
+        (
+            "call",
+            json!({"operation":"terminal_close","arguments":{"session":"offline-terminal-guard","wait_for":"completed","request_id":"terminal-option-rejected"}}),
+            "/arguments/wait_for",
+            Value::Null,
+            Value::Null,
+            "Invalid operation arguments at <args>; discover this operation for its schema",
+        ),
+        (
+            "terminal",
+            json!({"action":"exec","session":"offline-terminal-guard","script":":"}),
+            "",
+            Value::Null,
+            Value::Null,
+            "unknown terminal session",
+        ),
+        (
+            "call",
+            json!({"operation":"terminal_exec","arguments":{"session":"offline-terminal-guard","script":":"}}),
+            "",
+            Value::Null,
+            Value::Null,
+            "unknown terminal session",
+        ),
     ] {
         let reply: Value = client
             .post(&endpoint)
@@ -1008,6 +1056,7 @@ max_parallel = 2\n",
         let error = server.dispatch(name, object(arguments)).await.unwrap_err();
         assert_eq!(error.message(), "jms_fs requires one explicit REST target");
     }
+    assert!(runtime.request_status("terminal-option-rejected").await.is_err());
     http.abort();
 
     runtime.shutdown().await;
