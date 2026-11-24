@@ -1571,11 +1571,16 @@ require allow_dangerous=true",
         let hosts = self.resolve_many(&targets).await?;
         let mut outcomes = Vec::new();
         for host in hosts {
-            outcomes.push(
-                self.runner
-                    .exec_on_with_progress(&host, &command, timeout, true, true, true, progress)
-                    .await?,
-            );
+            match self.runner
+                .exec_on_with_progress(&host, &command, timeout, true, true, true, progress)
+                .await
+            {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(failure) if progress.is_some() => {
+                    return Ok(legacy_exec_failed_response(&self.store, &outcomes, &host.name, &failure));
+                }
+                Err(failure) => return Err(failure.error),
+            }
         }
         Ok(legacy_exec_response(&self.store, &outcomes, progress.is_some()))
     }
@@ -1903,6 +1908,19 @@ fn legacy_exec_response(store: &ResultStore, outcomes: &[ExecOutcome], journaled
     }
     let ok = rows.iter().all(|row| row.get("ok").and_then(Value::as_bool).unwrap_or(false));
     json!({"ok": ok, "results": rows})
+}
+
+fn legacy_exec_failed_response(
+    store: &ResultStore,
+    completed_attempts: &[ExecOutcome],
+    host: &str,
+    failure: &crate::execution::ExecFailure,
+) -> Value {
+    let mut response = legacy_exec_response(store, completed_attempts, true);
+    response["ok"] = json!(false);
+    response["results"].as_array_mut().expect("result rows")
+        .push(Value::Object(failure_row(host, failure)));
+    response
 }
 
 fn terminal_mutation(action: &str) -> bool {
@@ -3233,7 +3251,14 @@ mod tests {
         let legacy = legacy_exec_response(&store, &mixed, false);
         assert!(legacy["results"][2].get("execution_state").is_none());
         assert!(legacy["results"][2].get("completion_unknown").is_none());
-        let response = legacy_exec_response(&store, &mixed, true);
+        let response = legacy_exec_failed_response(
+            &store,
+            &mixed,
+            "store-error",
+            &crate::execution::ExecFailure::before_send("results", BridgeError::storage("fixture store failure")),
+        );
+        assert_eq!(response["results"][3]["execution_state"], "not_started");
+        assert_eq!(response["results"][3]["completion_unknown"], false);
         assert_eq!(response["results"][2]["executed"], Value::Null);
         assert_eq!(response["results"][2]["timed_out"], true);
         let journal_path = directory.path().join("requests");

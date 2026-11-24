@@ -62,3 +62,60 @@ async fn strict_policy_rejects_before_dispatch_and_reconciles_both_terminal_clos
         assert_eq!(reply["execution_replayed"], false);
     }
 }
+
+#[tokio::test]
+async fn legacy_exec_local_result_failure_is_not_started_and_reconciles_without_replay() {
+    use axum::{extract::Path, routing::get, Json, Router};
+    const FIRST: &str = "11111111-1111-1111-1111-111111111111";
+    const SECOND: &str = "22222222-2222-2222-2222-222222222222";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/api/v1/perms/users/my/assets/", get(|| async {
+            Json(json!({"count":2,"next":null,"results":[{"id":FIRST},{"id":SECOND}]}))
+        }))
+        .route("/api/v1/perms/users/my/assets/{id}/", get(|Path(id): Path<String>| async move {
+            Json(json!({"id":id, "name":id, "address":id, "is_active":true,
+                "permed_accounts":[{"username":"fixture","has_secret":true}],
+                "permed_protocols":[{"name":"ssh"}]}))
+        }));
+    let mock = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let state = dir.path().join("state");
+    std::fs::write(&config, format!(
+        "[bastion]\nurl = 'http://{address}'\nssh_port = 1\nlogin_user = 'fixture'\nsession_token = 'offline'\n[bridge]\nstate_dir = '{}'\n",
+        state.display()
+    )).unwrap();
+    let runtime = BridgeRuntime::start(Some(&config), false).await.unwrap();
+    let server = BridgeServer::new(runtime.clone());
+    let results = state.join("results");
+    std::fs::remove_dir(&results).unwrap();
+    std::fs::write(&results, "").unwrap();
+    let request = json!({"operation":"jms_exec","request_id":"local-store-failure",
+        "arguments":{"targets":[FIRST, SECOND],"command":"true"}, "detail":"full"});
+    let first = server.dispatch("call", request.as_object().unwrap().clone()).await.unwrap();
+    assert_eq!(first["request_state"], "complete", "{first}");
+    assert_eq!(first["completion_unknown"], false, "{first}");
+    assert_eq!(first["results"].as_array().unwrap().len(), 1);
+    assert_eq!(first["results"][0]["failure_stage"], "results");
+    assert_eq!(first["results"][0]["execution_state"], "not_started");
+    assert_eq!(first["results"][0]["executed"], false);
+    assert_eq!(first["results"][0]["completion_unknown"], false);
+    let mut unkeyed = request.as_object().unwrap().clone();
+    unkeyed.remove("request_id");
+    assert!(server.dispatch("call", unkeyed).await.is_err());
+    drop(server);
+    drop(runtime);
+    std::fs::remove_file(&results).unwrap();
+    let reopened = BridgeRuntime::start(Some(&config), false).await.unwrap();
+    // If the request were rerun, the new result store would allow a result to
+    // be created. Reconciliation neither contacts the fixture nor starts work.
+    mock.abort();
+    let duplicate = BridgeServer::new(reopened.clone())
+        .dispatch("call", request.as_object().unwrap().clone()).await.unwrap();
+    assert_eq!(duplicate["duplicate"], true);
+    assert_eq!(duplicate["execution_replayed"], false);
+    assert_eq!(duplicate["results"], first["results"]);
+    assert_eq!(std::fs::read_dir(&results).unwrap().count(), 0);
+}
