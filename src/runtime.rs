@@ -416,6 +416,11 @@ require allow_dangerous=true",
         if action != "read" && arguments.contains_key("result_id") {
             return Err(BridgeError::invalid("result_id is only for terminal read"));
         }
+        if action != "close" && arguments.contains_key("expected_result_id") {
+            return Err(BridgeError::invalid(
+                "expected_result_id is only for terminal close",
+            ));
+        }
         if matches!(action, "open" | "close") && arguments.contains_key("wait_for") {
             return Err(BridgeError::invalid(
                 "wait_for is only for terminal exec, read or write",
@@ -584,7 +589,13 @@ require allow_dangerous=true",
             }
             "close" => {
                 let session = used_string(&arguments, "session")?;
-                self.terminals.close(&session).await
+                let expected = arguments
+                    .contains_key("expected_result_id")
+                    .then(|| used_string(&arguments, "expected_result_id"))
+                    .transpose()?;
+                self.terminals
+                    .close_with_expected_result(&session, expected.as_deref())
+                    .await
             }
             other => Err(BridgeError::invalid(format!(
                 "unknown terminal action {other:?}"
