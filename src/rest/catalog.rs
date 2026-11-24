@@ -647,7 +647,7 @@ fn permission_denied(error: &BridgeError) -> bool {
 
 fn error_kind(error: &BridgeError) -> &'static str {
     match error {
-        BridgeError::Invalid(_) => "ValueError",
+        BridgeError::Invalid(_) | BridgeError::InvalidArguments { .. } => "ValueError",
         BridgeError::Config(_) => "ConfigError",
         BridgeError::Inventory(_) => "InventoryError",
         BridgeError::Rest(_) => "JumpServerError",

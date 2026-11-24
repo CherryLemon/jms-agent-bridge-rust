@@ -229,6 +229,13 @@ three bytes). Use the returned `next_offset` to continue even if the limit was
 reached in the middle of a line. Do not combine `head_lines` with `tail` or
 `pattern`.
 
+Schema validation failures keep the same MCP `isError` and JSON `error` text.
+The optional `validation` object gives an RFC 6901 JSON Pointer `path` from
+the submitted tool arguments (such as `/options/wait_ms` or
+`/arguments/timeout`), a short `message`, and applicable schema `expected`
+bounds or choices. A uniquely similar field name may appear as `suggestion`;
+the bridge never substitutes it or sends the rejected call.
+
 ### Execution contract
 
 * `execution_state`: `completed` (start and finish markers seen), `not_started`

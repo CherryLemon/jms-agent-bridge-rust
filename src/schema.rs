@@ -6,12 +6,16 @@
 //! length, `pattern`, array bounds and `items`. `oneOf`/`anyOf` are supported for the
 //! mutually exclusive execution shapes.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub struct SchemaError {
     pub path: String,
     pub message: String,
+    pointer: String,
+    detail: Option<String>,
+    expected: Option<Value>,
+    suggestion: Option<String>,
 }
 
 impl SchemaError {
@@ -19,8 +23,90 @@ impl SchemaError {
         Self {
             path: path.join("."),
             message: message.into(),
+            pointer: path.iter().map(|key| pointer_token(key)).collect(),
+            detail: None,
+            expected: None,
+            suggestion: None,
         }
     }
+
+    fn field(mut self, field: &str) -> Self {
+        self.pointer.push_str(&pointer_token(field));
+        self
+    }
+
+    fn expected(mut self, expected: Value) -> Self {
+        self.expected = Some(expected);
+        self
+    }
+
+    pub(crate) fn diagnostic(self, prefix: &str) -> Value {
+        let mut diagnostic = json!({
+            "path": format!("{prefix}{}", self.pointer),
+            "message": self.detail.unwrap_or(self.message),
+        });
+        if let Some(expected) = self.expected {
+            diagnostic["expected"] = expected;
+        }
+        if let Some(suggestion) = self.suggestion {
+            diagnostic["suggestion"] = json!(suggestion);
+        }
+        diagnostic
+    }
+}
+
+pub(crate) fn pointer_token(field: &str) -> String {
+    format!("/{}", field.replace('~', "~0").replace('/', "~1"))
+}
+
+/// Offer only one nearby identifier from this object's own schema. Work stays
+/// bounded on arbitrary input; ambiguous and non-identifier keys get no hint.
+fn suggest_field<'a>(actual: &str, candidates: impl Iterator<Item = &'a String>) -> Option<String> {
+    if !(4..=64).contains(&actual.len())
+        || !actual
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return None;
+    }
+    let actual = actual.as_bytes();
+    let mut near = candidates.filter(|field| {
+        let candidate = field.as_bytes();
+        if candidate.len() == actual.len() {
+            let mut different = (0..actual.len()).filter(|&i| actual[i] != candidate[i]);
+            match (different.next(), different.next(), different.next()) {
+                (Some(_), None, None) => true,
+                (Some(a), Some(b), None) => {
+                    b == a + 1 && actual[a] == candidate[b] && actual[b] == candidate[a]
+                }
+                _ => false,
+            }
+        } else if candidate.len().abs_diff(actual.len()) == 1 {
+            let (short, long) = if actual.len() < candidate.len() {
+                (actual, candidate)
+            } else {
+                (candidate, actual)
+            };
+            let first_diff = short
+                .iter()
+                .zip(long)
+                .position(|(a, b)| a != b)
+                .unwrap_or(short.len());
+            short[first_diff..] == long[first_diff + 1..]
+        } else {
+            false
+        }
+    });
+    let first = near.next()?;
+    near.next().is_none().then(|| first.clone())
+}
+
+fn numeric_bounds(schema: &serde_json::Map<String, Value>) -> Value {
+    let bounds = ["minimum", "maximum"]
+        .into_iter()
+        .filter_map(|name| schema.get(name).map(|v| (name.to_owned(), v.clone())))
+        .collect();
+    Value::Object(bounds)
 }
 
 impl std::fmt::Display for SchemaError {
@@ -47,12 +133,14 @@ fn walk(schema: &Value, value: &Value, path: &mut Vec<String>) -> Result<(), Sch
             return Err(SchemaError::new(
                 path,
                 format!("expected {kind}, got {}", json_type(value)),
-            ));
+            )
+            .expected(json!({"type": kind})));
         }
     }
     if let Some(Value::Array(options)) = schema.get("enum") {
         if !options.iter().any(|option| option == value) {
-            return Err(SchemaError::new(path, "value is not an allowed option"));
+            return Err(SchemaError::new(path, "value is not an allowed option")
+                .expected(json!({"enum": options})));
         }
     }
     if let Some(expected) = schema.get("const") {
@@ -72,7 +160,27 @@ fn walk(schema: &Value, value: &Value, path: &mut Vec<String>) -> Result<(), Sch
                 matches == 1
             };
             if !ok {
-                return Err(SchemaError::new(path, "value matches no allowed shape"));
+                // A uniquely type-compatible branch can pinpoint invalid data
+                // inside a union, without guessing between similar object shapes.
+                let mut compatible = branches.iter().filter(|branch| {
+                    branch
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_none_or(|kind| type_matches(kind, value))
+                });
+                let chosen = compatible.next().filter(|_| compatible.next().is_none());
+                let mut error = SchemaError::new(path, "value matches no allowed shape");
+                if matches == 0 {
+                    if let Some(cause) =
+                        chosen.and_then(|branch| walk(branch, value, &mut path.clone()).err())
+                    {
+                        error.pointer = cause.pointer;
+                        error.expected = cause.expected;
+                        error.suggestion = cause.suggestion;
+                        error.detail = Some(cause.detail.unwrap_or(cause.message));
+                    }
+                }
+                return Err(error);
             }
         }
     }
@@ -81,7 +189,9 @@ fn walk(schema: &Value, value: &Value, path: &mut Vec<String>) -> Result<(), Sch
             if let Some(Value::Array(required)) = schema.get("required") {
                 for key in required.iter().filter_map(Value::as_str) {
                     if !map.contains_key(key) {
-                        return Err(SchemaError::new(path, format!("missing required: {key}")));
+                        return Err(
+                            SchemaError::new(path, format!("missing required: {key}")).field(key)
+                        );
                     }
                 }
             }
@@ -94,10 +204,11 @@ fn walk(schema: &Value, value: &Value, path: &mut Vec<String>) -> Result<(), Sch
                 if let Some(properties) = properties {
                     for key in map.keys() {
                         if !properties.contains_key(key) {
-                            return Err(SchemaError::new(
-                                path,
-                                format!("unexpected property: {key}"),
-                            ));
+                            let mut error =
+                                SchemaError::new(path, format!("unexpected property: {key}"))
+                                    .field(key);
+                            error.suggestion = suggest_field(key, properties.keys());
+                            return Err(error);
                         }
                     }
                 }
@@ -199,12 +310,14 @@ fn walk(schema: &Value, value: &Value, path: &mut Vec<String>) -> Result<(), Sch
             let value = number.as_f64().unwrap_or(0.0);
             if let Some(min) = schema.get("minimum").and_then(Value::as_f64) {
                 if value < min {
-                    return Err(SchemaError::new(path, format!("must be >= {min}")));
+                    return Err(SchemaError::new(path, format!("must be >= {min}"))
+                        .expected(numeric_bounds(schema)));
                 }
             }
             if let Some(max) = schema.get("maximum").and_then(Value::as_f64) {
                 if value > max {
-                    return Err(SchemaError::new(path, format!("must be <= {max}")));
+                    return Err(SchemaError::new(path, format!("must be <= {max}"))
+                        .expected(numeric_bounds(schema)));
                 }
             }
             if schema.get("type").and_then(Value::as_str) == Some("integer")
