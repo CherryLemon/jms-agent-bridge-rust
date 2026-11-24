@@ -380,3 +380,54 @@ text costs more tokens under the selected encoding. Submit accounts for
 most of the token increase in all six comparisons (e.g. 1,751 → 2,729
 tokens in the HTTP above-concurrency run). These are aggregate results,
 not guarantees about individual runs or the model's billed input.
+
+### Offline: reversible submit projection
+
+This is an experiment for #15, not a server response mode. Replay each
+captured, successfully decoded result text through a local projection and
+compare both forms with the same tokenizer. Only direct Job submit can
+change: for an entirely acknowledged inline batch, omit each redundant
+`asset_id` when equal to `target`, and omit `launched: true` when
+`launch_state` is `acknowledged`. Re-expand to the original object and
+reject any mismatch. Preserve IDs, job handles, request state, scopes,
+continuations and other diagnostic fields. The staged, failed, ambiguous,
+unknown and explicitly duplicate/replayed examples are unchanged. The
+legacy façade, wait and logs are unchanged.
+
+```sh
+# Use the pinned release and the pre-populated tiktoken 0.12.0 cache.
+for case in one-target growing-log above-concurrency; do
+  python3 tools/mcp_job_projection.py --binary target/release/jms-bridge \
+    --server-git-sha 4b0e956aa9e4d7bb8a1173462744e76cc2587c7e \
+    --case "$case" --repeats 3 > "$case-projection.json"
+done
+```
+
+Same release binary and vocabulary hashes as the preceding section.
+Three workflows per façade/transport/case, 36 completed, no duplicate
+launches. Each public submit sample changes; all measured legacy submit,
+wait and log samples are identical. Table entries total three workflows,
+use `o200k_base`, and exclude outer JSON-RPC/MCP framing. Byte counts
+refer to decoded UTF-8 result text, not HTTP or stdio wire bytes.
+
+| Workload | Transport | Public submit text bytes | Public submit text tokens | Public workflow result tokens |
+| --- | --- | ---: | ---: | ---: |
+| One target | HTTP | 2,515 → 2,317 | 814 → 736 | 1,171 → 1,093 |
+| One target | stdio | 2,515 → 2,317 | 818 → 740 | 1,177 → 1,099 |
+| Growing log | HTTP | 2,515 → 2,317 | 806 → 728 | 3,331 → 3,253 |
+| Growing log | stdio | 2,515 → 2,317 | 815 → 737 | 3,355 → 3,277 |
+| Six targets | HTTP | 7,247 → 6,059 | 2,678 → 2,210 | 4,640 → 4,172 |
+| Six targets | stdio | 7,248 → 6,060 | 2,692 → 2,224 | 4,666 → 4,198 |
+
+For six targets, the projection cuts submit tokens by about 17%, and
+public workflow result tokens by 10%. Projected workflow totals still
+exceed matched legacy (HTTP 3,723; stdio 3,707).
+
+**Decision: defer changes to the server protocol.** The pairwise test
+verifies JSON parsing and semantic round-trip locally. The actual
+workflows consume the unmodified server replies; it does not establish
+projected client task completion, extra reads, latency or provider
+usage. None of the projection is sent over MCP. The benchmark does not
+change defaults or persisted receipts. Keep #15 open for terminal and
+explicit text formats, actual compact/full consumption, and integrated
+staged and lost-reply evaluation. No conditional output is prototyped.
