@@ -9,6 +9,11 @@ use serde_json::Value;
 pub enum BridgeError {
     #[error("{0}")]
     Invalid(String),
+    #[error("{message}")]
+    InvalidArguments {
+        message: String,
+        validation: Box<Value>,
+    },
     #[error("{0}")]
     Config(String),
     #[error("{0}")]
@@ -27,6 +32,21 @@ pub enum BridgeError {
 impl BridgeError {
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::Invalid(message.into())
+    }
+
+    pub(crate) fn invalid_arguments(message: impl Into<String>, validation: Value) -> Self {
+        Self::InvalidArguments {
+            message: message.into(),
+            validation: Box::new(validation),
+        }
+    }
+
+    pub(crate) fn tool_error_body(&self) -> Value {
+        let mut body = serde_json::json!({"ok": false, "error": self.message()});
+        if let Self::InvalidArguments { validation, .. } = self {
+            body["validation"] = (**validation).clone();
+        }
+        body
     }
 
     pub fn config(message: impl Into<String>) -> Self {

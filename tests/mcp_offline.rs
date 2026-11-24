@@ -639,6 +639,113 @@ max_parallel = 2\n",
             assert_eq!(body, json!({"unchanged": true}));
         }
     }
+    // Invalid calls must fail before executing and retain isError and the
+    // legacy error string while supplying a precise caller-visible pointer.
+    for (name, arguments, path, expected, suggestion, old_error) in [
+        (
+            "run",
+            json!({"targets":["worker"],"script":"printf test","max_output_bytes":255}),
+            "/max_output_bytes",
+            json!({"minimum":256, "maximum":16384}),
+            Value::Null,
+            "Invalid arguments at max_output_bytes: must be >= 256",
+        ),
+        (
+            "run",
+            json!({"targets":["worker"],"script":"printf test","options":{"max_output_bytes":16385}}),
+            "/options/max_output_bytes",
+            json!({"minimum":256, "maximum":16384}),
+            Value::Null,
+            "Invalid arguments at options.max_output_bytes: must be <= 16384",
+        ),
+        (
+            "terminal",
+            json!({"action":"read","session":"mock","options":{"wait_mss":1}}),
+            "/options/wait_mss",
+            Value::Null,
+            json!("wait_ms"),
+            "Invalid arguments at options: unexpected property: wait_mss",
+        ),
+        (
+            "terminal",
+            json!({"action":"raed","session":"mock"}),
+            "/action",
+            json!({"enum":["open","exec","read","write","close"]}),
+            Value::Null,
+            "Invalid arguments at action: value is not an allowed option",
+        ),
+        (
+            "run",
+            json!({"targets":["worker"],"script":"printf test","timeout":7,"options":{"timeout":12}}),
+            "/options/timeout",
+            Value::Null,
+            Value::Null,
+            "duplicate options: timeout",
+        ),
+        (
+            "run",
+            json!({"targets":["worker"],"script":"printf test","env":{"a/b~c":8}}),
+            "/env/a~1b~0c",
+            json!({"type":"string"}),
+            Value::Null,
+            "Invalid arguments at env.a/b~c: expected string, got integer",
+        ),
+        (
+            "call",
+            json!({"operation":"jms_job_wait","arguments":{"targets":["worker"],"job_id":"abcd1234","timeout":0}}),
+            "/arguments/timeout",
+            json!({"minimum":1,"maximum":180}),
+            Value::Null,
+            "Invalid operation arguments at timeout; discover this operation for its schema",
+        ),
+        (
+            "call",
+            json!({"operation":"jms_job_wait","arguments":{"targets":["worker"],"job_id":"abcd1234","timeoutt":3}}),
+            "/arguments/timeoutt",
+            Value::Null,
+            json!("timeout"),
+            "Invalid operation arguments at <args>; discover this operation for its schema",
+        ),
+        (
+            "job",
+            json!({"action":"wait","jobs":[{"target":"worker","jobid":"abcd1234"}]}),
+            "/jobs/0/job_id",
+            Value::Null,
+            Value::Null,
+            "Invalid arguments at jobs: value matches no allowed shape",
+        ),
+        (
+            "job",
+            json!({"action":"logs","job_id":"abcd1234"}),
+            "/target",
+            Value::Null,
+            Value::Null,
+            "Invalid operation arguments at <args>; discover this operation for its schema",
+        ),
+    ] {
+        let reply: Value = client
+            .post(&endpoint)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-06-18")
+            .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+                "params":{"name": name,"arguments": arguments}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        let body: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["ok"], false, "{body}");
+        assert_eq!(body["error"], old_error, "{body}");
+        assert_eq!(body["validation"]["path"], path, "{body}");
+        assert_eq!(body["validation"]["expected"], expected, "{body}");
+        assert_eq!(body["validation"]["suggestion"], suggestion, "{body}");
+    }
     http.abort();
 
     runtime.shutdown().await;

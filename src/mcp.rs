@@ -117,7 +117,7 @@ impl BridgeServer {
         let flat = flatten_options(name, arguments.clone())?;
         crate::schema::validate(&spec.input_schema, &Value::Object(arguments.clone())).map_err(
             |error| {
-                BridgeError::invalid(format!(
+                let message = format!(
                     "Invalid arguments at {}: {}",
                     if error.path.is_empty() {
                         "<args>".to_string()
@@ -125,7 +125,8 @@ impl BridgeServer {
                         error.path.clone()
                     },
                     error.message
-                ))
+                );
+                BridgeError::invalid_arguments(message, error.diagnostic(""))
             },
         )?;
         let value = match name {
@@ -171,13 +172,22 @@ fn flatten_options(
     let options = match arguments.remove("options") {
         Some(Value::Object(map)) => map,
         Some(Value::Null) | None => Map::new(),
-        Some(_) => return Err(BridgeError::invalid("options must be an object")),
+        Some(_) => {
+            return Err(BridgeError::invalid_arguments(
+                "options must be an object",
+                json!({"path": "/options", "message": "options must be an object",
+                   "expected": {"type": "object"}}),
+            ))
+        }
     };
     if options.is_empty() {
         return Ok(arguments);
     }
     if !matches!(name, "run" | "fs" | "terminal") {
-        return Err(BridgeError::invalid("this tool takes no options object"));
+        return Err(BridgeError::invalid_arguments(
+            "this tool takes no options object",
+            json!({"path": "/options", "message": "this tool takes no options object"}),
+        ));
     }
     let identity: &[&str] = match name {
         "terminal" => &["action"],
@@ -185,12 +195,19 @@ fn flatten_options(
     };
     for (key, value) in options {
         if identity.contains(&key.as_str()) {
-            return Err(BridgeError::invalid(format!(
-                "options must not redefine {key}; pass it as a top-level argument"
-            )));
+            let message =
+                format!("options must not redefine {key}; pass it as a top-level argument");
+            return Err(BridgeError::invalid_arguments(
+                &message,
+                json!({"path": format!("/options{}", crate::schema::pointer_token(&key)), "message": &message}),
+            ));
         }
         if arguments.contains_key(&key) {
-            return Err(BridgeError::invalid(format!("duplicate options: {key}")));
+            let message = format!("duplicate options: {key}");
+            return Err(BridgeError::invalid_arguments(
+                &message,
+                json!({"path": format!("/options{}", crate::schema::pointer_token(&key)), "message": &message}),
+            ));
         }
         arguments.insert(key, value);
     }
@@ -239,7 +256,7 @@ impl ServerHandler for BridgeServer {
                 Ok(CallToolResult::success(vec![ContentBlock::text(render(&value))]).into())
             }
             Err(error) => {
-                let body = json!({"ok": false, "error": error.message()});
+                let body = error.tool_error_body();
                 Ok(CallToolResult::error(vec![ContentBlock::text(render(&body))]).into())
             }
         }

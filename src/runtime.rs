@@ -818,7 +818,7 @@ require allow_dangerous=true",
         if let Some(request_id) = request_id {
             call.insert("request_id".into(), request_id);
         }
-        self.tool_call_impl(call, action == "submit").await
+        self.tool_call_impl(call, Some(&action)).await
     }
 
     async fn wait_job_handles(&self, payload: Map<String, Value>) -> BridgeResult<Value> {
@@ -859,13 +859,13 @@ require allow_dangerous=true",
     }
 
     pub async fn tool_call(self: &Arc<Self>, arguments: Map<String, Value>) -> BridgeResult<Value> {
-        self.tool_call_impl(arguments, false).await
+        self.tool_call_impl(arguments, None).await
     }
 
     async fn tool_call_impl(
         self: &Arc<Self>,
         arguments: Map<String, Value>,
-        job_submit_facade: bool,
+        direct_job_action: Option<&str>,
     ) -> BridgeResult<Value> {
         let operation = used_string(&arguments, "operation")?;
         let payload = match arguments.get("arguments") {
@@ -886,14 +886,25 @@ require allow_dangerous=true",
             .get("inputSchema")
             .ok_or_else(|| BridgeError::storage("operation schema is missing inputSchema"))?;
         crate::schema::validate(input, &Value::Object(payload.clone())).map_err(|error| {
-            BridgeError::invalid(format!(
+            let message = format!(
                 "Invalid operation arguments at {}; discover this operation for its schema",
                 if error.path.is_empty() {
                     "<args>".to_string()
                 } else {
                     error.path.clone()
                 }
-            ))
+            );
+            let prefix = if direct_job_action.is_some() {
+                ""
+            } else {
+                "/arguments"
+            };
+            let mut validation = error.diagnostic(prefix);
+            if matches!(direct_job_action, Some("logs" | "cancel")) && validation["path"] == "/host"
+            {
+                validation["path"] = json!("/target");
+            }
+            BridgeError::invalid_arguments(message, validation)
         })?;
         if let Some(request_id) = request_id {
             if operation != "jms_submit_job" {
@@ -917,7 +928,7 @@ require allow_dangerous=true",
             if let Some(map) = value.as_object_mut() {
                 map.insert("request_id".into(), Value::from(request_id.clone()));
             }
-            if job_submit_facade {
+            if direct_job_action == Some("submit") {
                 return stage_job_batch(
                     &self.store,
                     JobBatch::Submit,
