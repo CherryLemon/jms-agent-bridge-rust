@@ -202,6 +202,15 @@ Listings are paged (`offset`/`limit`, `next_offset` in the answer) and a `call` 
 response above 8 KiB is saved whole: the reply then carries `staged: true`, a
 business summary and a `result_id` that `read_result(stream="result")` reads back.
 
+For truncated `run` output, each affected stream in `preview_ranges` lists
+`shown` and `omitted` source byte offsets as half-open ranges, independent of
+JSON escaping or lossy text encoding. Stdout previews a prefix and stderr a
+suffix. Follow the read-only `next_action` where present; for more than one
+page, continue with `next_offset` until the omitted range ends. The output
+byte budget still applies across all targets; a row with no preview bytes
+can still give ranges for its retained output. Older receipts may lack ranges.
+
+
 For a saved stream, `read_result(head_lines=N)` stops at the Nth newline or the
 byte limit, whichever comes first (an ordinary UTF-8 page may extend by up to
 three bytes). Use the returned `next_offset` to continue even if the limit was

@@ -2153,7 +2153,7 @@ pub fn fanout_rows(
         if !result_id.is_empty() {
             // A result whose metadata never landed cannot be read back; that must not
             // hide the other targets' rows.
-            if let Ok(preview) = store.preview(&result_id, budget) {
+            if let Ok(preview) = store.run_preview(&result_id, budget) {
                 for (key, value) in preview {
                     row.insert(key, value);
                 }
