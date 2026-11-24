@@ -525,3 +525,37 @@ environment. This run covers a single authorized job and two rejection
 cases. Mixed outcomes, staged results, and the full failure-state
 reconciliation matrix still need their own evidence. No production
 access, server change or deployment.
+
+### Mixed wait receipt handoff between local bridge processes
+
+Use the pinned release with `tools/mcp_job_mixed_receipt.py`:
+
+```sh
+python3 tools/mcp_job_mixed_receipt.py \
+  --binary /path/to/pinned/jms-bridge \
+  --server-git-sha 4b0e956aa9e4d7bb8a1173462744e76cc2587c7e
+```
+
+The two-target canned fixture has one job that exits 7 and one that remains
+running through the wait deadline. The wait must retain both observations, with
+only the running handle in `pending` and only its read-only status call in
+`next_action`. After the origin bridge exits, the fixture makes the running
+job complete; this is a synthetic state transition, not a scheduler latency
+measurement. A second bridge process with its own HOME and state directory
+calls the emitted action twice, then reads the failed job's log once using the
+original handle. It must not reprobe the failed job or submit either job again.
+
+This covers a mixed **wait** after two acknowledged launches. It does not cover
+mixed launch acknowledgement, unknown submissions, original journal recovery,
+staged payloads, or real cross-host operation. The emulator never executes
+the received command. No runtime or protocol changes are made.
+
+Observed with release SHA-256
+`6d53b26e8ecf926d4c3d4458b4a11e5252f19c3a679d2ecfe99f3a0e88ddce7c`
+and fixture SHA-256
+`d4f26a820abad89a8660b38185cc5ae710b2cb6d9b568af4aeef6b539ebcad52`:
+
+| Transport | Workflows | Launches | Failed rows retained | Pending actions | Follower status reads | Failed log reads | Duplicate launches |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HTTP | 3 | 6 | 3 | 3 | 6 | 3 | 0 |
+| stdio | 3 | 6 | 3 | 3 | 6 | 3 | 0 |
