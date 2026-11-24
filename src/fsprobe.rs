@@ -15,6 +15,19 @@ pub const SCAN_LIMIT: u64 = 100_000;
 pub const SCAN_BYTES: u64 = 64 * 1024 * 1024;
 pub const WIRE_LIMIT: usize = 1024 * 1024;
 pub const DEFAULT_BYTES: usize = 4096;
+pub(crate) const FS_TIMEOUT_MIN: u64 = 1;
+pub(crate) const FS_EXPLORATION_TIMEOUT_MAX: u64 = 120;
+pub(crate) const FS_EXPLORATION_TIMEOUT_DEFAULT: u64 = 30;
+pub(crate) const FS_TRANSFER_TIMEOUT_MAX: u64 = 900;
+
+pub(crate) fn fs_timeout_limits(action: &str) -> (u64, u64) {
+    if matches!(action, "upload" | "download") {
+        (FS_TRANSFER_TIMEOUT_MAX, FS_TRANSFER_TIMEOUT_MAX)
+    } else {
+        (FS_EXPLORATION_TIMEOUT_MAX, FS_EXPLORATION_TIMEOUT_DEFAULT)
+    }
+}
+
 pub const PROBE_SOURCE: &str = include_str!("../resources/fs_probe.sh");
 
 #[derive(Debug, Clone, Default)]
@@ -197,7 +210,7 @@ pub fn remote_script(options: &FsOptions, rg_command: &str) -> Result<String, St
         args.push(values.len().to_string());
         args.extend(values);
     }
-    let timeout = options.timeout.unwrap_or(30);
+    let timeout = options.timeout.unwrap_or(FS_EXPLORATION_TIMEOUT_DEFAULT);
     let mut command = vec![
         "timeout".to_string(),
         "--signal=TERM".to_string(),
