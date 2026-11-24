@@ -1118,10 +1118,24 @@ require allow_dangerous=true",
                         "job logs takes tail or pattern, not both",
                     ));
                 }
-                if cursor.is_some() && (pattern.is_none() || arguments.contains_key("offset")) {
+                if tail && cursor.is_some() {
                     return Err(BridgeError::invalid(
-                        "job log cursor requires pattern and no offset",
+                        "job logs takes tail or cursor, not both",
                     ));
+                }
+                if let Some(cursor) = cursor {
+                    if cursor == crate::jobs::JOB_LOG_CURSOR_START && pattern.is_some() {
+                        return Err(BridgeError::invalid(
+                            "job log search starts with offset, not cursor=start",
+                        ));
+                    }
+                    if cursor != crate::jobs::JOB_LOG_CURSOR_START
+                        && arguments.contains_key("offset")
+                    {
+                        return Err(BridgeError::invalid(
+                            "job log continuation cursor cannot be combined with offset",
+                        ));
+                    }
                 }
                 if pattern
                     .is_some_and(|p| p.is_empty() || p.len() > crate::jobs::JOB_LOG_PATTERN_BYTES)
@@ -1138,7 +1152,7 @@ require allow_dangerous=true",
                         .await;
                 }
                 self.jobs
-                    .logs(&host, &job_id, offset, max_bytes, tail)
+                    .logs(&host, &job_id, offset, max_bytes, tail, cursor)
                     .await
             }
             "jms_job_cancel" => {
