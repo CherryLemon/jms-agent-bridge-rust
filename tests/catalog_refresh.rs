@@ -34,6 +34,7 @@ fn router(status: Arc<AtomicUsize>) -> Router {
 struct DetailOrder {
     slow: AtomicUsize,
     completed: Mutex<Vec<String>>,
+    earlier_returning: tokio::sync::Notify,
 }
 
 fn router_with_order(status: Arc<AtomicUsize>, order: Option<Arc<DetailOrder>>) -> Router {
@@ -64,9 +65,16 @@ fn router_with_order(status: Arc<AtomicUsize>, order: Option<Arc<DetailOrder>>) 
                             ASSET_B
                         };
                         if id == slow {
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            // A stored permit also covers the case where the early
+                            // request reaches this handler before the late request.
+                            order.earlier_returning.notified().await;
+                            order.completed.lock().unwrap().push(id.clone());
+                        } else {
+                            order.completed.lock().unwrap().push(id.clone());
+                            // Do not release the late handler until this handler has
+                            // recorded its response. Refreshes are serialized.
+                            order.earlier_returning.notify_one();
                         }
-                        order.completed.lock().unwrap().push(id.clone());
                     }
                     if id == ASSET_B {
                         match status.load(Ordering::SeqCst) {
