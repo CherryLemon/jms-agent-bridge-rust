@@ -841,6 +841,78 @@ max_parallel = 2\n",
             Value::Null,
             "job wait takes jobs or targets/job_id, not both",
         ),
+        (
+            "run",
+            json!({"targets":["worker"],"max_output_bytes":256}),
+            "",
+            Value::Null,
+            Value::Null,
+            "provide exactly one of script or script_path",
+        ),
+        (
+            "run",
+            json!({"targets":["worker"],"options":{"max_output_bytes":16384}}),
+            "",
+            Value::Null,
+            Value::Null,
+            "provide exactly one of script or script_path",
+        ),
+        (
+            "job",
+            json!({"action":"logs","target":"worker","job_id":"abcd1234","max_bytes":1023,"tail":true,"offset":0}),
+            "/max_bytes",
+            json!({"minimum":1024,"maximum":16384}),
+            Value::Null,
+            "Invalid arguments at max_bytes: must be >= 1024",
+        ),
+        (
+            "job",
+            json!({"action":"logs","target":"worker","job_id":"abcd1234","max_bytes":1024,"tail":true,"offset":0}),
+            "",
+            Value::Null,
+            Value::Null,
+            "job logs takes tail or offset, not both",
+        ),
+        (
+            "call",
+            json!({"operation":"jms_job_logs","arguments":{"host":"worker","job_id":"abcd1234","max_bytes":16384,"tail":true,"offset":0}}),
+            "",
+            Value::Null,
+            Value::Null,
+            "job logs takes tail or offset, not both",
+        ),
+        (
+            "terminal",
+            json!({"action":"read","session":"mock","options":{"wait_ms":30001,"max_bytes":16384}}),
+            "/options/wait_ms",
+            json!({"minimum":0,"maximum":30000}),
+            Value::Null,
+            "Invalid arguments at options.wait_ms: must be <= 30000",
+        ),
+        (
+            "terminal",
+            json!({"action":"read","session":"mock","options":{"wait_ms":30000,"max_bytes":16384}}),
+            "",
+            Value::Null,
+            Value::Null,
+            "unknown terminal session",
+        ),
+        (
+            "call",
+            json!({"operation":"terminal_read","arguments":{"session":"mock","wait_ms":0,"max_bytes":1}}),
+            "",
+            Value::Null,
+            Value::Null,
+            "unknown terminal session",
+        ),
+        (
+            "call",
+            json!({"operation":"terminal_read","arguments":{"session":"mock","wait_ms":0,"max_bytes":0}}),
+            "/arguments/max_bytes",
+            json!({"minimum":1,"maximum":16384}),
+            Value::Null,
+            "Invalid operation arguments at max_bytes; discover this operation for its schema",
+        ),
     ] {
         let reply: Value = client
             .post(&endpoint)
@@ -861,6 +933,10 @@ max_parallel = 2\n",
             serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(body["ok"], false, "{body}");
         assert_eq!(body["error"], old_error, "{body}");
+        if path.is_empty() {
+            assert!(body.get("validation").is_none(), "{body}");
+            continue;
+        }
         assert_eq!(body["validation"]["path"], path, "{body}");
         assert_eq!(body["validation"]["expected"], expected, "{body}");
         assert_eq!(body["validation"]["suggestion"], suggestion, "{body}");

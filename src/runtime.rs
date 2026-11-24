@@ -24,6 +24,13 @@ use crate::storage::journal::RequestJournal;
 use crate::storage::results::{now, ResultStore};
 use crate::terminal::{Interactive, ReadWait};
 
+pub(crate) const RUN_PREVIEW_MIN_BYTES: u64 = 256;
+pub(crate) const RUN_PREVIEW_MAX_BYTES: u64 = 16_384;
+pub(crate) const RUN_PREVIEW_DEFAULT_BYTES: u64 = 4096;
+pub(crate) const JOB_LOG_MIN_BYTES: u64 = 1024;
+pub(crate) const JOB_LOG_MAX_BYTES: u64 = 16_384;
+pub(crate) const JOB_LOG_DEFAULT_BYTES: u64 = 4096;
+
 pub struct BridgeRuntime {
     pub cfg: Arc<BastionConfig>,
     pub settings: Arc<BridgeSettings>,
@@ -213,15 +220,18 @@ impl BridgeRuntime {
         let max_output = arguments
             .get("max_output_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(4096) as usize;
-        if !(1.0..=600.0).contains(&timeout) || !(256..=16384).contains(&max_output) {
-            return Err(BridgeError::invalid(
-                "timeout must be 1..600 seconds; max_output_bytes must be 256..16384",
-            ));
+            .unwrap_or(RUN_PREVIEW_DEFAULT_BYTES);
+        if !(1.0..=600.0).contains(&timeout)
+            || !(RUN_PREVIEW_MIN_BYTES..=RUN_PREVIEW_MAX_BYTES).contains(&max_output)
+        {
+            return Err(BridgeError::invalid(format!(
+                "timeout must be 1..600 seconds; max_output_bytes must be {RUN_PREVIEW_MIN_BYTES}..{RUN_PREVIEW_MAX_BYTES}",
+            )));
         }
         if targets.is_empty() {
             return Err(BridgeError::invalid("targets must not be empty"));
         }
+        let max_output = max_output as usize;
         let spec = ExecSpec {
             cwd: arguments
                 .get("cwd")
@@ -306,7 +316,7 @@ impl BridgeRuntime {
         let preview_budget = arguments
             .get("max_output_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(4096) as usize;
+            .unwrap_or(RUN_PREVIEW_DEFAULT_BYTES) as usize;
         if let Some(pattern) = output_view
             .as_ref()
             .and_then(|view| view["pattern"].as_str())
@@ -1245,8 +1255,8 @@ require allow_dangerous=true",
                 let max_bytes = arguments
                     .get("max_bytes")
                     .and_then(Value::as_u64)
-                    .unwrap_or(4096)
-                    .clamp(1024, 16384);
+                    .unwrap_or(JOB_LOG_DEFAULT_BYTES)
+                    .clamp(JOB_LOG_MIN_BYTES, JOB_LOG_MAX_BYTES);
                 let tail = arguments
                     .get("tail")
                     .and_then(Value::as_bool)
@@ -1697,12 +1707,15 @@ impl PageOptions {
             .get("wait_ms")
             .and_then(Value::as_u64)
             .unwrap_or(crate::terminal::DEFAULT_TERMINAL_WAIT_MS)
-            .min(30_000);
+            .min(crate::terminal::MAX_TERMINAL_WAIT_MS);
         let max_bytes = arguments
             .get("max_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(4096)
-            .clamp(1, 16_384) as usize;
+            .unwrap_or(crate::terminal::DEFAULT_TERMINAL_PAGE_BYTES)
+            .clamp(
+                crate::terminal::MIN_TERMINAL_PAGE_BYTES,
+                crate::terminal::MAX_TERMINAL_PAGE_BYTES,
+            ) as usize;
         Self {
             wait_ms,
             wait_for_completion: arguments.get("wait_for").and_then(Value::as_str)
@@ -2237,7 +2250,7 @@ fn normalize_run_arguments(arguments: &Map<String, Value>) -> Value {
         arguments
             .get("max_output_bytes")
             .cloned()
-            .unwrap_or_else(|| json!(4096)),
+            .unwrap_or_else(|| json!(RUN_PREVIEW_DEFAULT_BYTES)),
     );
     out.insert(
         "allow_dangerous".into(),
