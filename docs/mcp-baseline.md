@@ -1,4 +1,4 @@
-# Offline MCP transport baseline (v2)
+# Offline MCP transport baseline (v3)
 
 Build the bridge from the revision being compared and run the same fixture on
 the same machine for both revisions. The Python 3.9+ harness uses the standard
@@ -52,6 +52,12 @@ actual declaration response sizes.
   touches no remote host and does not use byte-to-token estimates. A later
   loopback SSH/REST fixture with counters can cover actual remote job/log and
   terminal success paths, followed by a controlled lost-reply experiment.
+
+Report v3 adds `fixture_tasks`: a task is one full validated iteration of
+the offline fixture, excluding startup. First and subsequent iterations have
+separate task counts, calls, expected errors, payload bytes and wall-clock
+P50/P95. A one-repeat run leaves the subsequent group null. This metric does
+not stand in for a real submit → wait → logs replay or a remote SSH probe.
 
 The existing unit-test limit on the advertised declaration stays in place:
 `cargo test --lib advertised_tools_stay_within_their_token_budget`.
