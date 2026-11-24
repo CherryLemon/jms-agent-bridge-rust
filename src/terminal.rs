@@ -825,6 +825,20 @@ impl Interactive {
         cwd: Option<&str>,
         env: &[(String, String)],
     ) -> BridgeResult<Value> {
+        self.open_with_session(target, container, image, docker_args, cwd, env, None)
+            .await
+    }
+
+    pub(crate) async fn open_with_session(
+        &self,
+        target: &str,
+        container: Option<&str>,
+        image: Option<&str>,
+        docker_args: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        reserved_session: Option<String>,
+    ) -> BridgeResult<Value> {
         if target.eq_ignore_ascii_case("all") || target.contains(['*', '?', '[', ']']) {
             return Err(BridgeError::invalid("terminal needs one exact target"));
         }
@@ -879,14 +893,17 @@ impl Interactive {
                 return Err(error);
             }
         };
-        let mut session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-        {
+        let session = if let Some(session) = reserved_session {
+            session
+        } else {
+            let mut session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
             let bindings = self.bindings.lock().await;
             let lost = self.lost.lock().expect("lost lock");
             while bindings.contains_key(&session) || lost.contains_key(&session) {
                 session = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
             }
-        }
+            session
+        };
         let binding = Arc::new(AsyncMutex::new(Binding {
             session: session.clone(),
             host: host.clone(),
@@ -1597,6 +1614,27 @@ impl Interactive {
             let _ = self.close(&session).await;
         }
         let _ = self.save().await;
+    }
+
+    pub(crate) async fn session_state(&self, session: &str) -> &'static str {
+        let binding = self.bindings.lock().await.get(session).cloned();
+        let Some(binding) = binding else {
+            return "lost";
+        };
+        let binding = binding.lock().await;
+        if binding.closed {
+            "closed"
+        } else if binding.shell.is_closing() {
+            "lost"
+        } else if binding
+            .command
+            .as_ref()
+            .is_some_and(|command| command.try_lock().map(|command| command.is_busy()).unwrap_or(true))
+        {
+            "running"
+        } else {
+            "idle"
+        }
     }
 
     pub async fn sessions(&self) -> Value {

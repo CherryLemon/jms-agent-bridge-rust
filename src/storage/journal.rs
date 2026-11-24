@@ -411,6 +411,20 @@ fn valid_request_id(value: &str) -> bool {
 /// false mean the same request. Check older raw false fingerprints without
 /// invalidating saved receipts; true and all other business fields stay exact.
 fn request_fingerprints(operation: &str, arguments: &Value) -> (String, Option<String>) {
+    if operation == "terminal_exec" {
+        if let Some(args) = arguments.as_object() {
+            if matches!(args.get("action"), None) || args.get("action") == Some(&Value::from("exec")) {
+                let mut canonical = args.clone();
+                canonical.remove("action");
+                let fingerprint = fingerprint_of(operation, &Value::Object(canonical.clone()));
+                canonical.insert("action".into(), Value::from("exec"));
+                return (
+                    fingerprint,
+                    Some(fingerprint_of(operation, &Value::Object(canonical))),
+                );
+            }
+        }
+    }
     if operation == "jms_submit_job" {
         if let Some(args) = arguments.as_object() {
             if matches!(args.get("allow_dangerous"), None | Some(Value::Bool(false))) {

@@ -353,6 +353,7 @@ max_parallel = 2\n",
     // A pre-fix partial write was saved as executed=true even without START.
     // Both terminal and general metadata reads clarify it without migrating the file.
     legacy_partial_send_metadata_is_corrected_on_read(&runtime, &server).await;
+    terminal_request_identity_is_shared(&runtime, &server).await;
 
     // Failure counters stay visible in the receipts surface.
     let status = runtime.status().await;
@@ -769,6 +770,80 @@ max_parallel = 2\n",
     http.abort();
 
     runtime.shutdown().await;
+}
+
+async fn terminal_request_identity_is_shared(runtime: &BridgeRuntime, server: &BridgeServer) {
+    let modern = server.dispatch(
+        "terminal", object(json!({
+            "action":"open", "target":"*", "options":{"request_id":"terminal-open-test"}
+        })),
+    );
+    let legacy = server.dispatch(
+        "call", object(json!({
+            "operation":"terminal_open", "arguments":{"target":"*", "request_id":"terminal-open-test"}
+        })),
+    );
+    let (modern, legacy) = tokio::join!(modern, legacy);
+    let modern = modern.unwrap();
+    let legacy = legacy.unwrap();
+    assert_ne!(modern["duplicate"], legacy["duplicate"]);
+    let receipt = runtime.request_status("terminal-open-test").await.unwrap();
+    assert_eq!(receipt["request_state"], "failed");
+    assert_eq!(receipt["state"], "lost");
+    assert_eq!(receipt["session"].as_str().unwrap().len(), 32);
+    let retry = server.dispatch(
+        "terminal", object(json!({
+            "action":"open", "target":"*", "options":{"request_id":"terminal-open-test"}
+        })),
+    ).await.unwrap();
+    assert_eq!(retry["session"], receipt["session"]);
+    assert_eq!(retry["execution_replayed"], false);
+
+    let conflict = server.dispatch(
+        "terminal", object(json!({
+            "action":"open", "target":"*", "options":{
+                "request_id":"terminal-open-test","env":{"ENV":"changed"}
+            }
+        })),
+    ).await.unwrap_err();
+    assert!(conflict.message().contains("already claimed"));
+
+    // Simulate a process restart after persisting the reserved handle, but before
+    // publishing a response. No task owns the running receipt in the new runtime.
+    let interrupted = runtime.journal.directory("terminal-open-test")
+        .unwrap().join("state.json");
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&interrupted).unwrap()).unwrap();
+    saved["request_state"] = json!("running");
+    std::fs::write(&interrupted, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let after_restart = runtime.request_status("terminal-open-test").await.unwrap();
+    assert_eq!(after_restart["request_state"], "interrupted");
+    assert_eq!(after_restart["completion_unknown"], true);
+    assert_eq!(after_restart["session"], receipt["session"]);
+    assert_eq!(after_restart["state"], "lost");
+
+    let exec = runtime.journal.execute(
+        "terminal-exec-identity-test", "terminal_exec", &json!({
+            "action":"exec", "session":"not-live", "script":":"
+        }),
+        |_| async { Ok(json!({"ok":true,"proof":"one-command"})) },
+    ).await.unwrap();
+    assert_eq!(exec["request_state"], "complete");
+    let old_path = runtime.journal.directory("terminal-exec-identity-test")
+        .unwrap().join("state.json");
+    let mut old: Value = serde_json::from_slice(&std::fs::read(&old_path).unwrap()).unwrap();
+    old["fingerprint"] = json!(jms_bridge::storage::journal::fingerprint_of(
+        "terminal_exec",
+        &json!({"action":"exec","session":"not-live","script":":"}),
+    ));
+    std::fs::write(old_path, serde_json::to_vec(&old).unwrap()).unwrap();
+    for args in [
+        json!({"session":"not-live","script":":","options":{"request_id":"terminal-exec-identity-test","wait_ms":0}}),
+        json!({"action":"exec","session":"not-live","script":":","options":{"request_id":"terminal-exec-identity-test"}}),
+    ] {
+        let replay = server.dispatch("terminal", object(args)).await.unwrap();
+        assert_eq!(replay["proof"], "one-command");
+        assert_eq!(replay["duplicate"], true);
+    }
 }
 
 async fn legacy_partial_send_metadata_is_corrected_on_read(
