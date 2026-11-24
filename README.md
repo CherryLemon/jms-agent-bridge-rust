@@ -261,6 +261,12 @@ the bridge never substitutes it or sends the rejected call.
   `execution_replayed: false` plus the stored result; it does not run again.
   Recover a lost reply with `call(operation="request_status")` or
   `meta(ref="request:<id>")`.
+* For `job(action="cancel")` and `call(operation="jms_job_cancel")`, supply
+  the optional top-level `request_id` to claim the canonical asset and job pair
+  before sending a cancellation. An identical ID reconciles the first attempt;
+  the bridge never sends it again, including after a disconnect or restart.
+  If completion is unknown, check `request_status` and the remote job's status
+  before taking another action. Without `request_id`, cancellation behaves as before.
 * `queue_full` is an unsent per-target refusal: nothing ran, so retrying is safe.
 * `jms_job_wait` stops at `done`, `failed`, `cancelled` or `missing`. A scan that
   cannot finish inside the remaining budget reports `status:"unknown"` with

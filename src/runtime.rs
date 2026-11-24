@@ -911,9 +911,9 @@ require allow_dangerous=true",
         let action = used_string(&payload, "action")?;
         payload.remove("action");
         let request_id = payload.remove("request_id");
-        if action != "submit" && request_id.is_some() {
+        if !matches!(action.as_str(), "submit" | "cancel") && request_id.is_some() {
             return Err(BridgeError::invalid(
-                "job request_id applies only to submit",
+                "job request_id applies only to submit or cancel",
             ));
         }
         if action == "wait" && payload.contains_key("jobs") {
@@ -1051,9 +1051,20 @@ require allow_dangerous=true",
             artifact_paths(payload.get("artifact_paths"))?;
         }
         if let Some(request_id) = request_id {
+            if operation == "jms_job_cancel" {
+                // Canonicalize before claiming; an alias which now points at another
+                // asset cannot inherit an earlier receipt or send a new cancellation.
+                self.journal.directory(&request_id)?;
+                let host = self.resolve_one(&used_string(&payload, "host")?).await?;
+                let job_id = used_string(&payload, "job_id")?;
+                let runtime = self.clone();
+                return journal_job_cancel(&self.journal, &request_id, host, job_id, move |host, id| async move {
+                    runtime.jobs.cancel(&host, &id).await
+                }).await;
+            }
             if operation != "jms_submit_job" {
                 return Err(BridgeError::invalid(
-                    "call request_id currently supports only jms_submit_job",
+                    "call request_id supports only jms_submit_job or jms_job_cancel",
                 ));
             }
             let runtime = self.clone();
@@ -1817,6 +1828,42 @@ fn unknown_row(host: &str, message: &str) -> Map<String, Value> {
     .as_object()
     .cloned()
     .unwrap_or_default()
+}
+
+/// Claim the canonical job identity and save reconciliation data before resolving
+/// any cancellation outcome. The journal owns the invocation even if the caller drops.
+async fn journal_job_cancel<F, Fut>(
+    journal: &Arc<RequestJournal>,
+    request_id: &str,
+    host: Host,
+    job_id: String,
+    cancel: F,
+) -> BridgeResult<Value>
+where
+    F: FnOnce(Host, String) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = BridgeResult<Value>> + Send + 'static,
+{
+    if let Some(error) = validate_job_id(&job_id) {
+        return Err(BridgeError::invalid(error));
+    }
+    let asset_id = host
+        .asset_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| BridgeError::invalid("journaled job cancel requires a canonical asset ID"))?
+        .to_owned();
+    let identity = json!({"asset_id":asset_id, "job_id":job_id});
+    journal
+        .execute(request_id, "jms_job_cancel", &identity, move |progress| async move {
+            use crate::storage::journal::ProgressSink;
+            progress.record("cancellation_receipts", json!({
+                "asset_id":asset_id, "host":host.name, "job_id":job_id,
+            }))?;
+            let mut response = cancel(host, job_id).await?;
+            response["asset_id"] = json!(asset_id);
+            Ok(response)
+        })
+        .await
 }
 
 #[derive(Clone, Copy)]
@@ -3003,6 +3050,81 @@ mod tests {
     }
 
     /// The full chain: a launcher that refused must never look like a running job.
+    #[tokio::test]
+    async fn journaled_job_cancel_reconciles_without_reentering_after_a_dropped_caller() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RequestJournal::new(directory.path().to_path_buf()).unwrap());
+        let host = Host { name:"display".into(), asset_id:Some("canonical".into()), ..Host::default() };
+        let id = "abcd1234";
+        let request = "cancel-once";
+        let entered = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call = tokio::spawn({
+            let (journal, host, entered, finish, calls) =
+                (journal.clone(), host.clone(), entered.clone(), finish.clone(), calls.clone());
+            async move {
+                journal_job_cancel(&journal, request, host, id.into(), move |_, _| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    finish.notified().await;
+                    Ok(json!({"ok":false,"completion_unknown":true,"execution_state":"unknown"}))
+                }).await
+            }
+        });
+        entered.notified().await;
+        call.abort();
+        let _ = call.await;
+        let never = |_, _| async { panic!("a claimed cancellation must never be dispatched again") };
+        let in_flight = journal_job_cancel(&journal, request, Host { name:"renamed".into(), ..host.clone() }, id.into(), never).await.unwrap();
+        assert_eq!(in_flight["request_state"], "running");
+        assert_eq!(in_flight["cancellation_receipts"][0]["job_id"], id);
+        assert_eq!(in_flight["cancellation_receipts"][0]["asset_id"], "canonical");
+        assert!(!in_flight["execution_replayed"].as_bool().unwrap());
+        assert!(journal_job_cancel(&journal, request, Host {asset_id:Some("other".into()), ..host.clone()}, id.into(), never).await.is_err());
+        assert!(journal_job_cancel(&journal, request, host.clone(), "f00d1234".into(), never).await.is_err());
+        finish.notify_one();
+        journal.drain().await;
+        let reopened = Arc::new(RequestJournal::new(directory.path().to_path_buf()).unwrap());
+        let finished = journal_job_cancel(&reopened, request, host, id.into(), never).await.unwrap();
+        assert_eq!(finished["request_state"], "complete");
+        assert_eq!(finished["asset_id"], "canonical");
+        assert_eq!(finished["completion_unknown"], true);
+        assert_eq!(finished["duplicate"], true);
+        assert_eq!(finished["execution_replayed"], false);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn interrupted_cancel_claim_never_dispatches_on_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = Host {
+            name: "host".into(),
+            asset_id: Some("canonical".into()),
+            ..Host::default()
+        };
+        let job_id = "abcd1234";
+        let request_id = "interrupted-cancel";
+        {
+            let journal = RequestJournal::new(directory.path().to_path_buf()).unwrap();
+            assert!(journal.claim(
+                request_id,
+                "jms_job_cancel",
+                &json!({"asset_id":"canonical","job_id":job_id})
+            ).unwrap().0);
+        }
+        let reopened = Arc::new(RequestJournal::new(directory.path().to_path_buf()).unwrap());
+        let reply = journal_job_cancel(&reopened, request_id, host, job_id.into(), |_, _| async {
+            panic!("an interrupted request must only reconcile")
+        }).await.unwrap();
+        assert_eq!(reply["request_state"], "interrupted");
+        assert_eq!(reply["completion_unknown"], true);
+        assert_eq!(reply["execution_replayed"], false);
+    }
+
     #[test]
     fn job_rows_distinguish_acknowledged_rejected_and_unknown() {
         let handle = |state| crate::jobs::JobHandle {
