@@ -112,6 +112,22 @@ max_parallel = 2\n",
         );
     }
 
+    let paired_tail_error = server
+        .dispatch(
+            "job",
+            object(json!({
+                "action":"wait","jobs":[{"target":"all","job_id":"abcd1234"}],"tail":true
+            })),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        paired_tail_error
+            .message()
+            .contains("exact permitted target"),
+        "{paired_tail_error}"
+    );
+
     // Seed a mocked launch under the legacy operation, keeping it in-flight.
     // Both public entry points must attach to that receipt, not call a launcher.
     let request_id = "facade-legacy-shared-id";

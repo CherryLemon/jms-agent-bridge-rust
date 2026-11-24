@@ -671,6 +671,78 @@ where
     (collect_rows(pairs, &last, !finished), finished)
 }
 
+const FAILURE_TAIL_SOURCE_BYTES: u64 = 256;
+const FAILURE_TAIL_MAX_PROBES: usize = 4;
+const FAILURE_TAIL_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn failure_tail_page(value: &Value) -> Option<Value> {
+    if value["ok"] != true {
+        return None;
+    }
+    let start = value.get("offset")?.as_u64()?;
+    let end = value.get("next_offset")?.as_u64()?;
+    let size = value.get("size")?.as_u64()?;
+    let consumed = end.checked_sub(start)?;
+    let text = value.get("log")?.as_str()?;
+    // Lossy UTF-8 decoding can expand one source byte to three text bytes.
+    if consumed == 0
+        || consumed > FAILURE_TAIL_SOURCE_BYTES
+        || end > size
+        || text.len() as u64 > consumed * 3
+    {
+        return None;
+    }
+    Some(json!({"offset":start,"next_offset":end,"text":text}))
+}
+
+/// Optional diagnostics over already-known failures. The status phase remains
+/// authoritative; no diagnostic (success, error or timeout) changes its verdict.
+async fn attach_failure_tails<F, Fut>(
+    pairs: &[(Host, String)],
+    rows: &mut [Value],
+    wait_deadline: tokio::time::Instant,
+    probe: F,
+) where
+    F: Fn(Host, String) -> Fut,
+    Fut: std::future::Future<Output = BridgeResult<Value>>,
+{
+    use futures::{stream::FuturesUnordered, StreamExt};
+    use tokio::time::{sleep_until, Instant};
+    let deadline = wait_deadline.min(Instant::now() + FAILURE_TAIL_MAX_TIME);
+    if Instant::now() >= deadline {
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut reads = FuturesUnordered::new();
+    for (index, ((host, id), row)) in pairs.iter().zip(rows.iter()).enumerate() {
+        if row["ok"] != true || row["status"] != "failed" || !seen.insert(pair_key(host, id)) {
+            continue;
+        }
+        let probe = &probe;
+        reads.push(async move {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let value = probe(host.clone(), id.clone()).await.ok()?;
+            Some((index, failure_tail_page(&value)?))
+        });
+        if reads.len() >= FAILURE_TAIL_MAX_PROBES {
+            break;
+        }
+    }
+    while !reads.is_empty() && Instant::now() < deadline {
+        tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => break,
+            read = reads.next() => {
+                if let Some(Some((index, page))) = read {
+                    rows[index]["failure_tail"] = page;
+                }
+            }
+        }
+    }
+}
+
 pub struct Jobs {
     runner: Arc<Runner>,
 }
@@ -1054,6 +1126,19 @@ echo \"status_before=$status_before\""
         .await
     }
 
+    pub(crate) async fn failure_tails(
+        &self,
+        pairs: &[(Host, String)],
+        status: &mut [Value],
+        deadline: tokio::time::Instant,
+    ) {
+        attach_failure_tails(pairs, status, deadline, |host, id| async move {
+            self.logs(&host, &id, 0, FAILURE_TAIL_SOURCE_BYTES, true, None)
+                .await
+        })
+        .await;
+    }
+
     pub async fn cancel_many(&self, pairs: &[(Host, String)]) -> Vec<Value> {
         let mut out = Vec::new();
         for (host, job_id) in pairs {
@@ -1079,6 +1164,97 @@ mod tests {
             workdir: workdir.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn optional_failure_tails_preserve_rows_and_stop_at_the_wait_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::time::Instant;
+        let pairs: Vec<_> = (0..7).map(|i| (host(None), format!("{i:08x}"))).collect();
+        let mut rows: Vec<_> = pairs.iter().enumerate().map(|(i, (_, id))|
+            json!({"job_id":id,"status":if i == 0 {"done"} else if i == 6 {"running"} else {"failed"},
+                "ok":true,"exit_code":i})).collect();
+        let original = rows.clone();
+        let count = AtomicUsize::new(0);
+        let deadline = Instant::now() + Duration::from_millis(17);
+        attach_failure_tails(&pairs, &mut rows, deadline, |_, id| {
+            count.fetch_add(1, Ordering::Relaxed);
+            async move {
+                match id.as_str() {
+                    "00000001" => std::future::pending().await,
+                    "00000002" => {
+                        Ok(json!({"ok":true,"size":200,"offset":197,"next_offset":200,"log":"bad"}))
+                    }
+                    "00000003" => Err(BridgeError::invalid(
+                        "denied; do not expose this diagnostic",
+                    )),
+                    "00000004" => {
+                        Ok(json!({"ok":true,"size":0,"offset":0,"next_offset":0,"log":""}))
+                    }
+                    _ => panic!("only four eligible failed pairs are probed"),
+                }
+            }
+        })
+        .await;
+        assert_eq!(Instant::now(), deadline);
+        assert_eq!(count.load(Ordering::Relaxed), 4);
+        assert_eq!(
+            rows[2].as_object_mut().unwrap().remove("failure_tail"),
+            Some(json!({"offset":197,"next_offset":200,"text":"bad"}))
+        );
+        assert_eq!(rows, original);
+
+        attach_failure_tails(&pairs, &mut rows, deadline, |_, _| {
+            count.fetch_add(1, Ordering::Relaxed);
+            std::future::pending::<BridgeResult<Value>>()
+        })
+        .await;
+        assert_eq!(count.load(Ordering::Relaxed), 4);
+        assert_eq!(rows, original);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn optional_failure_tail_budget_is_at_most_one_second_and_deduplicated() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::time::Instant;
+        let pair = (host(None), "00000007".to_string());
+        let pairs = [pair.clone(), pair];
+        let mut rows = [
+            json!({"status":"failed","ok":true}),
+            json!({"status":"failed","ok":true}),
+        ];
+        let original = rows.clone();
+        let calls = AtomicUsize::new(0);
+        let start = Instant::now();
+        attach_failure_tails(
+            &pairs,
+            &mut rows,
+            start + Duration::from_secs(30),
+            |_, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                std::future::pending::<BridgeResult<Value>>()
+            },
+        )
+        .await;
+        assert_eq!(Instant::now() - start, Duration::from_secs(1));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(rows, original);
+    }
+
+    #[test]
+    fn failure_tail_has_independent_source_and_text_budgets() {
+        let replaced = "�".repeat(FAILURE_TAIL_SOURCE_BYTES as usize);
+        let valid = json!({"ok":true,"offset":44,"next_offset":300,"size":300,"log":replaced});
+        let tail = failure_tail_page(&valid).unwrap();
+        assert_eq!(tail["text"].as_str().unwrap().len(), 768);
+        let mut too_many_source = valid.clone();
+        too_many_source["offset"] = json!(43);
+        assert!(failure_tail_page(&too_many_source).is_none());
+        let mut too_many_text = valid;
+        too_many_text["offset"] = json!(299);
+        assert!(failure_tail_page(&too_many_text).is_none());
     }
 
     #[test]

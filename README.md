@@ -317,6 +317,17 @@ Pass that object unchanged as `jobs` to continue; the bridge checks each target
 against the current permitted inventory before probing it. Legacy
 `call(operation="jms_job_wait")` with a single ID is unchanged.
 
+For paired-handle `job(action="wait", jobs=..., tail=true)`, optionally add a
+`failure_tail` to verified `failed` status rows. This is skipped by default.
+Only the first four distinct failed pairs are probed, in parallel, within
+the remaining wait deadline and for at most one extra second after status
+collection. Missing, denied, or late tails are omitted without changing
+status, exit code, or pending handles. Each tail reads at most 256 source
+bytes, with byte offsets and up to 768 UTF-8 text bytes after lossy decoding.
+Tails are omitted if they would force otherwise inline status rows to be
+staged. This is a best-effort excerpt, not a complete log or a wait prerequisite.
+
+
 An inline `jobs` or `pending` array marked `remote_job` can be copied to another
 bridge. The receiving bridge must resolve the same asset, use an account that
 can read the same remote job state, and resolve the same job directory. The

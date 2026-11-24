@@ -824,7 +824,7 @@ require allow_dangerous=true",
     async fn wait_job_handles(&self, payload: Map<String, Value>) -> BridgeResult<Value> {
         if payload
             .keys()
-            .any(|key| !matches!(key.as_str(), "jobs" | "timeout" | "interval"))
+            .any(|key| !matches!(key.as_str(), "jobs" | "timeout" | "interval" | "tail"))
         {
             return Err(BridgeError::invalid(
                 "job wait takes jobs or targets/job_id, not both",
@@ -850,7 +850,10 @@ require allow_dangerous=true",
             return stage_job_batch(&self.store, JobBatch::Wait, inventory_timeout_rows(jobs));
         };
         let pairs = inventory.resolve_job_targets(&handles)?;
-        let (status, finished) = self.jobs.wait_until(&pairs, deadline, interval).await;
+        let (mut status, finished) = self.jobs.wait_until(&pairs, deadline, interval).await;
+        if payload.get("tail").and_then(Value::as_bool) == Some(true) {
+            self.jobs.failure_tails(&pairs, &mut status, deadline).await;
+        }
         stage_job_batch(
             &self.store,
             JobBatch::Wait,
@@ -1692,6 +1695,23 @@ fn stage_job_batch(store: &ResultStore, scope: JobBatch, mut value: Value) -> Br
     if bytes.len() <= OPERATION_BUDGET {
         return Ok(value);
     }
+    // Optional diagnostics must not turn an inline status response into a
+    // staged one. Never strip unrelated fields or change the primary verdicts.
+    if matches!(scope, JobBatch::Wait)
+        && value["status"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row.get("failure_tail").is_some()))
+    {
+        let mut status_only = value.clone();
+        if let Some(rows) = status_only["status"].as_array_mut() {
+            for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+                row.remove("failure_tail");
+            }
+        }
+        if serde_json::to_vec(&status_only)?.len() <= OPERATION_BUDGET {
+            return Ok(status_only);
+        }
+    }
     let metadata = json!({"kind":JOB_BATCH_RESULT,"operation":operation,
                           "handle_section":section,"bytes":bytes.len()})
     .as_object()
@@ -2204,6 +2224,20 @@ mod tests {
         let mut raw = raw;
         mark_job_recovery(&mut raw, "jobs");
         assert_eq!(full, raw);
+    }
+
+    #[test]
+    fn optional_tails_cannot_push_primary_wait_rows_into_staging() {
+        let (_dir, store) = job_test_store();
+        let original = json!({
+            "ok":true,"finished":true,"pending":[],
+            "status":[{"status":"failed","exit_code":7,"note":"x".repeat(OPERATION_BUDGET - 200)}]
+        });
+        let mut annotated = original.clone();
+        annotated["status"][0]["failure_tail"] = json!({"offset":10,"next_offset":266,
+            "text":"x".repeat(256)});
+        let retained = stage_job_batch(&store, JobBatch::Wait, annotated).unwrap();
+        assert_eq!(retained, original);
     }
 
     #[test]
