@@ -176,7 +176,10 @@ an uncached response, which can outweigh the payload of a one-line lookup;
 caching is most useful for repeated lists and full schemas.
 
 `topic="assets"` uses a separate `inventory_version` for the authorized
-snapshot and a page-specific `etag`. A matching `if_none_match` returns
+snapshot and a page-specific `etag`. Asset rows are ordered by normalized
+asset ID before they are persisted, paged, or hashed. Duplicate IDs are
+retained, with ties ordered by the serialized row.
+A matching `if_none_match` returns
 `unchanged: true`, the version and `last_success`. Tags are scoped to the
 issuing bridge and exact query, representation, limit and offset. The bridge
 does not return a hit for snapshots only loaded from disk, stale snapshots,
