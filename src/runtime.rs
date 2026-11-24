@@ -22,7 +22,7 @@ use crate::scheduler::{queue_rejection, Lane};
 use crate::schemas::{self, DANGEROUS_FLAG_DESCRIPTION};
 use crate::storage::journal::RequestJournal;
 use crate::storage::results::{now, ResultStore};
-use crate::terminal::Interactive;
+use crate::terminal::{Interactive, ReadWait};
 
 pub struct BridgeRuntime {
     pub cfg: Arc<BastionConfig>,
@@ -408,13 +408,18 @@ require allow_dangerous=true",
             .map(str::to_string);
         let identity = |map: &Map<String, Value>| {
             let mut identity = map.clone();
-            for key in ["request_id", "wait_ms", "max_bytes", "cursor"] {
+            for key in ["request_id", "wait_ms", "wait_for", "max_bytes", "cursor"] {
                 identity.remove(key);
             }
             identity
         };
         if action != "read" && arguments.contains_key("result_id") {
             return Err(BridgeError::invalid("result_id is only for terminal read"));
+        }
+        if matches!(action, "open" | "close") && arguments.contains_key("wait_for") {
+            return Err(BridgeError::invalid(
+                "wait_for is only for terminal exec, read or write",
+            ));
         }
         match action {
             "open" => {
@@ -454,11 +459,11 @@ require allow_dangerous=true",
                             move |progress| async move {
                                 let sink: Arc<dyn crate::storage::journal::ProgressSink> = progress;
                                 terminals
-                                    .execute(
+                                    .execute_with_wait(
                                         &session,
                                         &script,
                                         allow,
-                                        page.wait_ms,
+                                        page.read_wait(),
                                         page.max_bytes,
                                         page.cursor.as_ref(),
                                         Some(sink.as_ref()),
@@ -475,11 +480,11 @@ require allow_dangerous=true",
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 self.terminals
-                    .execute(
+                    .execute_with_wait(
                         &session,
                         &script,
                         allow,
-                        page.wait_ms,
+                        page.read_wait(),
                         page.max_bytes,
                         page.cursor.as_ref(),
                         None,
@@ -492,17 +497,22 @@ require allow_dangerous=true",
                     let result_id = used_string(&arguments, "result_id")?;
                     return self
                         .terminals
-                        .read_result(
+                        .read_result_with_wait(
                             &session,
                             &result_id,
-                            page.wait_ms,
+                            page.read_wait(),
                             page.max_bytes,
                             page.cursor.as_ref(),
                         )
                         .await;
                 }
                 self.terminals
-                    .read(&session, page.wait_ms, page.max_bytes, page.cursor.as_ref())
+                    .read_with_wait(
+                        &session,
+                        page.read_wait(),
+                        page.max_bytes,
+                        page.cursor.as_ref(),
+                    )
                     .await
             }
             "write" => {
@@ -524,7 +534,7 @@ require allow_dangerous=true",
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     let cursor = page.cursor.clone();
-                    let (wait_ms, max_bytes) = (page.wait_ms, page.max_bytes);
+                    let (wait, max_bytes) = (page.read_wait(), page.max_bytes);
                     return self
                         .journal
                         .execute(
@@ -533,13 +543,13 @@ require allow_dangerous=true",
                             &Value::Object(work),
                             move |_progress| async move {
                                 terminals
-                                    .write(
+                                    .write_with_wait(
                                         &session,
                                         input.as_deref(),
                                         signal.as_deref(),
                                         eof,
                                         allow,
-                                        wait_ms,
+                                        wait,
                                         max_bytes,
                                         cursor.as_ref(),
                                     )
@@ -560,13 +570,13 @@ require allow_dangerous=true",
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 self.terminals
-                    .write(
+                    .write_with_wait(
                         &session,
                         input,
                         signal,
                         eof,
                         allow,
-                        page.wait_ms,
+                        page.read_wait(),
                         page.max_bytes,
                         page.cursor.as_ref(),
                     )
@@ -1423,6 +1433,7 @@ require allow_dangerous=true",
 
 pub struct PageOptions {
     pub wait_ms: u64,
+    wait_for_completion: bool,
     pub max_bytes: usize,
     pub cursor: Option<Value>,
 }
@@ -1441,8 +1452,18 @@ impl PageOptions {
             .clamp(1, 16_384) as usize;
         Self {
             wait_ms,
+            wait_for_completion: arguments.get("wait_for").and_then(Value::as_str)
+                == Some("completed"),
             max_bytes,
             cursor: arguments.get("cursor").cloned(),
+        }
+    }
+
+    fn read_wait(&self) -> ReadWait {
+        if self.wait_for_completion {
+            ReadWait::Completed(self.wait_ms)
+        } else {
+            ReadWait::Output(self.wait_ms)
         }
     }
 }
@@ -2271,6 +2292,15 @@ mod tests {
 
     #[test]
     fn terminal_page_wait_defaults_to_fifteen_seconds() {
+        assert!(matches!(
+            PageOptions::from(&Map::new()).read_wait(),
+            ReadWait::Output(15_000)
+        ));
+        let completed = json!({"wait_for":"completed","wait_ms":u64::MAX});
+        assert!(matches!(
+            PageOptions::from(completed.as_object().unwrap()).read_wait(),
+            ReadWait::Completed(30_000)
+        ));
         assert_eq!(PageOptions::from(&Map::new()).wait_ms, 15_000);
         assert_eq!(
             PageOptions::from(json!({"wait_ms": 0}).as_object().unwrap()).wait_ms,

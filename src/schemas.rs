@@ -174,7 +174,7 @@ reuse handle. Running is not completion; reads honour cursors.",
                     "script": {"type": "string", "maxLength": 1048576, "description": "exec: literal Bash."},
                     "input": {"type": "string", "maxLength": 1048576, "description": "write: bytes for a foreground command."},
                     "options": {"type": "object", "additionalProperties": false,
-                        "description": "open: target/container/image/cwd/env. exec/read/write: wait_ms, max_bytes, cursor, signal, eof, allow_dangerous, request_id.",
+                        "description": "open: target/container/image/cwd/env. exec/read/write: wait_ms, wait_for, max_bytes, cursor, signal, eof, allow_dangerous, request_id.",
                         "properties": {
                             "target": string("open: one exact REST asset."),
                             "container": string("open: existing container."),
@@ -182,7 +182,8 @@ reuse handle. Running is not completion; reads honour cursors.",
                             "docker_args": {"type": "array", "items": {"type": "string"}},
                             "cwd": string("open: directory for the bound shell."),
                             "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                            "wait_ms": integer(0, 30000, crate::terminal::DEFAULT_TERMINAL_WAIT_MS, "Maximum wait; returns earlier on output or completion."),
+                            "wait_ms": integer(0, 30000, crate::terminal::DEFAULT_TERMINAL_WAIT_MS, "Maximum observation wait in milliseconds."),
+                            "wait_for": terminal_wait_policy(),
                             "max_bytes": integer(1, 16384, 4096, "Output budget per stream."),
                             "cursor": {"type": "object", "additionalProperties": false,
                                        "properties": {"stdout": {"type": "integer", "minimum": 0},
@@ -590,10 +591,16 @@ original ID after reply loss; reusing it never replays.",
     map
 }
 
+fn terminal_wait_policy() -> Value {
+    json!({"type": "string", "enum": ["output", "completed"], "default": "output",
+           "description": "Return on output or completion (default), or wait only for terminal state."})
+}
+
 fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
     let pages = || {
         json!({
             "wait_ms": int(0, 30000, crate::terminal::DEFAULT_TERMINAL_WAIT_MS),
+            "wait_for": terminal_wait_policy(),
             "max_bytes": int(1, 16384, 4096),
             "cursor": {"type": "object", "additionalProperties": false,
                        "properties": {"stdout": {"type": "integer", "minimum": 0},
@@ -1096,6 +1103,43 @@ mod tests {
                     "allow_dangerous": value,
                 });
                 assert_eq!(validate(schema, &args).is_ok(), valid);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_wait_policy_is_validated_in_full_and_legacy_schemas() {
+        let terminal = full_specs()
+            .into_iter()
+            .find(|tool| tool.name == "terminal")
+            .unwrap();
+        let legacy = operations();
+        for (action, required) in [
+            ("exec", json!({"session":"s","script":":"})),
+            ("read", json!({"session":"s"})),
+            ("write", json!({"session":"s","input":"yes"})),
+        ] {
+            for (policy, wait_ms, valid) in [
+                ("output", 0, true),
+                ("completed", 30_000, true),
+                ("completed", 30_001, false),
+                ("invalid", 1, false),
+            ] {
+                let mut public = required.clone();
+                public["action"] = json!(action);
+                public["options"] = json!({"wait_for":policy,"wait_ms":wait_ms});
+                assert_eq!(validate(&terminal.input_schema, &public).is_ok(), valid);
+                let mut old = required.clone();
+                old["wait_for"] = json!(policy);
+                old["wait_ms"] = json!(wait_ms);
+                assert_eq!(
+                    validate(
+                        &legacy[format!("terminal_{action}").as_str()]["inputSchema"],
+                        &old
+                    )
+                    .is_ok(),
+                    valid
+                );
             }
         }
     }

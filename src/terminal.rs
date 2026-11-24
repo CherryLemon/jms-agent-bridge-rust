@@ -949,7 +949,7 @@ impl Interactive {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn execute_with_wait(
+    pub(crate) async fn execute_with_wait(
         &self,
         session: &str,
         script: &str,
@@ -1101,6 +1101,17 @@ impl Interactive {
         max_bytes: usize,
         cursor: Option<&Value>,
     ) -> BridgeResult<Value> {
+        self.read_with_wait(session, ReadWait::Output(wait_ms), max_bytes, cursor)
+            .await
+    }
+
+    pub(crate) async fn read_with_wait(
+        &self,
+        session: &str,
+        wait: ReadWait,
+        max_bytes: usize,
+        cursor: Option<&Value>,
+    ) -> BridgeResult<Value> {
         let binding = self.binding(session).await?;
         if binding.lock().await.shell.is_closing() {
             binding.lock().await.shell.mark_lost();
@@ -1120,7 +1131,7 @@ impl Interactive {
             }));
         };
         let _ = lost;
-        self.read_command(session, &command, wait_ms, max_bytes, cursor)
+        self.read_command(session, &command, wait, max_bytes, cursor)
             .await
     }
 
@@ -1134,6 +1145,24 @@ impl Interactive {
         max_bytes: usize,
         cursor: Option<&Value>,
     ) -> BridgeResult<Value> {
+        self.read_result_with_wait(
+            session,
+            result_id,
+            ReadWait::Output(wait_ms),
+            max_bytes,
+            cursor,
+        )
+        .await
+    }
+
+    pub(crate) async fn read_result_with_wait(
+        &self,
+        session: &str,
+        result_id: &str,
+        wait: ReadWait,
+        max_bytes: usize,
+        cursor: Option<&Value>,
+    ) -> BridgeResult<Value> {
         let explicit = json!({});
         let cursor = cursor.or(Some(&explicit));
         let binding = self.bindings.lock().await.get(session).cloned();
@@ -1144,7 +1173,7 @@ impl Interactive {
                 if command.lock().await.result_id == result_id {
                     terminal_result_metadata(&self.store, session, result_id)?;
                     return self
-                        .read_command(session, &command, wait_ms, max_bytes, cursor)
+                        .read_command(session, &command, wait, max_bytes, cursor)
                         .await;
                 }
             }
@@ -1157,25 +1186,18 @@ impl Interactive {
         &self,
         session: &str,
         command: &Arc<AsyncMutex<Command>>,
-        wait_ms: u64,
+        wait: ReadWait,
         max_bytes: usize,
         cursor: Option<&Value>,
     ) -> BridgeResult<Value> {
-        read_command_state(
-            &self.store,
-            session,
-            command,
-            ReadWait::Output(wait_ms),
-            max_bytes,
-            cursor,
-        )
-        .await
+        read_command_state(&self.store, session, command, wait, max_bytes, cursor).await
     }
 }
 
 #[derive(Clone, Copy)]
-enum ReadWait {
+pub(crate) enum ReadWait {
     Output(u64),
+    Completed(u64),
     Completion(Instant),
 }
 
@@ -1210,6 +1232,10 @@ async fn read_command_state(
         };
         let (deadline, stop_on_output) = match wait {
             ReadWait::Output(ms) => (Instant::now() + Duration::from_millis(ms.min(30_000)), true),
+            ReadWait::Completed(ms) => (
+                Instant::now() + Duration::from_millis(ms.min(30_000)),
+                false,
+            ),
             ReadWait::Completion(deadline) => (deadline, false),
         };
         if guard.is_busy() {
@@ -1358,6 +1384,30 @@ impl Interactive {
         max_bytes: usize,
         cursor: Option<&Value>,
     ) -> BridgeResult<Value> {
+        self.write_with_wait(
+            session,
+            input,
+            signal,
+            eof,
+            allow_dangerous,
+            ReadWait::Output(wait_ms),
+            max_bytes,
+            cursor,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_with_wait(
+        &self,
+        session: &str,
+        input: Option<&str>,
+        signal: Option<&str>,
+        eof: bool,
+        allow_dangerous: bool,
+        wait: ReadWait,
+        max_bytes: usize,
+        cursor: Option<&Value>,
+    ) -> BridgeResult<Value> {
         let binding = self.binding(session).await?;
         let guard = binding.lock().await;
         self.permitted(&guard).await?;
@@ -1398,7 +1448,11 @@ impl Interactive {
         } else {
             shell.write_eof().await;
         }
-        let mut out = self.read(session, wait_ms, max_bytes, cursor).await?;
+        // Observe the same command selected for the input even if the session
+        // acquires a new foreground command before this read.
+        let mut out = self
+            .read_command(session, &command, wait, max_bytes, cursor)
+            .await?;
         if let Some(map) = out.as_object_mut() {
             map.insert("input_sent".into(), Value::Bool(true));
         }
@@ -1983,6 +2037,116 @@ mod tests {
         assert_eq!(page["exit_code"], 0);
         assert_eq!(page["stdout"], "init warning");
         producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_wait_keeps_the_command_and_unread_backlog() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let result_id = store.create(Map::new()).unwrap();
+        let command = Arc::new(AsyncMutex::new(Command::new(result_id.clone())));
+        let out_path = store.path(&result_id, "stdout").unwrap();
+        std::fs::write(&out_path, b"prompt").unwrap();
+        {
+            let mut guard = command.lock().await;
+            guard.state = CmdState::Running;
+        }
+
+        // Both zero and positive deadlines expose the same bounded page without
+        // changing the state; output is not itself a completion event.
+        let zero = read_command_state(
+            &store,
+            "s",
+            &command,
+            ReadWait::Completed(0),
+            3,
+            Some(&json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(zero["state"], "running");
+        assert_eq!(zero["result_id"], result_id);
+        assert_eq!(zero["stdout"], "pro");
+        assert_eq!(zero["more"], true);
+
+        let cursor = zero["cursor"].clone();
+        let deadline = read_command_state(
+            &store,
+            "s",
+            &command,
+            ReadWait::Completed(20),
+            3,
+            Some(&cursor),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deadline["state"], "running");
+        assert_eq!(deadline["stdout"], "mpt");
+
+        let cursor = deadline["cursor"].clone();
+        let mut waiter = Box::pin(read_command_state(
+            &store,
+            "s",
+            &command,
+            ReadWait::Completed(1_000),
+            4,
+            Some(&cursor),
+        ));
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        std::fs::write(&out_path, b"promptabcdefgh").unwrap();
+        command.lock().await.changed.notify_waiters();
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        {
+            let mut guard = command.lock().await;
+            guard.state = CmdState::Completed;
+            guard.exit_code = Some(0);
+            guard.persist_verdict(&store, None).unwrap();
+        }
+        let page = waiter.await.unwrap();
+        assert_eq!(page["state"], "completed");
+        assert_eq!(page["exit_code"], 0);
+        assert_eq!(page["result_id"], result_id);
+        assert_eq!(page["stdout"], "abcd");
+        assert_eq!(page["more"], true);
+        let rest = read_command_state(
+            &store,
+            "s",
+            &command,
+            ReadWait::Completed(0),
+            4,
+            Some(&page["cursor"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rest["stdout"], "efgh");
+    }
+
+    #[tokio::test]
+    async fn completed_wait_observes_unsent_failure_without_waiting_for_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let result_id = store.create(Map::new()).unwrap();
+        let command = Arc::new(AsyncMutex::new(Command::new(result_id.clone())));
+        let mut waiter = Box::pin(read_command_state(
+            &store,
+            "s",
+            &command,
+            ReadWait::Completed(30_000),
+            4,
+            None,
+        ));
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        {
+            let mut guard = command.lock().await;
+            assert!(!try_take_over(&mut guard, true, &store));
+        }
+        let page = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page["state"], "not_started");
+        assert_eq!(page["result_id"], result_id);
+        assert_eq!(page["executed"], false);
     }
 
     #[tokio::test]

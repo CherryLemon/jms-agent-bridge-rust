@@ -138,6 +138,17 @@ For a command's saved output, call
 new command owns the terminal or the server has restarted. Use the returned
 cursor for subsequent pages; explicit cursors do not move the implicit session
 cursor. Omit the result ID to read the session's current command as before.
+
+For a short command that may print before exiting, set
+`options={"wait_for":"completed","wait_ms":15000}` on terminal `exec`, `read` or
+`write`. The legacy equivalents accept the same fields directly. The default
+`wait_for="output"` returns on available output or a terminal state, which is
+useful for interactive prompts. Completion mode waits for a terminal state
+within the observation budget; `wait_ms=0` reads immediately and the maximum is
+30,000 ms. An expired wait neither cancels nor replays the command. The reply
+still includes the observed state, result ID and cursor; if it has `more`,
+continue reading that same command with its `result_id` and cursor. Changing
+wait or paging options does not change a journaled request's execution identity.
 If sending a command fails or times out, that shell is marked lost and cannot
 accept another command. Keep the result ID to reconcile the uncertain outcome;
 open a new terminal explicitly rather than replaying the command automatically.
