@@ -219,7 +219,8 @@ reuse handle. Running is not completion; reads honour cursors.",
                     "timeout":{"type":"number","minimum":1,"maximum":180,"default":50},
                     "interval":{"type":"number","minimum":0.1,"maximum":30,"default":2},
                     "offset":int(0,1099511627776,0),
-                    "max_bytes":int(1024,16384,4096)
+                    "max_bytes":int(1024,16384,4096),
+                    "tail":{"type":"boolean"}
                 }
             }),
             read_only:false,
@@ -697,12 +698,13 @@ fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool
         ),
         (
             "jms_job_logs",
-            "Read a job's log from offset onward; poll with the returned next_offset.",
+            "Read a job's log from offset or tail; poll with the returned next_offset.",
             json!({
                 "host": {"type": "string"},
                 "job_id": {"type": "string", "pattern": "^[0-9a-f]{8}$"},
                 "offset": int(0, 1099511627776, 0),
                 "max_bytes": int(1024, 16384, 4096),
+                "tail": {"type":"boolean"},
             }),
             json!(["host", "job_id"]),
             true,
@@ -1026,6 +1028,7 @@ fn public_view(name: &str, schema: Value) -> Value {
             "interval",
             "offset",
             "max_bytes",
+            "tail",
         ],
         _ => return schema,
     };
