@@ -208,3 +208,46 @@ Separate MCP call counts from REST/catalog and SSH request counts. A
 shorter workflow or fewer MCP rounds need not use fewer SSH probes or
 fewer MCP bytes. The synthetic handler delay is part of the measured
 elapsed time; it is not a production latency estimate.
+
+#### Measured loopback pilot (one and six targets)
+
+Both façades ran on the same Linux x86-64 workstation against the Rust
+1.89 release binary built from server commit
+`ab1311e15fde03ba4ebbcc639795fd3bb5389041` with
+`cargo build --offline --locked --release`. Binary SHA-256:
+`eb9383ce88352f9fc2387a442e02ccb1d91a2d37245880dd5b97b9b14a9c22f2`.
+The client used Python 3.13.5 and Paramiko 3.5.1. The process, bridge state
+and canned backend were fresh for every workflow, with three completed
+workflows per row. The exact fixture SHA-256s are:
+
+- `one-target`: `0f63ff03bc9f98417b56d6d26c68e53c55c995e1df30b43d20d9636c056170ac`
+- `above-concurrency`: `ee6624c666881c42abb691448332bb78f3709c2bfde8af80640cd3d29b67bda9`
+
+| Case | Transport | Façade | MCP submit / wait / logs per workflow | SSH launch / status / log per workflow | Peak status handlers | MCP payload B across 3 | Workflow P50 / P95 ms |
+| --- | --- | --- | --- | --- | --- | ---: | ---: |
+| 1 target | HTTP | Legacy | 1 / 1 / 1 | 1 / 1 / 1 | 1 | 5,666 | 6.873 / 7.819 |
+| 1 target | HTTP | Public | 1 / 1 / 1 | 1 / 1 / 1 | 1 | 6,780 | 7.301 / 7.780 |
+| 1 target | stdio | Legacy | 1 / 1 / 1 | 1 / 1 / 1 | 1 | 5,684 | 12.464 / 29.821 |
+| 1 target | stdio | Public | 1 / 1 / 1 | 1 / 1 / 1 | 1 | 6,798 | 12.024 / 12.177 |
+| 6 targets | HTTP | Legacy | 1 / 6 / 6 | 6 / 6 / 6 | 1 | 25,140 | 25,526.539 / 25,545.945 |
+| 6 targets | HTTP | Public | 1 / 1 / 6 | 6 / 6 / 6 | 4 | 23,391 | 25,199.871 / 25,201.583 |
+| 6 targets | stdio | Legacy | 1 / 6 / 6 | 6 / 6 / 6 | 1 | 25,218 | 25,529.346 / 25,530.392 |
+| 6 targets | stdio | Public | 1 / 1 / 6 | 6 / 6 / 6 | 4 | 23,438 | 25,205.621 / 25,206.402 |
+
+Each row had zero duplicate launches, unexpected MCP errors or wait
+timeouts. There was one accepted catalog list plus one catalog lookup per
+target per workflow in both façades. The one-target rows completed three
+successful jobs each. The six-target rows each completed 12 successful jobs
+and six expected exit-7 jobs, with validated terminal IDs, exit codes and
+exact per-target canned logs. An exit-7 job is a validated workload
+outcome, not an MCP error.
+
+The public façade used the same number of calls for one target and saved
+five MCP waits for six targets. SSH request counts were unchanged. MCP
+payload rose by about 20% for one target and fell by about 7% for six.
+Payload includes the request and complete response body/frame, with
+initialization excluded. Elapsed time starts at submit and includes the
+fixture's 80 ms status-handler delay in the six-target case and any bridge
+submit scheduling. The reported P95 is the maximum of three observations.
+These figures do not estimate live SSH or production latency, HTTP wire
+bytes or model token usage.
