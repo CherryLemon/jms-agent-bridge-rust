@@ -682,6 +682,13 @@ impl Binding {
     }
 }
 
+#[cfg(test)]
+struct OpenFixture {
+    allocations: std::sync::atomic::AtomicUsize,
+    entered: Notify,
+    release: tokio::sync::Semaphore,
+}
+
 pub struct Interactive {
     catalog: Arc<AssetCatalog>,
     runner: Arc<Runner>,
@@ -690,6 +697,8 @@ pub struct Interactive {
     lost: Mutex<HashMap<String, Value>>,
     registry: PathBuf,
     save_lock: AsyncMutex<()>,
+    #[cfg(test)]
+    open_fixture: Mutex<Option<Arc<OpenFixture>>>,
 }
 
 impl Interactive {
@@ -717,6 +726,8 @@ impl Interactive {
             lost: Mutex::new(lost),
             registry,
             save_lock: AsyncMutex::new(()),
+            #[cfg(test)]
+            open_fixture: Mutex::new(None),
         }
     }
 
@@ -883,7 +894,34 @@ impl Interactive {
         // Register the protection before the shell exists: the connection must not be
         // replaced between opening the channel and the binding becoming visible.
         let protection = Arc::new(self.runner.protect_terminal(&key));
+        #[cfg(test)]
+        let fixture = self.open_fixture.lock().expect("open fixture lock").clone();
+        #[cfg(not(test))]
         let shell = TerminalShell::open(&self.runner, &host, &command, protection.clone()).await;
+        #[cfg(test)]
+        let shell = if let Some(fixture) = fixture {
+            fixture.allocations.fetch_add(1, Ordering::SeqCst);
+            fixture.entered.notify_one();
+            fixture.release.acquire().await.expect("fixture semaphore").forget();
+            let (_, writer) = ChannelWriter::mock_stalled(0);
+            let stream = || StreamSource {
+                receiver: mpsc::channel(1).1,
+                buffer: Vec::new(),
+                closed: false,
+            };
+            Ok(TerminalShell {
+                writer,
+                streams: AsyncMutex::new(Streams {
+                    out: stream(),
+                    err: stream(),
+                }),
+                lost: Arc::new(AtomicBool::new(false)),
+                protection: protection.clone(),
+                demux: Mutex::new(None),
+            })
+        } else {
+            TerminalShell::open(&self.runner, &host, &command, protection.clone()).await
+        };
         drop(slot);
         drop(lease);
         let shell = match shell {
@@ -1918,6 +1956,99 @@ mod tests {
             })),
         );
         (interactive, host, frames)
+    }
+
+    #[tokio::test]
+    async fn successful_terminal_open_is_reconciled_across_facades_and_restart() {
+        use crate::{mcp::BridgeServer, runtime::BridgeRuntime};
+        use sha2::{Digest, Sha256};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let temp = tempfile::tempdir().unwrap();
+            let state = temp.path().join("state");
+            let config = temp.path().join("config.toml");
+            std::fs::write(&config, format!(
+                "[bastion]\nurl = 'http://127.0.0.1:1'\nssh_port = 2224\nlogin_user = 'tester'\n[bridge]\nstate_dir = '{}'\n",
+                state.display()
+            )).unwrap();
+            std::fs::write(
+                temp.path().join("credentials.toml"),
+                "[credentials]\nsession_token = 'offline-fixture'\n",
+            ).unwrap();
+            let bootstrap = BridgeRuntime::start(Some(&config), false).await.unwrap();
+            assert_eq!(bootstrap.settings.state_dir, state);
+            let mut identity = bootstrap.cfg.credential_identity();
+            identity.push(bootstrap.settings.preferred_account.clone());
+            atomic_json(&state.join("assets.json"), &json!({
+                "identity":hex::encode(Sha256::digest(serde_json::to_vec(&identity).unwrap())),
+                "refreshed_at":crate::storage::results::now(),
+                "assets":[{
+                    "id":"11111111-1111-1111-1111-111111111111","name":"test-host",
+                    "active":true,"protocols":["ssh"],"login":"test","account":"test"
+                }]
+            })).unwrap();
+            drop(bootstrap);
+            let runtime = BridgeRuntime::start(Some(&config), false).await.unwrap();
+            let fixture = Arc::new(OpenFixture {
+                allocations: std::sync::atomic::AtomicUsize::new(0),
+                entered: Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            *runtime.terminals.open_fixture.lock().unwrap() = Some(fixture.clone());
+
+            let object = |value: Value| value.as_object().unwrap().clone();
+            let public = |request_id: &str| object(json!({
+                "action":"open","target":"test-host","detail":"full",
+                "options":{"request_id":request_id}
+            }));
+            let legacy = |request_id: &str| object(json!({
+                "operation":"terminal_open","detail":"full",
+                "arguments":{"target":"test-host","request_id":request_id}
+            }));
+            let server = BridgeServer::new(runtime.clone());
+            let caller = BridgeServer::new(runtime.clone());
+            let public_args = public("same");
+            let client = tokio::spawn(async move {
+                caller.dispatch("terminal", public_args).await
+            });
+            fixture.entered.notified().await;
+            let pending = server.dispatch("call", legacy("same")).await.unwrap();
+            assert_eq!(pending["duplicate"], true);
+            assert_eq!(pending["state"], "opening");
+            assert!(pending.get("session").is_none());
+            assert_eq!(fixture.allocations.load(Ordering::SeqCst), 1);
+
+            client.abort(); // Simulate the original requester losing its response.
+            assert!(client.await.unwrap_err().is_cancelled());
+            fixture.release.add_permits(1);
+            runtime.journal.drain().await;
+            let saved = server.dispatch("call", legacy("same")).await.unwrap();
+            assert_eq!(saved["duplicate"], true);
+            assert_eq!(saved["request_state"], "complete");
+            assert_eq!(saved["state"], "idle");
+            let session = saved["session"].as_str().unwrap().to_owned();
+            assert_eq!(server.dispatch("terminal", public("same")).await.unwrap()["session"], session);
+            assert_eq!(fixture.allocations.load(Ordering::SeqCst), 1);
+
+            // Start a new runtime against the same disk, without first marking
+            // the old session closed through a graceful shutdown.
+            drop(server);
+            drop(runtime);
+            let runtime = BridgeRuntime::start(Some(&config), false).await.unwrap();
+            *runtime.terminals.open_fixture.lock().unwrap() = Some(fixture.clone());
+            let server = BridgeServer::new(runtime.clone());
+            let lost = server.dispatch("terminal", public("same")).await.unwrap();
+            assert_eq!(lost["session"], session);
+            assert_eq!(lost["state"], "lost");
+            assert_eq!(lost["execution_replayed"], false);
+            assert_eq!(fixture.allocations.load(Ordering::SeqCst), 1);
+
+            fixture.release.add_permits(1);
+            let fresh = server.dispatch("call", legacy("new")).await.unwrap();
+            assert_eq!(fresh["state"], "idle");
+            assert_ne!(fresh["session"], session);
+            assert_eq!(fixture.allocations.load(Ordering::SeqCst), 2);
+        }).await.expect("offline open fixture timed out");
     }
 
     fn test_command(store: &ResultStore, kind: &str, session: &str, bytes: &[u8]) -> String {
