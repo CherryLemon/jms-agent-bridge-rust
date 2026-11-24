@@ -28,6 +28,10 @@ use crate::transport::session::{
 use crate::transport::ssh::{ChannelShell, ChannelWriter, ShellEvent};
 
 pub const DEFAULT_TERMINAL_WAIT_MS: u64 = 15_000;
+pub(crate) const MAX_TERMINAL_WAIT_MS: u64 = 30_000;
+pub(crate) const MIN_TERMINAL_PAGE_BYTES: u64 = 1;
+pub(crate) const MAX_TERMINAL_PAGE_BYTES: u64 = 16_384;
+pub(crate) const DEFAULT_TERMINAL_PAGE_BYTES: u64 = 4096;
 
 const SHELL_GUARD: &str = "JMS_SCRIPT_PATTERN_GUARD: already-authorized action needs \
 allow_dangerous=true; this acknowledges only the local guard, never client or JumpServer policy";
@@ -1305,9 +1309,12 @@ async fn read_command_state(
             })
         };
         let (deadline, stop_on_output) = match wait {
-            ReadWait::Output(ms) => (Instant::now() + Duration::from_millis(ms.min(30_000)), true),
+            ReadWait::Output(ms) => (
+                Instant::now() + Duration::from_millis(ms.min(MAX_TERMINAL_WAIT_MS)),
+                true,
+            ),
             ReadWait::Completed(ms) => (
-                Instant::now() + Duration::from_millis(ms.min(30_000)),
+                Instant::now() + Duration::from_millis(ms.min(MAX_TERMINAL_WAIT_MS)),
                 false,
             ),
             ReadWait::Completion(deadline) => (deadline, false),

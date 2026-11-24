@@ -14,7 +14,16 @@ use crate::fsprobe::{
     fs_timeout_limits, FS_EXPLORATION_TIMEOUT_DEFAULT, FS_EXPLORATION_TIMEOUT_MAX, FS_TIMEOUT_MIN,
     FS_TRANSFER_TIMEOUT_MAX,
 };
+use crate::runtime::{
+    JOB_LOG_DEFAULT_BYTES, JOB_LOG_MAX_BYTES, JOB_LOG_MIN_BYTES, RUN_PREVIEW_DEFAULT_BYTES,
+    RUN_PREVIEW_MAX_BYTES, RUN_PREVIEW_MIN_BYTES,
+};
 use crate::schema::strip_titles;
+
+use crate::terminal::{
+    DEFAULT_TERMINAL_PAGE_BYTES, DEFAULT_TERMINAL_WAIT_MS, MAX_TERMINAL_PAGE_BYTES,
+    MAX_TERMINAL_WAIT_MS, MIN_TERMINAL_PAGE_BYTES,
+};
 
 pub const DANGEROUS_FLAG_DESCRIPTION: &str = "Acknowledges the local guard for this authorized \
 command; it grants no authorization.";
@@ -96,7 +105,7 @@ Full output is saved; read_result fetches it. Advanced fields may also be passed
                     "session_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$",
                                    "description": "Named shell that keeps cwd, exports and functions."},
                     "timeout": {"type": "number", "minimum": 1, "maximum": 600, "default": 60},
-                    "max_output_bytes": integer(256, 16384, 4096,
+                    "max_output_bytes": integer(RUN_PREVIEW_MIN_BYTES, RUN_PREVIEW_MAX_BYTES, RUN_PREVIEW_DEFAULT_BYTES,
                         "Preview budget shared by all targets."),
                     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
                                    "description": "Caller id; recover with request_status."},
@@ -111,7 +120,7 @@ Full output is saved; read_result fetches it. Advanced fields may also be passed
                             "docker_args": {"type": "array", "items": {"type": "string"}},
                             "session_id": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$"},
                             "timeout": {"type": "number", "minimum": 1, "maximum": 600, "default": 60},
-                            "max_output_bytes": integer(256, 16384, 4096, "Preview budget."),
+                            "max_output_bytes": integer(RUN_PREVIEW_MIN_BYTES, RUN_PREVIEW_MAX_BYTES, RUN_PREVIEW_DEFAULT_BYTES, "Preview budget."),
                             "output_view": run_output_view_schema(),
                             "cwd": string("Remote working directory."),
                             "env": {"type": "object", "additionalProperties": {"type": "string"}},
@@ -196,9 +205,9 @@ reuse handle. Running is not completion; reads honour cursors.",
                             "docker_args": {"type": "array", "items": {"type": "string"}},
                             "cwd": string("open: directory for the bound shell."),
                             "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                            "wait_ms": integer(0, 30000, crate::terminal::DEFAULT_TERMINAL_WAIT_MS, "Maximum observation wait in milliseconds."),
+                            "wait_ms": integer(0, MAX_TERMINAL_WAIT_MS, DEFAULT_TERMINAL_WAIT_MS, "Maximum observation wait in milliseconds."),
                             "wait_for": terminal_wait_policy(),
-                            "max_bytes": integer(1, 16384, 4096, "Shared source byte budget for stdout and stderr."),
+                            "max_bytes": integer(MIN_TERMINAL_PAGE_BYTES, MAX_TERMINAL_PAGE_BYTES, DEFAULT_TERMINAL_PAGE_BYTES, "Shared source byte budget for stdout and stderr."),
                             "cursor": {"type": "object", "additionalProperties": false,
                                        "properties": {"stdout": {"type": "integer", "minimum": 0},
                                                       "stderr": {"type": "integer", "minimum": 0},
@@ -236,7 +245,7 @@ reuse handle. Running is not completion; reads honour cursors.",
                     "timeout":{"type":"number","minimum":1,"maximum":180,"default":50},
                     "interval":{"type":"number","minimum":0.1,"maximum":30,"default":2},
                     "offset":int(0,1099511627776,0),
-                    "max_bytes":int(1024,16384,4096),
+                    "max_bytes":int(JOB_LOG_MIN_BYTES, JOB_LOG_MAX_BYTES, JOB_LOG_DEFAULT_BYTES),
                     "tail":{"type":"boolean"},
                     "pattern":{"type":"string","minLength":1,"maxLength":1024},
                     "cursor":{"type":"string","minLength":1,"maxLength":256}
@@ -623,9 +632,9 @@ fn terminal_close_expectation() -> Value {
 fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
     let pages = || {
         json!({
-            "wait_ms": int(0, 30000, crate::terminal::DEFAULT_TERMINAL_WAIT_MS),
+            "wait_ms": int(0, MAX_TERMINAL_WAIT_MS, DEFAULT_TERMINAL_WAIT_MS),
             "wait_for": terminal_wait_policy(),
-            "max_bytes": integer(1, 16384, 4096, "Shared source byte budget for stdout and stderr."),
+            "max_bytes": integer(MIN_TERMINAL_PAGE_BYTES, MAX_TERMINAL_PAGE_BYTES, DEFAULT_TERMINAL_PAGE_BYTES, "Shared source byte budget for stdout and stderr."),
             "cursor": {"type": "object", "additionalProperties": false,
                        "properties": {"stdout": {"type": "integer", "minimum": 0},
                                       "stderr": {"type": "integer", "minimum": 0},
@@ -735,7 +744,7 @@ fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool
                 "host": {"type": "string"},
                 "job_id": {"type": "string", "pattern": "^[0-9a-f]{8}$"},
                 "offset": int(0, 1099511627776, 0),
-                "max_bytes": int(1024, 16384, 4096),
+                "max_bytes": int(JOB_LOG_MIN_BYTES, JOB_LOG_MAX_BYTES, JOB_LOG_DEFAULT_BYTES),
                 "tail": {"type":"boolean"},
                 "pattern":{"type":"string","minLength":1,"maxLength":1024},
                 "cursor":{"type":"string","minLength":1,"maxLength":256},
