@@ -314,7 +314,7 @@ continue with next_offset.",
                     "arguments": {"type": "object", "description": "Validated against the operation schema.",
                                   "default": {}},
                     "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
-                                   "description": "Job submit/cancel: recover via request_status."},
+                                   "description": "Jobs, jms_exec, session_close: recover via request_status."},
                 },
             }),
             read_only: false,
@@ -694,7 +694,7 @@ fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
         (
             "terminal_close",
             "Close this shell, optionally requiring the expected current command. Saved outputs remain.",
-            json!({"session": {"type": "string"}, "expected_result_id": terminal_close_expectation()}),
+            json!({"session": {"type": "string"}, "expected_result_id": terminal_close_expectation(), "request_id": request_id_property()}),
             json!(["session"]),
         ),
     ]

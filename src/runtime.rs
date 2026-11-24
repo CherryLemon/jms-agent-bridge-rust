@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{load_config, load_settings, BastionConfig, BridgeSettings, StateLock};
 use crate::errors::{BridgeError, BridgeResult};
-use crate::execution::{ExecSpec, Runner};
+use crate::execution::{ExecOutcome, ExecSpec, Runner};
 use crate::filesystem::Filesystem;
 use crate::guard;
 use crate::inspection::AcceleratorInspector;
@@ -309,7 +309,18 @@ impl BridgeRuntime {
         Ok(Value::Object(value))
     }
 
+    fn enforce_request_id(&self, mutation: bool, id: Option<&Value>, path: &str) -> BridgeResult<()> {
+        if self.settings.require_request_id && mutation && id.and_then(Value::as_str).is_none() {
+            return Err(BridgeError::invalid_arguments(
+                "strict request ID policy requires a caller-provided request_id for this mutation",
+                json!({"path":path, "message":"missing required: request_id"}),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn tool_run(self: &Arc<Self>, arguments: Map<String, Value>) -> BridgeResult<Value> {
+        self.enforce_request_id(true, arguments.get("request_id"), "/request_id")?;
         let mut arguments = arguments;
         // Presentation options never enter the journal or the execution closure.
         let output_view = arguments.remove("output_view");
@@ -448,12 +459,17 @@ require allow_dangerous=true",
     // --- fs ------------------------------------------------------------------
 
     pub async fn tool_fs(self: &Arc<Self>, arguments: Map<String, Value>) -> BridgeResult<Value> {
-        crate::filesystem::validate(&arguments)?;
         let action = arguments
             .get("action")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        self.enforce_request_id(
+            matches!(action.as_str(), "upload" | "download"),
+            arguments.get("request_id"),
+            "/request_id",
+        )?;
+        crate::filesystem::validate(&arguments)?;
         if let Some(request_id) = arguments
             .get("request_id")
             .and_then(Value::as_str)
@@ -520,6 +536,11 @@ require allow_dangerous=true",
                 "wait_for is only for terminal exec, read or write",
             ));
         }
+        self.enforce_request_id(
+            terminal_mutation(action),
+            arguments.get("request_id"),
+            "/options/request_id",
+        )?;
         match action {
             "open" => {
                 let target = arguments
@@ -724,6 +745,15 @@ require allow_dangerous=true",
                     .contains_key("expected_result_id")
                     .then(|| used_string(&arguments, "expected_result_id"))
                     .transpose()?;
+                if let Some(request_id) = request_id {
+                    let work = json!({"session":session, "expected_result_id":expected});
+                    let terminals = self.terminals.clone();
+                    return self.journal.execute(
+                        &request_id, "terminal_close", &work, move |_| async move {
+                            terminals.close_with_expected_result(&session, expected.as_deref()).await
+                        },
+                    ).await;
+                }
                 self.terminals
                     .close_with_expected_result(&session, expected.as_deref())
                     .await
@@ -926,7 +956,7 @@ require allow_dangerous=true",
         }
         let operation = match action.as_str() {
             "submit" => {
-                if request_id.as_ref().and_then(Value::as_str).is_none() {
+                if !self.settings.require_request_id && request_id.as_ref().and_then(Value::as_str).is_none() {
                     return Err(BridgeError::invalid("job submit requires request_id"));
                 }
                 "jms_submit_job"
@@ -1052,6 +1082,20 @@ require allow_dangerous=true",
             }
             BridgeError::invalid_arguments(message, validation)
         })?;
+        let (mutation, id, path) = match operation.as_str() {
+            "jms_submit_job" | "jms_job_cancel" | "jms_exec" | "session_close" =>
+                (true, arguments.get("request_id"), "/request_id"),
+            "jms_fs" => (
+                matches!(payload.get("action").and_then(Value::as_str), Some("upload" | "download")),
+                payload.get("request_id"), "/arguments/request_id"
+            ),
+            op if op.starts_with("terminal_") => (
+                terminal_mutation(op.trim_start_matches("terminal_")),
+                payload.get("request_id"), "/arguments/request_id"
+            ),
+            _ => (false, None, "/request_id"),
+        };
+        self.enforce_request_id(mutation, id, path)?;
         if operation == "jms_submit_job" {
             artifact_paths(payload.get("artifact_paths"))?;
         }
@@ -1067,9 +1111,22 @@ require allow_dangerous=true",
                     runtime.jobs.cancel(&host, &id).await
                 }).await;
             }
+            if matches!(operation.as_str(), "jms_exec" | "session_close") {
+                let runtime = self.clone();
+                let operation_for_work = operation.clone();
+                let work = Value::Object(payload.clone());
+                let value = self.journal.execute(&request_id, &operation, &work, move |sink| async move {
+                    if operation_for_work == "jms_exec" {
+                        runtime.legacy_exec(payload, Some(sink.as_ref())).await
+                    } else {
+                        runtime.dispatch_operation(&operation_for_work, payload).await
+                    }
+                }).await?;
+                return self.stage_operation_result(&operation, value);
+            }
             if operation != "jms_submit_job" {
                 return Err(BridgeError::invalid(
-                    "call request_id supports only jms_submit_job or jms_job_cancel",
+                    "outer call request_id applies to job submit/cancel, jms_exec, or session_close",
                 ));
             }
             let runtime = self.clone();
@@ -1126,7 +1183,7 @@ require allow_dangerous=true",
                     .unwrap_or(90);
                 self.inspector.inspect(&targets, timeout).await
             }
-            "jms_exec" => self.legacy_exec(arguments).await,
+            "jms_exec" => self.legacy_exec(arguments, None).await,
             "jms_list_assets" => {
                 let search = arguments
                     .get("search")
@@ -1489,7 +1546,11 @@ require allow_dangerous=true",
         Ok(value)
     }
 
-    async fn legacy_exec(&self, arguments: Map<String, Value>) -> BridgeResult<Value> {
+    async fn legacy_exec(
+        &self,
+        arguments: Map<String, Value>,
+        progress: Option<&dyn crate::storage::journal::ProgressSink>,
+    ) -> BridgeResult<Value> {
         let command = used_string(&arguments, "command")?;
         let allow_dangerous = arguments
             .get("allow_dangerous")
@@ -1510,17 +1571,18 @@ require allow_dangerous=true",
         let hosts = self.resolve_many(&targets).await?;
         let mut outcomes = Vec::new();
         for host in hosts {
-            outcomes.push(
-                self.runner
-                    .exec_on(&host, &command, timeout, true, true, true)
-                    .await?,
-            );
+            match self.runner
+                .exec_on_with_progress(&host, &command, timeout, true, true, true, progress)
+                .await
+            {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(failure) if progress.is_some() => {
+                    return Ok(legacy_exec_failed_response(&self.store, &outcomes, &host.name, &failure));
+                }
+                Err(failure) => return Err(failure.error),
+            }
         }
-        let rows = crate::filesystem::exec_rows(&self.store, &outcomes, 4096);
-        let ok = rows
-            .iter()
-            .all(|row| row.get("ok").and_then(Value::as_bool).unwrap_or(false));
-        Ok(json!({"ok": ok, "results": rows}))
+        Ok(legacy_exec_response(&self.store, &outcomes, progress.is_some()))
     }
 
     // --- request receipts ----------------------------------------------------
@@ -1833,6 +1895,36 @@ fn unknown_row(host: &str, message: &str) -> Map<String, Value> {
     .as_object()
     .cloned()
     .unwrap_or_default()
+}
+
+fn legacy_exec_response(store: &ResultStore, outcomes: &[ExecOutcome], journaled: bool) -> Value {
+    let mut rows = crate::filesystem::exec_rows(store, outcomes, 4096);
+    if journaled {
+        for (row, outcome) in rows.iter_mut().zip(outcomes) {
+            for key in ["executed", "execution_state", "timed_out", "completion_unknown"] {
+                row[key] = outcome.meta.get(key).cloned().unwrap_or(Value::Null);
+            }
+        }
+    }
+    let ok = rows.iter().all(|row| row.get("ok").and_then(Value::as_bool).unwrap_or(false));
+    json!({"ok": ok, "results": rows})
+}
+
+fn legacy_exec_failed_response(
+    store: &ResultStore,
+    completed_attempts: &[ExecOutcome],
+    host: &str,
+    failure: &crate::execution::ExecFailure,
+) -> Value {
+    let mut response = legacy_exec_response(store, completed_attempts, true);
+    response["ok"] = json!(false);
+    response["results"].as_array_mut().expect("result rows")
+        .push(Value::Object(failure_row(host, failure)));
+    response
+}
+
+fn terminal_mutation(action: &str) -> bool {
+    matches!(action, "open" | "exec" | "write" | "close")
 }
 
 /// Claim the canonical job identity and save reconciliation data before resolving
@@ -3128,6 +3220,61 @@ mod tests {
         assert_eq!(reply["request_state"], "interrupted");
         assert_eq!(reply["completion_unknown"], true);
         assert_eq!(reply["execution_replayed"], false);
+    }
+
+    #[tokio::test]
+    async fn journaled_legacy_exec_preserves_mixed_outcomes_and_reopened_uncertainty() {
+        let (directory, store) = job_test_store();
+        let outcome = |id: &str, state: &str, executed: Value, timed_out: bool, unknown: bool| {
+            let mut outcome = ExecOutcome::failure(id, "");
+            outcome.result_id = id.to_owned();
+            outcome.exit_code = if state == "completed" { 0 } else { 75 };
+            outcome.meta = json!({
+                "execution_state":state, "executed":executed, "timed_out":timed_out,
+                "completion_unknown":unknown
+            }).as_object().unwrap().clone();
+            outcome
+        };
+        let known = [
+            outcome("completed", "completed", json!(true), false, false),
+            outcome("not-started", "not_started", json!(false), false, false),
+        ];
+        let response = legacy_exec_response(&store, &known, true);
+        assert_eq!(response["results"][0]["executed"], true);
+        assert_eq!(response["results"][1]["execution_state"], "not_started");
+        assert_eq!(response["results"][1]["completion_unknown"], false);
+        let mixed = [
+            outcome("completed", "completed", json!(true), false, false),
+            outcome("not-started", "not_started", json!(false), false, false),
+            outcome("unknown", "unknown", Value::Null, true, true),
+        ];
+        let legacy = legacy_exec_response(&store, &mixed, false);
+        assert!(legacy["results"][2].get("execution_state").is_none());
+        assert!(legacy["results"][2].get("completion_unknown").is_none());
+        let response = legacy_exec_failed_response(
+            &store,
+            &mixed,
+            "store-error",
+            &crate::execution::ExecFailure::before_send("results", BridgeError::storage("fixture store failure")),
+        );
+        assert_eq!(response["results"][3]["execution_state"], "not_started");
+        assert_eq!(response["results"][3]["completion_unknown"], false);
+        assert_eq!(response["results"][2]["executed"], Value::Null);
+        assert_eq!(response["results"][2]["timed_out"], true);
+        let journal_path = directory.path().join("requests");
+        let journal = Arc::new(RequestJournal::new(journal_path.clone()).unwrap());
+        let payload = json!({"targets":["fixture"],"command":"true"});
+        let first = journal.execute("mixed", "jms_exec", &payload, |_| async { Ok(response) }).await.unwrap();
+        assert_eq!(first["completion_unknown"], true);
+        let reopened = Arc::new(RequestJournal::new(journal_path).unwrap());
+        assert_eq!(reopened.status("mixed", false).unwrap()["completion_unknown"], true);
+        let replay = reopened.execute("mixed", "jms_exec", &payload, |_| async {
+            panic!("journaled legacy execution must not replay")
+        }).await.unwrap();
+        assert_eq!(replay["completion_unknown"], true);
+        assert_eq!(replay["duplicate"], true);
+        assert_eq!(replay["results"][2]["result_id"], "unknown");
+        assert_eq!(replay["results"][2]["execution_state"], "unknown");
     }
 
     #[test]

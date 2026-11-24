@@ -46,6 +46,15 @@ Python one on the same state directory keeps dedupe working. New receipts
 written by Rust are plain JSON with the same keys; the Python journal ignores
 any extra field it does not know.
 
+## Optional strict request IDs
+
+Enable `require_request_id = true` in the `[bridge]` table only after clients
+supply IDs for mutations. It defaults to false. Disabling this setting restores
+acceptance of missing IDs without changing existing fingerprints or deleting
+receipts. Use `request_status` to reconcile an already-accepted ID after a lost
+reply; do not change the payload or generate a replacement ID for an unknown
+outcome.
+
 ## Stricter defaults in the Rust bridge
 
 Three behaviours are deliberately fail-closed where the Python bridge was
