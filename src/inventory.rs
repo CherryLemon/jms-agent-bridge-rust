@@ -134,7 +134,7 @@ impl Inventory {
     pub(crate) fn resolve_job_targets(
         &self,
         targets: &[(String, String)],
-    ) -> BridgeResult<Vec<(Host, String)>> {
+    ) -> Vec<BridgeResult<(Host, String)>> {
         let hosts = self.index();
         let assets: HashMap<_, _> = self
             .hosts
@@ -485,6 +485,8 @@ mod tests {
                 ("ip-for-one".into(), "aaaa1111".into()),
                 ("one".into(), "aaaa1111".into()),
             ])
+            .into_iter()
+            .collect::<BridgeResult<Vec<_>>>()
             .unwrap();
         assert_eq!(
             ordered
@@ -495,7 +497,7 @@ mod tests {
         );
         for denied in ["*", "all", "both", "unlisted"] {
             assert!(inventory
-                .resolve_job_targets(&[(denied.into(), "aaaa1111".into())])
+                .resolve_job_targets(&[(denied.into(), "aaaa1111".into())])[0]
                 .is_err());
         }
     }

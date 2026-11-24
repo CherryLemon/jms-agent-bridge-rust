@@ -532,6 +532,18 @@ impl AssetCatalog {
 
     /// Ensure a complete snapshot exists, refreshing when stale.
     pub async fn ensure(&self) -> BridgeResult<Inventory> {
+        self.ensure_with_staleness().await.map(|(inventory, _)| inventory)
+    }
+
+    /// Pair the inventory with freshness from the same snapshot so an older
+    /// lookup miss cannot be mistaken for a current permission decision.
+    pub(crate) async fn ensure_with_staleness(&self) -> BridgeResult<(Inventory, bool)> {
+        let view = |state: &CatalogState| {
+            let age = now() - state.snapshot.refreshed_at;
+            let stale = state.error.is_some()
+                || !(0.0..self.settings.refresh_interval as f64).contains(&age);
+            (state.inventory.clone(), stale)
+        };
         let refreshed = self
             .state
             .lock()
@@ -541,7 +553,8 @@ impl AssetCatalog {
         let locked = self.refresh_lock.try_lock().is_err();
         if refreshed > 0.0 && locked {
             // Keep the last complete view usable while another request refreshes.
-            return Ok(self.inventory());
+            let state = self.state.lock().expect("catalog lock");
+            return Ok(view(&state));
         }
         if refreshed <= 0.0 && locked {
             let _guard = self.refresh_lock.lock().await;
@@ -555,7 +568,7 @@ impl AssetCatalog {
                 .refreshed_at;
             if refreshed_now > 0.0 {
                 let state = self.state.lock().expect("catalog lock");
-                return Ok(state.inventory.clone());
+                return Ok(view(&state));
             }
         }
         if now() - refreshed >= self.settings.refresh_interval as f64 {
@@ -570,7 +583,7 @@ impl AssetCatalog {
                 || "REST inventory is not ready; configure API access first".into(),
             )));
         }
-        Ok(state.inventory.clone())
+        Ok(view(&state))
     }
 
     /// One REST health call for `doctor`; never touches the cached snapshot.

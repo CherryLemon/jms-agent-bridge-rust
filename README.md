@@ -341,6 +341,17 @@ Pass that object unchanged as `jobs` to continue; the bridge checks each target
 against the current permitted inventory before probing it. Legacy
 `call(operation="jms_job_wait")` with a single ID is unchanged.
 
+In paired-handle wait, an asset not visible in this bridge's current permitted
+inventory yields a per-row `status:"unknown", probed:false, reason:"asset_not_visible"`
+without blocking visible jobs. A known selector naming multiple targets reports
+`target_ambiguous` without expanding it. A lookup miss against a stale retained inventory
+reports `inventory_stale`; a refresh failure without a usable snapshot remains an
+inventory error. Unobservable rows are omitted from `pending` and do not receive a
+remote follow-up. Here `finished` means this observation has no remaining visible
+work, not that every remote job completed. The overall `ok` is false if any asset
+could not be observed. Keep the original handle to try again explicitly after
+inventory or permissions change.
+
 For paired-handle `job(action="wait", jobs=..., tail=true)`, optionally add a
 `failure_tail` to verified `failed` status rows. This is skipped by default.
 Only the first four distinct failed pairs are probed, in parallel, within
