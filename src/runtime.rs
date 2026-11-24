@@ -2082,12 +2082,12 @@ fn project_job_wait(
             && handle["job_id"].as_str() == Some(job_id)
         {
             let paths = artifact_paths(handle.get("artifact_paths")).unwrap_or_default();
-            if !paths.is_empty() {
-                let target = host.asset_id.as_deref().unwrap_or(&host.name);
+            if let Some(target) = host.asset_id.as_deref().filter(|_| !paths.is_empty()) {
                 row["artifact_refs"] = json!(paths
                     .into_iter()
                     .map(|path| json!({
-                        "target":target, "job_id":job_id, "path":path, "verified":false
+                        "target":target, "job_id":job_id, "path":path, "verified":false,
+                        "options":{"expected_asset_id":target}
                     }))
                     .collect::<Vec<_>>());
             }
@@ -2696,7 +2696,8 @@ mod tests {
         assert_eq!(
             failed["status"][0]["artifact_refs"],
             json!([{
-                "target":asset, "job_id":job_id, "path":path, "verified":false
+                "target":asset, "job_id":job_id, "path":path, "verified":false,
+                "options":{"expected_asset_id":asset}
             }])
         );
         for row in [

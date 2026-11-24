@@ -145,6 +145,7 @@ Put advanced fields in options; discover(operation='jms_fs', query=action) lists
                     "options": {"type": "object", "additionalProperties": false,
                         "description": "Action fields: paths, local_path, overwrite, paging, filters, timeout.",
                         "properties": {
+                            "expected_asset_id": string("Exact mode: must equal target and match one permitted canonical asset ID."),
                             "paths": array_of_strings("read_many: absolute paths.", Some(16)),
                             "local_path": string("upload/download: absolute path on the MCP machine."),
                             "overwrite": boolean(false, "Replace existing destination files when true."),
@@ -811,6 +812,7 @@ fn fs_schema() -> Value {
             "required": ["target", "action"],
             "properties": {
                 "target": {"type": "string", "minLength": 1},
+                "expected_asset_id": {"type":"string","minLength":1,"description":"Exact mode: must equal target and match one permitted canonical asset ID."},
                 "action": {"type": "string", "enum": ["list", "stat", "read", "read_many", "glob",
                     "search", "tree", "checksum", "upload", "download"]},
                 "path": {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -904,8 +906,9 @@ pub fn categories() -> BTreeMap<&'static str, Vec<&'static str>> {
 }
 
 /// Fields that are common to every fs action.
-pub const FS_COMMON: [&str; 6] = [
+pub const FS_COMMON: [&str; 7] = [
     "target",
+    "expected_asset_id",
     "action",
     "path",
     "container",

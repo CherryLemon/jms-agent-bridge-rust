@@ -348,7 +348,11 @@ A successful status read for a `done` or `failed` job returns these as
 An archive failure still returns the original exit status and any requested
 failure tail. No artifact file is opened, scanned, or transferred by job
 wait. To verify presence, run `fs(action="stat", target=..., path=...)` for
-the reference; use the appropriate authorized Fs read/download separately.
+the reference, copying its `options.expected_asset_id` unchanged into every
+stat, read and download request (flat `expected_asset_id` for legacy `call`).
+Exact mode matches only one current permitted canonical asset ID. It fails
+closed without falling back to names, aliases, addresses or tags. No guarded
+reference is produced if the job target has no canonical asset ID.
 The reference never grants access, and Fs applies its own configured scope.
 Container paths are not supported by these host references.
 
