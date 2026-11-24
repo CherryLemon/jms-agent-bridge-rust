@@ -859,12 +859,17 @@ require allow_dangerous=true",
     }
 
     async fn wait_job_handles(&self, payload: Map<String, Value>) -> BridgeResult<Value> {
-        if payload
+        if let Some(field) = payload
             .keys()
-            .any(|key| !matches!(key.as_str(), "jobs" | "timeout" | "interval" | "tail"))
+            .find(|key| !matches!(key.as_str(), "jobs" | "timeout" | "interval" | "tail"))
         {
-            return Err(BridgeError::invalid(
+            let message = match field.as_str() {
+                "targets" | "job_id" => format!("{field} cannot be combined with jobs"),
+                _ => format!("{field} is not applicable when waiting on jobs"),
+            };
+            return Err(BridgeError::invalid_arguments(
                 "job wait takes jobs or targets/job_id, not both",
+                json!({"path": crate::schema::pointer_token(field), "message": message}),
             ));
         }
         let input = payload
