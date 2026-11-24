@@ -91,3 +91,54 @@ same fixture) completed three startup messages, 150 workload tool calls and
 The startup byte improvement is separate from repeated workload traffic and
 does not imply that workload replies shrank. These figures are checks of the
 fixture, not thresholds or model token measurements.
+
+## Matched job workflow over loopback
+
+Use the separate bench to compare the legacy `call` job operations with the
+public `job` tool against the **same binary** and workload. It requires
+Python and Paramiko (tested with 3.5.1). Install this optional test dependency in
+a virtual environment and run with only loopback networking available:
+
+```sh
+python3 tools/mcp_job_measure.py --binary target/release/jms-bridge \
+  --server-git-sha "$(git rev-parse HEAD)" --repeats 5 > matched-job.json
+```
+
+Each repeat starts with a new bridge, state directory and scripted backend for
+each variant and transport. Legacy uses the same keyed submit and polls each
+job through an independent legacy wait; public uses a single batched wait and
+continues using only its pending handles. Both read the same two logs via the
+corresponding entry point. The fixture makes one job finish with exit code 7
+and one remain pending through the first wait deadline, then finish with exit
+code 0. Wrong results or unexpected errors abort the measurement.
+
+The report counts accepted REST catalog requests and individual SSH exec
+payloads by role. The SSH emulator speaks the bridge's framing and returns
+canned replies; it never executes shell commands. Counts are actual loopback
+requests, not the mock denominators elsewhere in this document. Reported
+bytes cover actual MCP stdio framing or HTTP bodies only. HTTP headers,
+TCP, SSH wire bytes and model tokens are unmeasured. Timing spans submit
+through both validated log results and includes the intentional wait; it is
+not a production latency estimate. Poll counts can vary with timing; JSON
+byte counts can also vary with emitted evidence and IDs. Startup measurement
+continues to belong to the separate standard-library baseline. The matched
+workflow does not discard responses or inject an SSH disconnect; the existing
+offline lost-reply receipt fixture remains separate.
+
+### Matched pilot
+
+Server `fdfb1b5a15ac67fa96d45e1348a4d258cc7f4df6`, Rust 1.89 release,
+Python/Paramiko protocol client, cold process state each repeat, three
+repeats for each transport and façade. Every workflow returned the expected
+one successful job, one failed job, first-wait timeout, and both logs.
+
+| Transport | Façade | MCP calls per workflow | SSH execs per workflow | Request + response bytes across 3 | P50 / P95 ms |
+|---|---|---:|---:|---:|---:|
+| HTTP | Legacy | 6 | 9 | 11,192 | 6,521 / 6,522 |
+| HTTP | Public | 5 | 9 | 12,250 | 6,519 / 6,520 |
+| stdio | Legacy | 6 | 9 | 11,227 | 6,525 / 6,525 |
+| stdio | Public | 5 | 9 | 12,278 | 6,522 / 6,522 |
+
+The public path saved one call in this scenario, with unchanged SSH probe
+counts and more MCP bytes. These small-sample, deadline-dominated measurements
+do not establish a latency or model-token improvement.

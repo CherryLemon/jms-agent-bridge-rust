@@ -82,13 +82,13 @@ def bridge(binary, mode, root, fixture):
                     process.wait(timeout=TIMEOUT)
 
 
-def stdio(process, body, reply):
+def stdio(process, body, reply, *, timeout=TIMEOUT):
     # One request is outstanding at a time and the payload is always small.
     outgoing = body + b"\n"
     process.stdin.write(outgoing)
     if not reply:
         return len(outgoing), b""
-    deadline = time.monotonic() + TIMEOUT
+    deadline = time.monotonic() + timeout
     received = bytearray()
     while not received.endswith(b"\n"):
         remaining = max(0, deadline - time.monotonic())
@@ -112,8 +112,8 @@ def await_http(port, process):
     raise RuntimeError("bridge did not start HTTP on loopback")
 
 
-def exchange_http(port, body, reply):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=TIMEOUT)
+def exchange_http(port, body, reply, *, timeout=TIMEOUT):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         conn.request("POST", "/mcp", body, {
             "Content-Type": "application/json",
