@@ -375,8 +375,8 @@ impl TerminalShell {
         self.writer.signal(signal).await
     }
 
-    async fn write_eof(&self) {
-        self.writer.write_eof().await;
+    async fn write_eof(&self) -> BridgeResult<()> {
+        self.writer.try_write_eof().await
     }
 
     async fn close(&self) {
@@ -1487,7 +1487,7 @@ impl Interactive {
                 "write needs an active foreground command; use exec for shell commands",
             ));
         };
-        {
+        let result_id = {
             let guard = command.lock().await;
             if shell.is_closing() {
                 return Err(BridgeError::invalid(
@@ -1499,14 +1499,20 @@ impl Interactive {
                     "write needs an active foreground command; use exec for shell commands",
                 ));
             }
-        }
+            guard.result_id.clone()
+        };
         if let Some(input) = input {
             self.check(input, allow_dangerous)?;
             shell.write_input(input).await?;
         } else if let Some(signal) = signal {
             shell.send_signal(signal).await?;
         } else {
-            shell.write_eof().await;
+            shell.write_eof().await.map_err(|error| {
+                BridgeError::ssh(format!(
+                    "terminal EOF send failed for result_id={result_id}; do not replay automatically: {}",
+                    error.message()
+                ))
+            })?;
         }
         // Observe the same command selected for the input even if the session
         // acquires a new foreground command before this read.
@@ -2469,6 +2475,38 @@ mod tests {
         assert_eq!(guard.evidence()["completion_unknown"], true);
         guard.started.store(true, Ordering::SeqCst);
         assert_eq!(guard.evidence()["executed"], true);
+    }
+
+    #[tokio::test]
+    async fn eof_send_failure_reports_the_captured_result_without_changing_its_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let (interactive, _, mut frames) = terminal_with_stalled_writer(dir.path(), 1).await;
+        let id = test_command(&interactive.store, "terminal", "s", b"");
+        let command = Arc::new(AsyncMutex::new(Command::new(id.clone())));
+        let binding = interactive.binding("s").await.unwrap();
+        binding.lock().await.command = Some(command.clone());
+        {
+            let mut guard = command.lock().await;
+            assert!(try_take_over(&mut guard, false, &interactive.store));
+        }
+
+        let error = interactive
+            .write("s", None, None, true, false, 0, 4096, None)
+            .await
+            .unwrap_err()
+            .message();
+        assert!(error.contains(&format!("result_id={id}")));
+        assert!(error.contains("mock EOF send failed"));
+        assert!(error.contains("do not replay automatically"));
+
+        let page = interactive.read("s", 0, 4096, None).await.unwrap();
+        assert_eq!(page["result_id"].as_str(), Some(id.as_str()));
+        assert_eq!(page["state"], "running");
+        assert!(page.get("input_sent").is_none());
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
