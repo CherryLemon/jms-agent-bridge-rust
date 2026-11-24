@@ -337,6 +337,21 @@ Tails are omitted if they would force otherwise inline status rows to be
 staged. This is a best-effort excerpt, not a complete log or a wait prerequisite.
 
 
+For jobs with known outputs, submit with `artifact_paths`, an optional list
+of up to four distinct absolute host paths (256 UTF-8 bytes each; no empty
+or dot segments or control characters). The paths apply to each submitted
+target. Keep them in the exact paired handles when resuming a wait. Those
+handles carry caller declarations, not evidence that a file exists.
+
+A successful status read for a `done` or `failed` job returns these as
+`artifact_refs`, with the resolved target, job ID, path and `verified: false`.
+An archive failure still returns the original exit status and any requested
+failure tail. No artifact file is opened, scanned, or transferred by job
+wait. To verify presence, run `fs(action="stat", target=..., path=...)` for
+the reference; use the appropriate authorized Fs read/download separately.
+The reference never grants access, and Fs applies its own configured scope.
+Container paths are not supported by these host references.
+
 An inline `jobs` or `pending` array marked `remote_job` can be copied to another
 bridge. The receiving bridge must resolve the same asset, use an account that
 can read the same remote job state, and resolve the same job directory. The

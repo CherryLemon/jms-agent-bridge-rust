@@ -547,7 +547,7 @@ max_parallel = 2\n",
     assert_eq!(row["name"], "jms_submit_job");
     assert_eq!(
         row["signature"],
-        "jms_submit_job(command, targets, allow_dangerous?)"
+        "jms_submit_job(command, targets, allow_dangerous?, artifact_paths?)"
     );
     let tag = page["etag"].clone();
     let mut cached = page_args;

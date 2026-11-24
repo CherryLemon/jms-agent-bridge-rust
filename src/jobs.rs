@@ -757,6 +757,7 @@ impl Jobs {
         &self,
         host: &Host,
         command: &str,
+        artifact_paths: &[String],
         progress: Option<&dyn ProgressSink>,
     ) -> BridgeResult<(JobHandle, ExecOutcome)> {
         let job_id = new_job_id();
@@ -778,6 +779,9 @@ impl Jobs {
         receipt.insert("session".into(), Value::from(session.clone()));
         receipt.insert("launch_acknowledged".into(), Value::Bool(false));
         receipt.insert("submission_state".into(), Value::from("prepared"));
+        if !artifact_paths.is_empty() {
+            receipt.insert("artifact_paths".into(), json!(artifact_paths));
+        }
         // This write must succeed before any remote bytes may be transmitted.
         if let Some(progress) = progress {
             progress.record("submission_receipts", Value::Object(receipt.clone()))?;

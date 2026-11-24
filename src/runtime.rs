@@ -1037,6 +1037,9 @@ require allow_dangerous=true",
             }
             BridgeError::invalid_arguments(message, validation)
         })?;
+        if operation == "jms_submit_job" {
+            artifact_paths(payload.get("artifact_paths"))?;
+        }
         if let Some(request_id) = request_id {
             if operation != "jms_submit_job" {
                 return Err(BridgeError::invalid(
@@ -1365,6 +1368,7 @@ require allow_dangerous=true",
             .as_object()
             .ok_or_else(|| BridgeError::invalid("arguments must be an object"))?;
         let command = used_string(map, "command")?;
+        let artifacts = Arc::new(artifact_paths(map.get("artifact_paths"))?);
         let allow_dangerous = map
             .get("allow_dangerous")
             .and_then(Value::as_bool)
@@ -1388,6 +1392,7 @@ require allow_dangerous=true",
             let runtime = self.clone();
             let command = command.clone();
             let progress = progress.clone();
+            let artifacts = artifacts.clone();
             let permit = limit.clone();
             set.spawn(async move {
                 let _permit = permit.acquire_owned().await;
@@ -1395,7 +1400,7 @@ require allow_dangerous=true",
                 let asset_id = host.asset_id.clone();
                 let submitted = runtime
                     .jobs
-                    .submit(&host, command.as_ref(), progress.as_deref())
+                    .submit(&host, command.as_ref(), &artifacts, progress.as_deref())
                     .await;
                 (index, name, asset_id, submitted)
             });
@@ -1422,7 +1427,11 @@ require allow_dangerous=true",
                 Ok((handle, outcome)) => {
                     all_launched &= handle.state == crate::jobs::LaunchState::Acknowledged;
                     any_unknown |= handle.state == crate::jobs::LaunchState::Unknown;
-                    job_row(&handle, &outcome)
+                    let mut row = job_row(&handle, &outcome);
+                    if !artifacts.is_empty() && handle.state != crate::jobs::LaunchState::Rejected {
+                        row["artifact_paths"] = json!(&*artifacts);
+                    }
+                    row
                 }
                 Err(error) => {
                     // The receipt could not be persisted, so nothing was transmitted.
@@ -1960,6 +1969,36 @@ fn load_job_handles(store: &ResultStore, input: &Value) -> BridgeResult<Vec<Valu
         .ok_or_else(|| BridgeError::invalid("job continuation has no saved handle array"))
 }
 
+fn artifact_paths(value: Option<&Value>) -> BridgeResult<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let paths = value
+        .as_array()
+        .filter(|paths| paths.len() <= 4)
+        .ok_or_else(|| {
+            BridgeError::invalid(
+                "artifact_paths must be an array of at most four absolute host paths",
+            )
+        })?;
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let path = path.as_str().filter(|path| {
+            path.len() <= 256 && !path.chars().any(char::is_control)
+                && path.strip_prefix('/').is_some_and(|rest| {
+                    rest.split('/').all(|part| !matches!(part, "" | "." | ".."))
+                })
+        }).ok_or_else(|| BridgeError::invalid("artifact_paths entries must be absolute host paths of at most 256 bytes, without empty or dot segments or control characters"))?;
+        if out.iter().any(|existing| existing == path) {
+            return Err(BridgeError::invalid(
+                "artifact_paths must not contain duplicates",
+            ));
+        }
+        out.push(path.to_owned());
+    }
+    Ok(out)
+}
+
 fn validate_job_handles(jobs: &[Value]) -> BridgeResult<Vec<(String, String)>> {
     if jobs.is_empty() {
         return Err(BridgeError::invalid("job wait requires nonempty handles"));
@@ -1968,8 +2007,13 @@ fn validate_job_handles(jobs: &[Value]) -> BridgeResult<Vec<(String, String)>> {
         .map(|handle| {
             let fields = handle
                 .as_object()
-                .filter(|fields| fields.len() == 2)
+                .filter(|fields| {
+                    fields
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "target" | "job_id" | "artifact_paths"))
+                })
                 .ok_or_else(|| BridgeError::invalid("job handle must contain target and job_id"))?;
+            artifact_paths(fields.get("artifact_paths"))?;
             let target = used_string(fields, "target")?;
             let id = used_string(fields, "job_id")?;
             if let Some(error) = validate_job_id(&id) {
@@ -2024,11 +2068,30 @@ fn project_job_wait(
     finished: bool,
 ) -> Value {
     let mut pending = Vec::new();
-    for ((row, handle), (host, _)) in status.iter_mut().zip(jobs).zip(pairs) {
+    for ((row, handle), (host, job_id)) in status.iter_mut().zip(jobs).zip(pairs) {
         let known = crate::jobs::is_terminal_status(row);
         row["target"] = handle["target"].clone();
         row["host"] = json!(host.name);
         row["job_id"] = handle["job_id"].clone();
+        if known
+            && row.get("ok").and_then(Value::as_bool) == Some(true)
+            && matches!(
+                row.get("status").and_then(Value::as_str),
+                Some("failed" | "done")
+            )
+            && handle["job_id"].as_str() == Some(job_id)
+        {
+            let paths = artifact_paths(handle.get("artifact_paths")).unwrap_or_default();
+            if !paths.is_empty() {
+                let target = host.asset_id.as_deref().unwrap_or(&host.name);
+                row["artifact_refs"] = json!(paths
+                    .into_iter()
+                    .map(|path| json!({
+                        "target":target, "job_id":job_id, "path":path, "verified":false
+                    }))
+                    .collect::<Vec<_>>());
+            }
+        }
         if !known {
             pending.push(handle.clone());
         }
@@ -2083,7 +2146,12 @@ fn project_job_submission(mut value: Value) -> Value {
             continue;
         };
         if confirmed_or_unknown && validate_job_id(id).is_none() {
-            jobs.push(json!({"target":target,"job_id":id}));
+            let mut handle = json!({"target":target,"job_id":id});
+            let paths = artifact_paths(row.get("artifact_paths")).unwrap_or_default();
+            if !paths.is_empty() {
+                handle["artifact_paths"] = json!(paths);
+            }
+            jobs.push(handle);
         }
     }
     map.remove("execution_results");
@@ -2575,6 +2643,103 @@ mod tests {
         assert_eq!(value["status"][1]["exit_code"], "7");
         assert_eq!(value["status"][1]["job_id"], "bbbbbbbb");
         assert_eq!(value["status"][2]["target"], "asset-c");
+    }
+
+    #[test]
+    fn archive_failure_preserves_declared_paths_through_receipt_and_wait_without_guessing() {
+        let (directory, store) = job_test_store();
+        let asset = "canonical-asset";
+        let job_id = "1234feed";
+        let path = "/out/metric file.json";
+        let receipt = json!({
+            "host":"duplicate-display", "asset_id":asset, "job_id":job_id,
+            "launch_state":"acknowledged", "artifact_paths":[path]
+        });
+        let submitted = project_job_submission(json!({"jobs":[receipt]}));
+        let replayed = project_job_submission(json!({"submission_receipts":[receipt]}));
+        assert_eq!(submitted["jobs"], replayed["jobs"]);
+        let jobs = load_job_handles(&store, &submitted["jobs"]).unwrap();
+        assert_eq!(
+            validate_job_handles(&jobs).unwrap(),
+            [(asset.into(), job_id.into())]
+        );
+        let pairs = [(
+            Host {
+                name: "duplicate-display".into(),
+                asset_id: Some(asset.into()),
+                ..Host::default()
+            },
+            job_id.into(),
+        )];
+        let pending = project_job_wait(
+            &jobs,
+            &pairs,
+            vec![json!({"status":"running","ok":true})],
+            false,
+        );
+        assert_eq!(pending["pending"], submitted["jobs"]);
+        assert!(pending["status"][0].get("artifact_refs").is_none());
+        let resumed = load_job_handles(&store, &pending["pending"]).unwrap();
+        let failed = project_job_wait(
+            &resumed,
+            &pairs,
+            vec![json!({
+                "status":"failed","exit_code":"7","ok":true,"failure_tail":{"text":"archive failed"}
+            })],
+            true,
+        );
+        assert_eq!(failed["status"][0]["exit_code"], "7");
+        assert_eq!(
+            failed["status"][0]["failure_tail"]["text"],
+            "archive failed"
+        );
+        assert_eq!(
+            failed["status"][0]["artifact_refs"],
+            json!([{
+                "target":asset, "job_id":job_id, "path":path, "verified":false
+            }])
+        );
+        for row in [
+            json!({"status":"missing","ok":true}),
+            json!({"status":"failed","ok":false}),
+        ] {
+            let value = project_job_wait(&jobs, &pairs, vec![row], false);
+            assert!(value["status"][0].get("artifact_refs").is_none());
+        }
+        let mut wrong_pair = pairs.clone();
+        wrong_pair[0].1 = "deadbeef".into();
+        let value = project_job_wait(
+            &jobs,
+            &wrong_pair,
+            vec![json!({"status":"failed","ok":true})],
+            true,
+        );
+        assert!(value["status"][0].get("artifact_refs").is_none());
+        drop(directory);
+    }
+
+    #[test]
+    fn artifact_paths_are_bounded_and_revalidated_for_inlined_and_recovered_handles() {
+        for paths in [
+            json!(["relative"]),
+            json!(["/"]),
+            json!(["//out"]),
+            json!(["/out/../file"]),
+            json!(["/out/file\n"]),
+            json!([format!("/{}", "é".repeat(128))]),
+            json!(["/a", "/a"]),
+            json!(["/a", "/b", "/c", "/d", "/e"]),
+        ] {
+            let invalid = json!({"target":"asset-a", "job_id":"aaaaaaaa", "artifact_paths":paths});
+            assert!(validate_job_handles(&[invalid]).is_err());
+            let recovered = project_job_submission(json!({"submission_receipts":[{
+                "asset_id":"asset-a","job_id":"aaaaaaaa","launch_state":"unknown","artifact_paths":paths
+            }]}));
+            assert_eq!(
+                recovered["jobs"],
+                json!([{"target":"asset-a","job_id":"aaaaaaaa"}])
+            );
+        }
     }
 
     #[test]
