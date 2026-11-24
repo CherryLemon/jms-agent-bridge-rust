@@ -1021,18 +1021,22 @@ require allow_dangerous=true",
         // typed local result is only a source of handles, never authorization.
         let jobs = load_job_handles(&self.store, input)?;
         let handles = validate_job_handles(&jobs)?;
-        let Some(inventory) = job_wait_inventory(deadline, self.inventory()).await? else {
+        let Some((inventory, stale)) =
+            job_wait_inventory(deadline, self.catalog.ensure_with_staleness()).await?
+        else {
             return stage_job_batch(&self.store, JobBatch::Wait, inventory_timeout_rows(jobs));
         };
-        let pairs = inventory.resolve_job_targets(&handles)?;
+        let (pairs, visible_jobs, unobserved) = split_job_observation(&inventory, &jobs, &handles, stale);
+        // No unresolved asset enters the remote observer or failure-tail lookup.
         let (mut status, finished) = self.jobs.wait_until(&pairs, deadline, interval).await;
         if payload.get("tail").and_then(Value::as_bool) == Some(true) {
             self.jobs.failure_tails(&pairs, &mut status, deadline).await;
         }
+        let response = project_job_wait(&visible_jobs, &pairs, status, finished);
         stage_job_batch(
             &self.store,
             JobBatch::Wait,
-            project_job_wait(&jobs, &pairs, status, finished),
+            project_unresolved_job_rows(response, &jobs, &unobserved),
         )
     }
 
@@ -2201,10 +2205,10 @@ fn validate_job_handles(jobs: &[Value]) -> BridgeResult<Vec<(String, String)>> {
         .collect()
 }
 
-async fn job_wait_inventory(
+async fn job_wait_inventory<T>(
     deadline: tokio::time::Instant,
-    inventory: impl std::future::Future<Output = BridgeResult<crate::inventory::Inventory>>,
-) -> BridgeResult<Option<crate::inventory::Inventory>> {
+    inventory: impl std::future::Future<Output = BridgeResult<T>>,
+) -> BridgeResult<Option<T>> {
     if tokio::time::Instant::now() >= deadline {
         return Ok(None);
     }
@@ -2228,6 +2232,63 @@ fn inventory_timeout_rows(jobs: Vec<Value>) -> Value {
         .collect();
     json!({"ok":false,"finished":false,"watch_timeout":true,"inventory_timed_out":true,
            "status":status,"pending":jobs})
+}
+
+type JobObservation = (Vec<(Host, String)>, Vec<Value>, Vec<Option<&'static str>>);
+
+fn split_job_observation(
+    inventory: &crate::inventory::Inventory,
+    jobs: &[Value],
+    handles: &[(String, String)],
+    stale: bool,
+) -> JobObservation {
+    let mut pairs = Vec::new();
+    let mut visible_jobs = Vec::new();
+    let mut unobserved = Vec::with_capacity(jobs.len());
+    for (handle, resolved) in jobs.iter().zip(inventory.resolve_job_targets(handles)) {
+        if let Ok(pair) = resolved {
+            unobserved.push(None);
+            pairs.push(pair);
+            visible_jobs.push(handle.clone());
+        } else {
+            let target = handle["target"].as_str().expect("validated target");
+            let reason = if stale {
+                "inventory_stale"
+            } else if inventory.ambiguous_job_selectors.contains(target)
+                || inventory.groups.get(target).is_some_and(|members| members.len() > 1)
+            {
+                "target_ambiguous"
+            } else {
+                "asset_not_visible"
+            };
+            unobserved.push(Some(reason));
+        }
+    }
+    (pairs, visible_jobs, unobserved)
+}
+
+fn project_unresolved_job_rows(
+    mut response: Value,
+    jobs: &[Value],
+    unobserved: &[Option<&str>],
+) -> Value {
+    if unobserved.iter().all(Option::is_none) {
+        return response;
+    }
+    let rows = std::mem::take(response["status"].as_array_mut().expect("job status rows"));
+    let mut rows = rows.into_iter();
+    response["status"] = json!(jobs.iter().zip(unobserved).map(|(handle, reason)| {
+        let Some(reason) = reason else {
+            return rows.next().expect("one row per visible job");
+        };
+        json!({
+            "target":handle["target"], "job_id":handle["job_id"], "status":"unknown",
+            "ok":false, "probed":false,
+            "reason":reason
+        })
+    }).collect::<Vec<_>>());
+    response["ok"] = json!(false);
+    response
 }
 
 fn project_job_wait(
@@ -2763,7 +2824,7 @@ mod tests {
     #[tokio::test]
     async fn inventory_timeout_keeps_original_handles_but_real_errors_are_not_timeouts() {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
-        let found = job_wait_inventory(deadline, std::future::pending())
+        let found = job_wait_inventory::<crate::inventory::Inventory>(deadline, std::future::pending())
             .await
             .unwrap();
         assert!(found.is_none());
@@ -2775,8 +2836,66 @@ mod tests {
         assert_eq!(response["status"][1]["target"], handles[1]["target"]);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         let denied =
-            job_wait_inventory(deadline, async { Err(BridgeError::inventory("denied")) }).await;
+            job_wait_inventory::<crate::inventory::Inventory>(deadline, async { Err(BridgeError::inventory("denied")) }).await;
         assert!(matches!(denied, Err(BridgeError::Inventory(_))));
+    }
+
+    #[test]
+    fn paired_wait_retains_visible_rows_but_does_not_continue_invisible_rows() {
+        let jobs = [
+            json!({"target":"allowed","job_id":"aaaaaaaa"}),
+            json!({"target":"invisible","job_id":"bbbbbbbb","artifact_paths":["/private"]}),
+            json!({"target":"allowed","job_id":"cccccccc"}),
+        ];
+        let host = Host { name: "allowed".into(), ..Host::default() };
+        let inventory = crate::inventory::Inventory {
+            hosts: vec![host.clone()],
+            ..Default::default()
+        };
+        let resolved = inventory.resolve_job_targets(&validate_job_handles(&jobs).unwrap());
+        let visible = resolved.iter().map(Result::is_ok).collect::<Vec<_>>();
+        assert_eq!(visible, [true, false, true]);
+        let pairs = resolved.into_iter().flatten().collect::<Vec<_>>();
+        let projected = project_job_wait(
+            &[jobs[0].clone(), jobs[2].clone()],
+            &pairs,
+            vec![json!({"ok":true,"status":"done","exit_code":"0"}),
+                 json!({"ok":false,"status":"unknown","error":"fixture transport unavailable"})],
+            false,
+        );
+        let response = project_unresolved_job_rows(projected.clone(), &jobs, &[None, Some("asset_not_visible"), None]);
+        assert_eq!(response["finished"], false);
+        assert_eq!(response["status"][0]["exit_code"], "0");
+        assert_eq!(response["status"][1], json!({
+            "target":"invisible","job_id":"bbbbbbbb","status":"unknown","ok":false,
+            "probed":false,"reason":"asset_not_visible"
+        }));
+        assert_eq!(response["status"][2], projected["status"][1]);
+        assert_eq!(response["pending"], json!([jobs[2]]));
+        let stale = project_unresolved_job_rows(projected.clone(), &jobs, &[None, Some("inventory_stale"), None]);
+        assert_eq!(stale["status"][1]["reason"], "inventory_stale");
+        let mut inventory = inventory;
+        inventory.hosts[0].asset_id = Some("stable-id".into());
+        inventory.groups.insert("invisible".into(), vec!["allowed".into(), "other".into()]);
+        let mut jobs = jobs;
+        jobs[0]["target"] = json!("stable-id");
+        let handles = validate_job_handles(&jobs).unwrap();
+        let (pairs, visible_jobs, reasons) = split_job_observation(&inventory, &jobs, &handles, false);
+        assert_eq!(reasons, [None, Some("target_ambiguous"), None]);
+        assert_eq!(pairs.iter().map(|(_, id)| id.as_str()).collect::<Vec<_>>(), ["aaaaaaaa", "cccccccc"]);
+        assert_eq!(visible_jobs[0]["target"], "stable-id");
+        assert_eq!(pairs[0].0.asset_id.as_deref(), Some("stable-id"));
+        let ambiguous = project_unresolved_job_rows(projected, &jobs, &reasons);
+        assert_eq!(ambiguous["status"][1]["reason"], "target_ambiguous");
+        assert_eq!(ambiguous["status"][1]["probed"], false);
+        assert_eq!(ambiguous["pending"], json!([jobs[2]]));
+        let no_visible = project_job_wait(&[], &[], vec![], true);
+        let mut none = project_unresolved_job_rows(no_visible, &jobs[1..2], &[Some("asset_not_visible")]);
+        mark_job_recovery(&mut none, "pending");
+        assert_eq!(none["finished"], true);
+        assert_eq!(none["ok"], false);
+        assert_eq!(none["pending"], json!([]));
+        assert!(none.get("next_action").is_none());
     }
 
     #[test]

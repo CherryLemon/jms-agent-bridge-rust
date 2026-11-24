@@ -354,3 +354,77 @@ async fn discover_etag_does_not_hide_failed_refresh_or_revocation() {
     assert!(revoked.get("unchanged").is_none());
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn paired_wait_keeps_visible_rows_when_another_asset_cannot_be_observed() {
+    use jms_bridge::{mcp::BridgeServer, runtime::BridgeRuntime};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let detail_status = Arc::new(AtomicUsize::new(200));
+    let status = detail_status.clone();
+    let app = Router::new()
+        .route("/api/v1/perms/users/my/assets/", get(|| async {
+            Json(json!({"count":2,"next":null,"results":[
+                {"id":ASSET_A,"name":"duplicate-name"},
+                {"id":ASSET_B,"name":"duplicate-name"}
+            ]}))
+        }))
+        .route("/api/v1/perms/users/my/assets/{id}/", get(move |Path(id): Path<String>| {
+            let status = status.clone();
+            async move {
+                let mut data = detail(&id);
+                data["name"] = json!("duplicate-name");
+                data["address"] = json!("192.0.2.30");
+                (StatusCode::from_u16(status.load(Ordering::SeqCst) as u16).unwrap(), Json(data))
+            }
+        }));
+    let fixture = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let state = dir.path().join("state");
+    std::fs::write(&config, format!(
+        "[bastion]\nurl = 'http://{address}'\nssh_port = 1\nlogin_user = 'fixture'\nsession_token = 'offline'\n[bridge]\nstate_dir = '{}'\n",
+        state.display()
+    )).unwrap();
+    let runtime = BridgeRuntime::start(Some(&config), false).await.unwrap();
+    let server = BridgeServer::new(runtime.clone());
+    // The known row still reaches the observer, but its result cannot be
+    // allocated locally, so neither row can reach even a dummy SSH gateway.
+    let results = state.join("results");
+    std::fs::remove_dir(&results).unwrap();
+    std::fs::write(&results, "").unwrap();
+    let visible = json!({"target":ASSET_A,"job_id":"aaaaaaaa"});
+    let hidden = json!({"target":"not-on-this-bridge","job_id":"bbbbbbbb"});
+    let dup_name = json!({"target":"duplicate-name","job_id":"cccccccc"});
+    let dup_address = json!({"target":"192.0.2.30","job_id":"dddddddd"});
+    let request = json!({"action":"wait","jobs":[hidden,visible,dup_name,dup_address],"timeout":2,"interval":1,"tail":true,"detail":"full"});
+    let response = server.dispatch("job", request.as_object().unwrap().clone()).await.unwrap();
+    assert_eq!(response["finished"], false, "{response}");
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["status"][0]["reason"], "asset_not_visible");
+    assert_eq!(response["status"][0]["probed"], false);
+    assert!(response["status"][0].get("host").is_none());
+    assert_eq!(response["status"][1]["job_id"], "aaaaaaaa");
+    assert!(response["status"][1]["error"].is_string(), "{response}");
+    assert_eq!(response["pending"], json!([visible]));
+    for row in &response["status"].as_array().unwrap()[2..] {
+        assert_eq!(row["reason"], "target_ambiguous");
+        assert_eq!(row["probed"], false);
+        assert!(row.get("host").is_none());
+        assert!(row.get("failure_tail").is_none());
+    }
+    assert!(runtime.catalog.inventory().resolve(&["duplicate-name".into()]).is_err());
+    assert!(runtime.catalog.inventory().resolve(&["192.0.2.30".into()]).is_err());
+    detail_status.store(500, Ordering::SeqCst);
+    assert_eq!(runtime.catalog.refresh().await["ok"], false);
+    let stale = json!({"action":"wait","jobs":[dup_name,dup_address,hidden],"tail":true,"detail":"full"});
+    let response = server.dispatch("job", stale.as_object().unwrap().clone()).await.unwrap();
+    for row in response["status"].as_array().unwrap() {
+        assert_eq!(row["reason"], "inventory_stale");
+        assert_eq!(row["probed"], false);
+    }
+    assert_eq!(response["pending"], json!([]));
+    assert_eq!(response["finished"], true);
+    assert!(response.get("next_action").is_none());
+    fixture.abort();
+}
