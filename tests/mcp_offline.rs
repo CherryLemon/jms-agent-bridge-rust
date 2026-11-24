@@ -742,6 +742,62 @@ max_parallel = 2\n",
             Value::Null,
             "Invalid operation arguments at <args>; discover this operation for its schema",
         ),
+        (
+            "fs",
+            json!({"target":"worker","action":"read","path":"/fixture","timeout":121}),
+            "/timeout",
+            Value::Null,
+            Value::Null,
+            "Invalid arguments at <args>: unexpected property: timeout",
+        ),
+        (
+            "fs",
+            json!({"target":"worker","action":"read","path":"/fixture","options":{"timeout":121}}),
+            "/options/timeout",
+            json!({"minimum":1,"maximum":120}),
+            Value::Null,
+            "exploration timeout must be 1..=120 seconds",
+        ),
+        (
+            "call",
+            json!({"operation":"jms_fs","arguments":{"target":"worker","action":"read","path":"/fixture","timeout":901}}),
+            "/arguments/timeout",
+            json!({"minimum":1,"maximum":120}),
+            Value::Null,
+            "Invalid operation arguments at timeout; discover this operation for its schema",
+        ),
+        (
+            "call",
+            json!({"operation":"jms_fs","arguments":{"target":"worker","action":"read","path":"/fixture","timeout":121}}),
+            "/arguments/timeout",
+            json!({"minimum":1,"maximum":120}),
+            Value::Null,
+            "exploration timeout must be 1..=120 seconds",
+        ),
+        (
+            "fs",
+            json!({"target":"worker","action":"read","path":"/fixture","options":{"overwrit":false}}),
+            "/options/overwrit",
+            Value::Null,
+            Value::Null,
+            "Invalid arguments at options: unexpected property: overwrit",
+        ),
+        (
+            "call",
+            json!({"operation":"jms_fs","arguments":{"target":"worker","action":"read","path":"/fixture","overwrit":false}}),
+            "/arguments/overwrit",
+            Value::Null,
+            Value::Null,
+            "Invalid operation arguments at <args>; discover this operation for its schema",
+        ),
+        (
+            "fs",
+            json!({"target":"worker","action":"download","path":"/fixture","options":{"timeout":901}}),
+            "/options/timeout",
+            json!({"minimum":1,"maximum":900}),
+            Value::Null,
+            "Invalid arguments at options.timeout: must be <= 900",
+        ),
     ] {
         let reply: Value = client
             .post(&endpoint)
@@ -765,6 +821,15 @@ max_parallel = 2\n",
         assert_eq!(body["validation"]["path"], path, "{body}");
         assert_eq!(body["validation"]["expected"], expected, "{body}");
         assert_eq!(body["validation"]["suggestion"], suggestion, "{body}");
+        if path == "/target" {
+            assert_eq!(
+                body["validation"]["message"], "missing required: target",
+                "{body}"
+            );
+        }
+        if path == "/arguments/timeout" && arguments["arguments"]["timeout"] == 901 {
+            assert_eq!(body["validation"]["message"], "must be <= 120", "{body}");
+        }
     }
     http.abort();
 

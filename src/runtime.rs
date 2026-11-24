@@ -899,10 +899,17 @@ require allow_dangerous=true",
             } else {
                 "/arguments"
             };
-            let mut validation = error.diagnostic(prefix);
+            let mut validation = if operation == "jms_fs" {
+                crate::schema::fs_diagnostic(error, &payload, prefix)
+            } else {
+                error.diagnostic(prefix)
+            };
             if matches!(direct_job_action, Some("logs" | "cancel")) && validation["path"] == "/host"
             {
                 validation["path"] = json!("/target");
+                if validation["message"] == "missing required: host" {
+                    validation["message"] = json!("missing required: target");
+                }
             }
             BridgeError::invalid_arguments(message, validation)
         })?;
@@ -954,7 +961,10 @@ require allow_dangerous=true",
         arguments: Map<String, Value>,
     ) -> BridgeResult<Value> {
         match operation {
-            "jms_fs" => self.tool_fs(arguments).await,
+            "jms_fs" => self
+                .tool_fs(arguments)
+                .await
+                .map_err(|error| error.with_validation_prefix("/arguments")),
             "jms_accelerator_status" => {
                 let targets = string_list(arguments.get("targets"));
                 let timeout = arguments

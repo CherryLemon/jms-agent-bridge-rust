@@ -55,6 +55,42 @@ impl SchemaError {
     }
 }
 
+/// Refine existing Fs schema failures without changing validation or its precedence.
+pub(crate) fn fs_diagnostic(
+    error: SchemaError,
+    flat: &serde_json::Map<String, Value>,
+    prefix: &str,
+) -> Value {
+    let mut diagnostic = error.diagnostic(prefix);
+    let Some(action_schema) = flat
+        .get("action")
+        .and_then(Value::as_str)
+        .and_then(|action| crate::schemas::fs_action_schema(action).ok())
+    else {
+        return diagnostic;
+    };
+    let properties = &action_schema["inputSchema"]["properties"];
+    if let Some(field) = diagnostic["suggestion"].as_str() {
+        if properties.get(field).is_none() {
+            diagnostic.as_object_mut().unwrap().remove("suggestion");
+        }
+    }
+    if diagnostic["path"] == format!("{prefix}/timeout")
+        || diagnostic["path"] == format!("{prefix}/options/timeout")
+    {
+        if diagnostic["expected"].get("maximum").is_some() {
+            diagnostic["expected"] = numeric_bounds(properties["timeout"].as_object().unwrap());
+            if let Some(timeout) = flat.get("timeout").and_then(Value::as_f64) {
+                let max = properties["timeout"]["maximum"].as_f64().unwrap();
+                if timeout > max {
+                    diagnostic["message"] = json!(format!("must be <= {max}"));
+                }
+            }
+        }
+    }
+    diagnostic
+}
+
 pub(crate) fn pointer_token(field: &str) -> String {
     format!("/{}", field.replace('~', "~0").replace('/', "~1"))
 }

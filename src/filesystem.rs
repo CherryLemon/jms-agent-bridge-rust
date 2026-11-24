@@ -101,9 +101,12 @@ pub fn validate(arguments: &Map<String, Value>) -> BridgeResult<()> {
         } else {
             "exploration"
         };
-        return Err(BridgeError::invalid(format!(
-            "{kind} timeout must be {FS_TIMEOUT_MIN}..={timeout_max} seconds"
-        )));
+        let message = format!("{kind} timeout must be {FS_TIMEOUT_MIN}..={timeout_max} seconds");
+        return Err(BridgeError::invalid_arguments(
+            &message,
+            serde_json::json!({"path": "/timeout", "message": &message,
+                               "expected": {"minimum": FS_TIMEOUT_MIN, "maximum": timeout_max}}),
+        ));
     }
     if matches!(action, "upload" | "download") {
         let local = arguments
