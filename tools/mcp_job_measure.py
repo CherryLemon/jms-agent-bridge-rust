@@ -61,8 +61,9 @@ def connected(binary, root, config, mode, *, state="state"):
 
 
 class Client:
-    def __init__(self, exchange, legacy, *, count_result_tokens=None):
+    def __init__(self, exchange, legacy, *, count_result_tokens=None, capture_results=False):
         self.count_result_tokens = count_result_tokens
+        self.capture_results = capture_results or count_result_tokens is not None
         self.result_texts = []
         self.exchange = exchange
         self.legacy = legacy
@@ -105,7 +106,7 @@ class Client:
         stats = self.bytes.setdefault(step, Counter())
         stats.update({"request_bytes": sizes[0], "response_bytes": sizes[1]})
         result_text = result["content"][0]["text"]
-        if self.count_result_tokens is not None:
+        if self.capture_results:
             self.result_texts.append((step, result_text))
         return json.loads(result_text)
 
@@ -223,7 +224,7 @@ def summarize(samples):
     return result
 
 
-def measure(binary, fixture, repeats, *, count_result_tokens=None):
+def measure(binary, fixture, repeats, *, count_result_tokens=None, observe_results=None):
     cohorts = {mode: {variant: [] for variant in ("legacy", "public")}
                for mode in ("stdio", "http")}
     for mode, variants in cohorts.items():
@@ -235,7 +236,8 @@ def measure(binary, fixture, repeats, *, count_result_tokens=None):
                     with LoopbackJobs(root, fixture).serving() as server:
                         with connected(binary, root, server.config, mode) as exchange:
                             client = Client(exchange, legacy=variant == "legacy",
-                                            count_result_tokens=count_result_tokens)
+                                            count_result_tokens=count_result_tokens,
+                                            capture_results=observe_results is not None)
                             start = time.perf_counter_ns()
                             try:
                                 states, timed_out = workflow(client, fixture)
@@ -261,6 +263,8 @@ def measure(binary, fixture, repeats, *, count_result_tokens=None):
                                 raise RuntimeError(f"unexpected per-asset {operation}: {server.per_asset[operation]!r}")
                         if server.per_asset["ssh_status"].keys() != expected_counts.keys():
                             raise RuntimeError("status probes did not cover exactly the expected targets")
+                        if observe_results is not None:
+                            observe_results(mode, variant, client.result_texts)
                         variants[variant].append({
                             "elapsed_ms": elapsed, "calls": client.counts, "timed_out": timed_out,
                             "terminal_jobs": states, "backend_requests": server.counts.copy(),
