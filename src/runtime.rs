@@ -518,8 +518,16 @@ require allow_dangerous=true",
             }
             identity
         };
+        // The legacy action schemas reject these fields before this check.
+        // The public terminal options schema is shared by all actions.
+        let invalid_option = |field: &str, message: &str| {
+            BridgeError::invalid_arguments(
+                message,
+                json!({"path": format!("/options{}", crate::schema::pointer_token(field)), "message": message}),
+            )
+        };
         if action != "read" && arguments.contains_key("result_id") {
-            return Err(BridgeError::invalid("result_id is only for terminal read"));
+            return Err(invalid_option("result_id", "result_id is only for terminal read"));
         }
         if action != "close" && arguments.contains_key("expected_result_id") {
             // The persistent SSH channel does not bind input to a remote
@@ -529,10 +537,11 @@ require allow_dangerous=true",
             } else {
                 "expected_result_id is only for terminal close"
             };
-            return Err(BridgeError::invalid(message));
+            return Err(invalid_option("expected_result_id", message));
         }
         if matches!(action, "open" | "close") && arguments.contains_key("wait_for") {
-            return Err(BridgeError::invalid(
+            return Err(invalid_option(
+                "wait_for",
                 "wait_for is only for terminal exec, read or write",
             ));
         }

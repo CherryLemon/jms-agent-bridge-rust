@@ -206,7 +206,7 @@ reuse handle. Running is not completion; reads honour cursors.",
                             "docker_args": {"type": "array", "items": {"type": "string"}},
                             "cwd": string("open: directory for the bound shell."),
                             "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                            "wait_ms": integer(0, MAX_TERMINAL_WAIT_MS, DEFAULT_TERMINAL_WAIT_MS, "Maximum observation wait in milliseconds."),
+                            "wait_ms": terminal_wait_ms_schema(),
                             "wait_for": terminal_wait_policy(),
                             "max_bytes": integer(MIN_TERMINAL_PAGE_BYTES, MAX_TERMINAL_PAGE_BYTES, DEFAULT_TERMINAL_PAGE_BYTES, "Shared source byte budget for stdout and stderr."),
                             "cursor": {"type": "object", "additionalProperties": false,
@@ -247,7 +247,7 @@ reuse handle. Running is not completion; reads honour cursors.",
                     "timeout":{"type":"number","minimum":1,"maximum":180,"default":50},
                     "interval":{"type":"number","minimum":0.1,"maximum":30,"default":2},
                     "offset":int(0,1099511627776,0),
-                    "max_bytes":int(JOB_LOG_MIN_BYTES, JOB_LOG_MAX_BYTES, JOB_LOG_DEFAULT_BYTES),
+                    "max_bytes":job_log_bytes_schema(),
                     "tail":{"type":"boolean"},
                     "pattern":{"type":"string","minLength":1,"maxLength":1024},
                     "cursor":{"type":"string","minLength":1,"maxLength":256}
@@ -620,6 +620,14 @@ original ID after reply loss; reusing it never replays.",
     map
 }
 
+fn terminal_wait_ms_schema() -> Value {
+    integer(0, MAX_TERMINAL_WAIT_MS, DEFAULT_TERMINAL_WAIT_MS, "Maximum observation wait in milliseconds.")
+}
+
+fn job_log_bytes_schema() -> Value {
+    integer(JOB_LOG_MIN_BYTES, JOB_LOG_MAX_BYTES, JOB_LOG_DEFAULT_BYTES, "Log bytes per read.")
+}
+
 fn terminal_wait_policy() -> Value {
     json!({"type": "string", "enum": ["output", "completed"], "default": "output",
            "description": "Return on output or completion (default), or wait only for terminal state."})
@@ -633,7 +641,7 @@ fn terminal_close_expectation() -> Value {
 fn terminal_operations() -> Vec<(&'static str, &'static str, Value, Value)> {
     let pages = || {
         json!({
-            "wait_ms": int(0, MAX_TERMINAL_WAIT_MS, DEFAULT_TERMINAL_WAIT_MS),
+            "wait_ms": terminal_wait_ms_schema(),
             "wait_for": terminal_wait_policy(),
             "max_bytes": integer(MIN_TERMINAL_PAGE_BYTES, MAX_TERMINAL_PAGE_BYTES, DEFAULT_TERMINAL_PAGE_BYTES, "Shared source byte budget for stdout and stderr."),
             "cursor": {"type": "object", "additionalProperties": false,
@@ -751,7 +759,7 @@ fn job_operations() -> Vec<(&'static str, &'static str, Value, Value, bool, bool
                 "host": {"type": "string"},
                 "job_id": {"type": "string", "pattern": "^[0-9a-f]{8}$"},
                 "offset": int(0, 1099511627776, 0),
-                "max_bytes": int(JOB_LOG_MIN_BYTES, JOB_LOG_MAX_BYTES, JOB_LOG_DEFAULT_BYTES),
+                "max_bytes": job_log_bytes_schema(),
                 "tail": {"type":"boolean"},
                 "pattern":{"type":"string","minLength":1,"maxLength":1024},
                 "cursor":{"type":"string","minLength":1,"maxLength":256},
@@ -1389,6 +1397,24 @@ mod tests {
     /// tool's own annotation flags, and the JSON-RPC envelope. `estimate_tokens` is a
     /// tokenizer-independent *estimate* (the live figure is recorded in
     /// `docs/verification.md`), not a measurement for a specific model.
+    #[test]
+    fn exact_budget_descriptions_match_across_facades() {
+        let job = exact_operation_schema("job", "").unwrap();
+        let logs = exact_operation_schema("jms_job_logs", "").unwrap();
+        let terminal = exact_operation_schema("terminal", "").unwrap();
+        let read = exact_operation_schema("terminal_read", "").unwrap();
+        let property = |schema: &Value, field: &str| schema["inputSchema"]["properties"][field].clone();
+        let max_bytes = property(&job, "max_bytes");
+        assert_eq!(max_bytes, property(&logs, "max_bytes"));
+        assert_eq!(max_bytes["description"], "Log bytes per read.");
+        let options = property(&terminal, "options");
+        for field in ["wait_ms", "max_bytes"] {
+            assert_eq!(options["properties"][field], property(&read, field));
+        }
+        assert!(options["properties"]["wait_ms"]["description"]
+            .as_str().unwrap().contains("milliseconds"));
+    }
+
     #[test]
     fn advertised_tools_stay_within_their_token_budget() {
         let tools: Vec<Value> = advertised()
