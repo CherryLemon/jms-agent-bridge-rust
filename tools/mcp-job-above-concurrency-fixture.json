@@ -1,0 +1,52 @@
+{
+  "command": "printf synthetic-workload",
+  "targets": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "fixture-1",
+      "pending_seconds": 0,
+      "exit_code": 7,
+      "log": "fixture 1 failed\n"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "name": "fixture-2",
+      "pending_seconds": 0,
+      "exit_code": 0,
+      "log": "fixture 2 complete\n"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "name": "fixture-3",
+      "pending_seconds": 0,
+      "exit_code": 0,
+      "log": "fixture 3 complete\n"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000004",
+      "name": "fixture-4",
+      "pending_seconds": 0,
+      "exit_code": 7,
+      "log": "fixture 4 failed\n"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000005",
+      "name": "fixture-5",
+      "pending_seconds": 0,
+      "exit_code": 0,
+      "log": "fixture 5 complete\n"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000006",
+      "name": "fixture-6",
+      "pending_seconds": 0,
+      "exit_code": 0,
+      "log": "fixture 6 complete\n"
+    }
+  ],
+  "first_timeout": 3,
+  "followup_timeout": 4,
+  "interval": 0.5,
+  "require_timeout": false,
+  "status_delay_ms": 80
+}

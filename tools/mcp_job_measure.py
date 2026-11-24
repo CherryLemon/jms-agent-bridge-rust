@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import math
+import platform
 from pathlib import Path
 import re
 import socket
@@ -19,6 +20,11 @@ from mcp_job_loopback import LoopbackJobs
 
 
 FIXTURE = Path(__file__).with_name("mcp-job-loopback-fixture.json")
+CASES = {
+    "mixed-timeout": FIXTURE,
+    "one-target": Path(__file__).with_name("mcp-job-one-target-fixture.json"),
+    "above-concurrency": Path(__file__).with_name("mcp-job-above-concurrency-fixture.json"),
+}
 
 
 @contextmanager
@@ -106,7 +112,11 @@ def workflow(client, fixture):
                for row in submitted["jobs"]]
     if not submitted["ok"] or Counter(row["target"] for row in handles) != Counter(targets.keys()):
         raise RuntimeError(f"unexpected submission: {submitted!r}")
-    return follow_jobs(client, fixture, handles)
+    require_timeout = fixture.get("require_timeout", True)
+    states, timed_out = follow_jobs(client, fixture, handles, require_timeout=require_timeout)
+    if timed_out != require_timeout:
+        raise RuntimeError("fixture unexpectedly needed a continuation")
+    return states, timed_out
 
 
 def follow_jobs(client, fixture, handles, *, require_timeout=True):
@@ -198,14 +208,31 @@ def measure(binary, fixture, repeats):
                                 or server.counts["ssh_logs"] != expected_jobs
                                 or server.counts["ssh_status"] < expected_jobs):
                             raise RuntimeError(f"unexpected backend request counts: {server.counts!r}")
+                        expected_counts = Counter({row["id"]: 1 for row in fixture["targets"]})
+                        for operation in ("ssh_launch", "ssh_logs"):
+                            if server.per_asset[operation] != expected_counts:
+                                raise RuntimeError(f"unexpected per-asset {operation}: {server.per_asset[operation]!r}")
+                        if server.per_asset["ssh_status"].keys() != expected_counts.keys():
+                            raise RuntimeError("status probes did not cover exactly the expected targets")
                         variants[variant].append({
                             "elapsed_ms": elapsed, "calls": client.counts, "timed_out": timed_out,
                             "terminal_jobs": states, "backend_requests": server.counts.copy(),
+                            "peak_status_handlers": server.peak_status_handlers,
                             **{field: {step: size[field] for step, size in client.bytes.items()}
                                for field in ("request_bytes", "response_bytes")},
                         })
-    return {mode: {variant: summarize(samples) for variant, samples in variants.items()}
-            for mode, variants in cohorts.items()}
+    return {
+        mode: {
+            variant: {
+                **summarize(samples),
+                "duplicate_launches": 0,  # Invalid workflows are rejected, not summarized.
+                "observed_peak_backend_status_handlers": max(
+                    row["peak_status_handlers"] for row in samples),
+            }
+            for variant, samples in variants.items()
+        }
+        for mode, variants in cohorts.items()
+    }
 
 
 def main():
@@ -213,19 +240,28 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--server-git-sha", required=True)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--case", choices=CASES, default="mixed-timeout")
     args = parser.parse_args()
     if args.repeats < 1 or not re.fullmatch(r"[0-9a-fA-F]{40}", args.server_git_sha):
         parser.error("require positive repeats and a full server source SHA")
-    fixture_bytes = FIXTURE.read_bytes()
+    fixture_bytes = CASES[args.case].read_bytes()
+    fixture = json.loads(fixture_bytes)
+    from paramiko import __version__ as paramiko_version
+
     result = {
+        "client": {"python": platform.python_version(), "paramiko": paramiko_version},
         "scope": "real MCP and loopback backend requests; canned job execution",
         "byte_scope": {"stdio": "UTF-8 JSON + LF", "http": "HTTP bodies only"},
         "server_git_sha": args.server_git_sha.lower(),
         "binary_sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest(),
         "fixture_sha256": hashlib.sha256(fixture_bytes).hexdigest(),
-        "targets_per_workflow": len(json.loads(fixture_bytes)["targets"]),
+        "case": args.case,
+        "repeats_per_transport_facade": args.repeats,
+        "process_state": "fresh server, state directory and emulator per workflow",
+        "targets_per_workflow": len(fixture["targets"]),
+        "synthetic_status_delay_ms": fixture.get("status_delay_ms", 0),
         "model_tokens": None,
-        "transports": measure(args.binary.resolve(), json.loads(fixture_bytes), args.repeats),
+        "transports": measure(args.binary.resolve(), fixture, args.repeats),
     }
     print(json.dumps(result, indent=2, sort_keys=True))
 

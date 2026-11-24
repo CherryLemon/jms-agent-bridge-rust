@@ -27,6 +27,9 @@ class LoopbackJobs:
         self.token = secrets.token_urlsafe()
         self.jobs = {}
         self.counts = Counter()
+        self.per_asset = {key: Counter() for key in ("ssh_launch", "ssh_status", "ssh_logs")}
+        self.status_handlers = 0
+        self.peak_status_handlers = 0
         self.errors = []
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -161,7 +164,21 @@ class LoopbackJobs:
                     raise ValueError("oversize fixture operation")
             nonce = re.search(rb"START([0-9a-f]{32})", packet).group(1)
             self.marker(channel, b"\x1eSTART" + nonce + b"\x1f")
-            output = self.canned_reply(asset, packet)
+            # The optional delay exposes overlapping in-flight status requests.
+            # Never sleep with the fixture lock held.
+            status = b'echo "status=' in packet
+            if status:
+                with self.lock:
+                    self.status_handlers += 1
+                    self.peak_status_handlers = max(self.peak_status_handlers, self.status_handlers)
+            try:
+                if status and (delay := self.case.get("status_delay_ms", 0)):
+                    time.sleep(delay / 1000)
+                output = self.canned_reply(asset, packet)
+            finally:
+                if status:
+                    with self.lock:
+                        self.status_handlers -= 1
             channel.sendall(output)
             self.marker(channel, b"\x1eEND" + nonce + b":0\x1f")
             channel.send_exit_status(0)
@@ -188,6 +205,7 @@ class LoopbackJobs:
         with self.lock:
             if b"JMS_RUNNER_EOF" in packet and self.case["command"].encode() in packet:
                 self.counts["ssh_launch"] += 1
+                self.per_asset["ssh_launch"][asset] += 1
                 if job in self.jobs:
                     raise ValueError("duplicate launch of fixture job")
                 self.jobs[job] = None
@@ -196,6 +214,7 @@ class LoopbackJobs:
                 raise ValueError("probe did not refer to a launched fixture job")
             if b"echo \"status=" in packet:
                 self.counts["ssh_status"] += 1
+                self.per_asset["ssh_status"][asset] += 1
                 if self.jobs[job] is None:
                     self.jobs[job] = time.monotonic() + row["pending_seconds"]
                 if time.monotonic() < self.jobs[job]:
@@ -205,6 +224,7 @@ class LoopbackJobs:
                 return f"status={state}\nalive=no\nexit_code={exit_code}\nlog_bytes={len(log)}\n".encode()
             if b"base64 -w0" in packet and b"offset=0" in packet:
                 self.counts["ssh_logs"] += 1
+                self.per_asset["ssh_logs"][asset] += 1
                 return f"size={len(log)}\noffset=0\n".encode() + base64.b64encode(log)
             raise ValueError("unrecognized fixture operation")
 
