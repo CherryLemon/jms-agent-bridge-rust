@@ -219,6 +219,16 @@ job(action="submit", targets=["worker-a", "worker-b"], command="…", request_id
 job(action="wait", jobs=[{"target":"worker-a","job_id":"1a2b3c4d"},{"target":"worker-b","job_id":"5e6f7890"}])
 ```
 
+Read the current bounded suffix with
+`job(action="logs", target="worker-a", job_id="1a2b3c4d", tail=true)`.
+The legacy `jms_job_logs` operation accepts the same flag under `arguments`,
+using `host` instead of `target`. The returned `offset` is the first source
+byte of the suffix. To follow later appends, omit `tail` and pass
+`next_offset` as `offset`. Do not supply `tail=true` and an explicit
+`offset` together. Cursors advance by the raw source bytes actually read,
+including when text decoding replaces a partial UTF-8 sequence.
+
+
 Pass the returned `jobs` array directly to `wait`. `submissions` carries per-target
 launch evidence, including rejected launches that do not get a wait handle. A
 concurrent duplicate can report `request_state: "running"`; retry or reconcile

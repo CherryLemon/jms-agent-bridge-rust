@@ -1071,7 +1071,7 @@ require allow_dangerous=true",
                 Ok(json!({"ok": ok, "status": status}))
             }
             "jms_job_logs" => {
-                let host = self.resolve_one(&used_string(&arguments, "host")?).await?;
+                let target = used_string(&arguments, "host")?;
                 let job_id = used_string(&arguments, "job_id")?;
                 let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0);
                 let max_bytes = arguments
@@ -1079,7 +1079,19 @@ require allow_dangerous=true",
                     .and_then(Value::as_u64)
                     .unwrap_or(4096)
                     .clamp(1024, 16384);
-                self.jobs.logs(&host, &job_id, offset, max_bytes).await
+                let tail = arguments
+                    .get("tail")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if tail && arguments.contains_key("offset") {
+                    return Err(BridgeError::invalid(
+                        "job logs takes tail or offset, not both",
+                    ));
+                }
+                let host = self.resolve_one(&target).await?;
+                self.jobs
+                    .logs(&host, &job_id, offset, max_bytes, tail)
+                    .await
             }
             "jms_job_cancel" => {
                 let host = self.resolve_one(&used_string(&arguments, "host")?).await?;

@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
 use crate::errors::{BridgeError, BridgeResult};
@@ -78,6 +80,63 @@ fn workdir_expr(workdir: Option<&str>) -> Option<String> {
         });
     }
     Some(shell_quote(workdir))
+}
+
+/// Open once so the watermark and bytes come from the same file even if the
+/// pathname is replaced. Encode bytes so UTF-8 replacement cannot affect the cursor.
+fn job_log_command(log_path: &str, offset: u64, max_bytes: u64, tail: bool) -> String {
+    let position = if tail {
+        format!("offset=$((size > {max_bytes} ? size - {max_bytes} : 0))")
+    } else {
+        format!("offset={offset}")
+    };
+    format!(
+        r#"(
+if [ ! -f {log_path} ]; then
+  printf 'size=0\noffset={missing_offset}\n'
+  exit 0
+fi
+exec 3< {log_path} || exit
+size=$(stat -Lc %s "/proc/self/fd/3") || exit
+{position}
+printf 'size=%s\noffset=%s\n' "$size" "$offset"
+remaining=$((size - offset))
+if [ "$remaining" -gt 0 ]; then
+  count=$(({max_bytes} < remaining ? {max_bytes} : remaining))
+  set -o pipefail
+  dd bs=4096 iflag=skip_bytes,count_bytes skip="$offset" count="$count" status=none <&3 | base64 -w0
+fi
+)"#,
+        missing_offset = if tail { 0 } else { offset },
+    )
+}
+
+fn parse_job_log(
+    output: &str,
+    requested: u64,
+    max_bytes: u64,
+    tail: bool,
+) -> BridgeResult<(u64, u64, Vec<u8>)> {
+    let malformed = || BridgeError::invalid("invalid response from remote job log reader");
+    let mut fields = output.splitn(3, '\n');
+    let mut read_field = |prefix: &str| fields.next()?.strip_prefix(prefix)?.parse::<u64>().ok();
+    let size = read_field("size=").ok_or_else(malformed)?;
+    let offset = read_field("offset=").ok_or_else(malformed)?;
+    let expected = if tail {
+        size.saturating_sub(max_bytes)
+    } else {
+        requested
+    };
+    if offset != expected {
+        return Err(malformed());
+    }
+    let body = BASE64
+        .decode(fields.next().unwrap_or_default().trim_end())
+        .map_err(|_| malformed())?;
+    if body.len() as u64 > max_bytes.min(size.saturating_sub(offset)) {
+        return Err(malformed());
+    }
+    Ok((size, offset, body))
 }
 
 /// The remote bash script that wraps one job.
@@ -586,33 +645,23 @@ else echo 'status=missing'; fi"
         job_id: &str,
         offset: u64,
         max_bytes: u64,
+        tail: bool,
     ) -> BridgeResult<Value> {
         if let Some(error) = validate_job_id(job_id) {
             return Err(BridgeError::invalid(error));
         }
         let log_path = format!("{}/stdout.log", job_root(host, job_id));
-        let command = format!(
-            "if [ -f {log_path} ]; then size=$(stat -c %s {log_path}); echo \"size=$size\"; \
-tail -c +{} {log_path} | head -c {max_bytes}; else echo 'size=0'; fi",
-            offset + 1
-        );
+        let command = job_log_command(&log_path, offset, max_bytes, tail);
         let outcome = self
             .runner
             .exec_on(host, &command, 60.0, false, false, false)
             .await?;
-        let mut size = 0u64;
-        let mut body = outcome.stdout.clone();
-        if let Some(rest) = body.strip_prefix("size=") {
-            let (first, remainder) = match rest.split_once('\n') {
-                Some(parts) => parts,
-                None => (rest, ""),
-            };
-            size = first.parse().unwrap_or(0);
-            body = remainder.to_string();
-        }
-        // Bytes this read actually delivered — never a re-encoded length, which can
-        // overshoot on a mid-UTF-8 clip and skip data on the next poll.
-        let consumed = max_bytes.min(size.saturating_sub(offset));
+        let (size, offset, body) = if outcome.ok() {
+            parse_job_log(&outcome.stdout, offset, max_bytes, tail)?
+        } else {
+            (0, offset, Vec::new())
+        };
+        let consumed = body.len() as u64;
         Ok(json!({
             "ok": outcome.ok(),
             "host": host.name,
@@ -620,7 +669,7 @@ tail -c +{} {log_path} | head -c {max_bytes}; else echo 'size=0'; fi",
             "offset": offset,
             "size": size,
             "next_offset": offset + consumed,
-            "log": body,
+            "log": String::from_utf8_lossy(&body),
             "exit_code": outcome.exit_code,
             "error": if outcome.ok() { String::new() } else {
                 outcome.stderr.trim().chars().take(400).collect::<String>()
@@ -736,6 +785,78 @@ mod tests {
             workdir: workdir.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn log_tail_reads_bounded_raw_bytes_and_resume_reads_only_appends() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed ' log");
+        let mut bytes = vec![b'a'; 1024];
+        bytes.extend_from_slice(&[0xc3, 0xa9, b'\n']);
+        std::fs::write(&path, &bytes).unwrap();
+        let log = shell_quote(path.to_str().unwrap());
+        let read = |offset, cap, tail| {
+            let output = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(job_log_command(&log, offset, cap, tail))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_job_log(
+                &String::from_utf8(output.stdout).unwrap(),
+                offset,
+                cap,
+                tail,
+            )
+            .unwrap()
+        };
+
+        let (size, start, tail) = read(0, 2, true);
+        assert_eq!((size, start), (1027, 1025));
+        assert_eq!(tail, &[0xa9, b'\n']);
+        let next = start + tail.len() as u64;
+        assert_eq!(next, 1027);
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"new")
+            .unwrap();
+        assert_eq!(read(next, 2, false), (1030, 1027, b"ne".to_vec()));
+        assert_eq!(read(1029, 4096, false), (1030, 1029, b"w".to_vec()));
+        assert_eq!(read(1200, 4096, false), (1030, 1200, Vec::new()));
+    }
+
+    #[test]
+    fn log_logical_watermark_does_not_advance_beyond_a_short_read() {
+        let output = format!("size=32\noffset=12\n{}", BASE64.encode([0xe2, 0x82]));
+        let (size, start, bytes) = parse_job_log(&output, 12, 4, false).unwrap();
+        assert_eq!((size, start + bytes.len() as u64), (32, 14));
+        assert_eq!(String::from_utf8_lossy(&bytes), "�");
+        assert!(parse_job_log(&output, 12, 1, false).is_err());
+        assert!(parse_job_log(&output, 11, 4, false).is_err());
+    }
+
+    #[test]
+    fn missing_log_keeps_the_requested_forward_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = shell_quote(dir.path().join("missing").to_str().unwrap());
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(job_log_command(&log, 74, 4096, false))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            parse_job_log(&String::from_utf8(output.stdout).unwrap(), 74, 4096, false).unwrap(),
+            (0, 74, Vec::new())
+        );
     }
 
     #[test]
