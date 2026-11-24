@@ -775,12 +775,14 @@ max_parallel = 2\n",
 async fn terminal_request_identity_is_shared(runtime: &BridgeRuntime, server: &BridgeServer) {
     let modern = server.dispatch(
         "terminal", object(json!({
-            "action":"open", "target":"*", "options":{"request_id":"terminal-open-test"}
+            "action":"open", "target":"*", "options":{"request_id":"terminal-open-test","env":{"A":"one","Z":"two"}}
         })),
     );
     let legacy = server.dispatch(
         "call", object(json!({
-            "operation":"terminal_open", "arguments":{"target":"*", "request_id":"terminal-open-test"}
+            "operation":"terminal_open", "arguments":{
+                "target":"*", "request_id":"terminal-open-test","env":{"Z":"two","A":"one"}
+            }
         })),
     );
     let (modern, legacy) = tokio::join!(modern, legacy);
@@ -793,7 +795,7 @@ async fn terminal_request_identity_is_shared(runtime: &BridgeRuntime, server: &B
     assert_eq!(receipt["session"].as_str().unwrap().len(), 32);
     let retry = server.dispatch(
         "terminal", object(json!({
-            "action":"open", "target":"*", "options":{"request_id":"terminal-open-test"}
+            "action":"open", "target":"*", "options":{"request_id":"terminal-open-test","env":{"A":"one","Z":"two"}}
         })),
     ).await.unwrap();
     assert_eq!(retry["session"], receipt["session"]);
@@ -802,7 +804,7 @@ async fn terminal_request_identity_is_shared(runtime: &BridgeRuntime, server: &B
     let conflict = server.dispatch(
         "terminal", object(json!({
             "action":"open", "target":"*", "options":{
-                "request_id":"terminal-open-test","env":{"ENV":"changed"}
+                "request_id":"terminal-open-test","env":{"Z":"two","A":"changed"}
             }
         })),
     ).await.unwrap_err();
@@ -820,6 +822,48 @@ async fn terminal_request_identity_is_shared(runtime: &BridgeRuntime, server: &B
     assert_eq!(after_restart["completion_unknown"], true);
     assert_eq!(after_restart["session"], receipt["session"]);
     assert_eq!(after_restart["state"], "lost");
+
+    let meta = server.dispatch(
+        "meta", object(json!({"ref":"request:terminal-open-test"})),
+    ).await.unwrap();
+    for key in ["session", "state", "terminal_sessions", "completion_unknown"] {
+        assert_eq!(meta.get(key), after_restart.get(key), "{key}");
+    }
+
+    // Hold a real journal worker between durable reservation and completion.
+    use jms_bridge::storage::journal::ProgressSink;
+    let (reserved_tx, reserved_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let journal = runtime.journal.clone();
+    let worker = tokio::spawn(async move {
+        journal.execute("terminal-open-pending", "terminal_open", &json!({}), |progress| async move {
+            progress.record("terminal_sessions", json!({"session":"unbound-mock-handle"}))?;
+            reserved_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            Ok(json!({"ok":true,"state":"idle","session":"unbound-mock-handle"}))
+        }).await.unwrap()
+    });
+    reserved_rx.await.unwrap();
+    let pending = runtime.request_status("terminal-open-pending").await.unwrap();
+    let pending_meta = server.dispatch(
+        "meta", object(json!({"ref":"request:terminal-open-pending"})),
+    ).await.unwrap();
+    for value in [&pending, &pending_meta] {
+        assert_eq!(value["state"], "opening");
+        assert!(value.get("session").is_none());
+        assert!(value.get("terminal_sessions").is_none());
+    }
+    finish_tx.send(()).unwrap();
+    worker.await.unwrap();
+    let completed = runtime.request_status("terminal-open-pending").await.unwrap();
+    let completed_meta = server.dispatch(
+        "meta", object(json!({"ref":"request:terminal-open-pending"})),
+    ).await.unwrap();
+    assert_eq!(completed["request_state"], "complete");
+    assert_eq!(completed["state"], "lost");
+    for key in ["session", "state", "terminal_sessions"] {
+        assert_eq!(completed_meta.get(key), completed.get(key), "{key}");
+    }
 
     let exec = runtime.journal.execute(
         "terminal-exec-identity-test", "terminal_exec", &json!({

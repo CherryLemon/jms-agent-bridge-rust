@@ -439,9 +439,13 @@ require allow_dangerous=true",
                     let container = arguments.get("container").and_then(Value::as_str).map(str::to_owned);
                     let image = arguments.get("image").and_then(Value::as_str).map(str::to_owned);
                     let cwd = arguments.get("cwd").and_then(Value::as_str).map(str::to_owned);
+                    // Object key order is not part of a request's execution identity.
+                    let canonical_env: std::collections::BTreeMap<_, _> = env.iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str()))
+                        .collect();
                     let work = json!({
                         "target":target, "container":container, "image":image,
-                        "cwd":cwd, "docker_args":docker_args, "env":env,
+                        "cwd":cwd, "docker_args":docker_args, "env":canonical_env,
                     });
                     let terminals = self.terminals.clone();
                     let receipt = self
@@ -1556,6 +1560,13 @@ require allow_dangerous=true",
             ] {
                 if let Some(item) = value.get(key) {
                     out.insert(key.to_string(), item.clone());
+                }
+            }
+            if value["operation"] == "terminal_open" {
+                for key in ["session", "state", "terminal_sessions"] {
+                    if let Some(item) = value.get(key) {
+                        out.insert(key.to_string(), item.clone());
+                    }
                 }
             }
             return Ok(Value::Object(out));
