@@ -1,0 +1,8 @@
+{
+  "targets": [
+    {"target": "asset-a", "job_id": "aaaa0001", "states": ["running", "done"], "exit_code": "0", "text": "alpha\n"},
+    {"target": "asset-b", "job_id": "bbbb0002", "states": ["failed"], "exit_code": "7", "text": "failed beta\n"},
+    {"target": "asset-c", "job_id": "cccc0003", "states": ["done"], "exit_code": "0", "text": "gamma\n"}
+  ],
+  "max_wait_calls": 3
+}
