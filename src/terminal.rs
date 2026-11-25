@@ -2282,6 +2282,78 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn independent_historical_readers_never_switch_to_the_live_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (interactive, _, mut frames) = terminal_with_stalled_writer(dir.path(), 1).await;
+        let store = &interactive.store;
+        let history = test_command(store, "terminal", "s", b"abcdef");
+        std::fs::write(store.path(&history, "stderr").unwrap(), b"ABCDEF").unwrap();
+        store
+            .finish(
+                &history,
+                json!({"execution_state":"completed","exit_code":0,"ok":true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+
+        let successor = test_command(store, "terminal", "s", b"123456");
+        std::fs::write(store.path(&successor, "stderr").unwrap(), b"UVWXYZ").unwrap();
+        interactive.binding("s").await.unwrap().lock().await.command =
+            Some(Arc::new(AsyncMutex::new(Command::new(successor.clone()))));
+
+        let live_first = interactive.read("s", 0, 4, None).await.unwrap();
+        assert_eq!(live_first["result_id"], successor);
+        assert_eq!(live_first["stdout"], "12");
+        assert_eq!(live_first["stderr"], "UV");
+
+        let (reader_one, reader_two) = tokio::join!(
+            interactive.read_result("s", &history, 0, 4, None),
+            interactive.read_result("s", &history, 0, 4, None),
+        );
+        let reader_one = reader_one.unwrap();
+        assert_eq!(reader_one, reader_two.unwrap());
+        assert_eq!(reader_one["result_id"], history);
+        assert_eq!(reader_one["state"], "completed");
+        assert_eq!(reader_one["stdout"], "ab");
+        assert_eq!(reader_one["stderr"], "AB");
+
+        for budget in [2, 4] {
+            let page = interactive
+                .read_result("s", &history, 0, budget, Some(&reader_one["cursor"]))
+                .await
+                .unwrap();
+            assert_eq!(page["result_id"], history);
+            assert_eq!(page["stdout"], if budget == 2 { "c" } else { "cd" });
+            assert_eq!(page["stderr"], if budget == 2 { "C" } else { "CD" });
+        }
+        assert_eq!(
+            interactive.read_result("s", &history, 0, 4, None).await.unwrap(),
+            reader_one
+        );
+        let live_second = interactive.read("s", 0, 4, None).await.unwrap();
+        assert_eq!(live_second["result_id"], successor);
+        assert_eq!(live_second["stdout"], "34");
+        assert_eq!(live_second["stderr"], "WX");
+
+        let cleaned = store.cleanup(crate::storage::results::now() + 7200.0);
+        assert_eq!(cleaned["removed"], 1);
+        assert!(interactive
+            .read_result("s", &history, 0, 4, Some(&reader_one["cursor"]))
+            .await
+            .is_err());
+        let live_tail = interactive.read("s", 0, 4, None).await.unwrap();
+        assert_eq!(live_tail["result_id"], successor);
+        assert_eq!(live_tail["stdout"], "56");
+        assert_eq!(live_tail["stderr"], "YZ");
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[test]
     fn a_closed_stream_without_its_marker_ends_the_command() {
         // START then Close: neither stream ever produced an end marker.
