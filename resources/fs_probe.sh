@@ -343,7 +343,9 @@ main() {
             engine=ripgrep ignore_applied=$respect_ignore skipped_large=-1 skipped_binary=-1
         else
             [[ $action == search ]] && engine=grep
-            (( respect_ignore )) && warning='rg unavailable: .gitignore/.ignore rules are not applied; use exclude or install rg.'
+            if (( respect_ignore )) && [[ -d $root ]]; then
+                warning='grep fallback ignores .gitignore/.ignore; use exclude.'
+            fi
         fi
     fi
     emit H "$engine" "$ignore_applied" "$warning"
