@@ -954,6 +954,14 @@ require allow_dangerous=true",
     ) -> BridgeResult<Value> {
         let action = used_string(&payload, "action")?;
         payload.remove("action");
+        let view = payload.remove("view");
+        if action != "submit" && view.is_some() {
+            return Err(BridgeError::invalid_arguments(
+                "job view is only applicable to submit",
+                json!({"path": "/view", "message": "use view only with job submit"}),
+            ));
+        }
+        let brief = view.as_ref().and_then(Value::as_str) == Some("brief");
         let request_id = payload.remove("request_id");
         if !matches!(action.as_str(), "submit" | "cancel") && request_id.is_some() {
             return Err(BridgeError::invalid(
@@ -988,7 +996,12 @@ require allow_dangerous=true",
         if let Some(request_id) = request_id {
             call.insert("request_id".into(), request_id);
         }
-        self.tool_call_impl(call, Some(&action)).await
+        let value = self.tool_call_impl(call, Some(&action)).await?;
+        Ok(if brief {
+            brief_job_submission(&value).unwrap_or(value)
+        } else {
+            value
+        })
     }
 
     async fn wait_job_handles(&self, payload: Map<String, Value>) -> BridgeResult<Value> {
@@ -2402,6 +2415,74 @@ fn project_job_submission(mut value: Value) -> Value {
     value
 }
 
+/// Opt-in inline success only. Do not change the journal or the original
+/// staging decision. A row whose evidence cannot be represented stays full.
+fn brief_job_submission(full: &Value) -> Option<Value> {
+    let map = full.as_object()?;
+    if full["ok"] != true
+        || full["request_state"] != "complete"
+        || full["operation"] != "jms_submit_job"
+        || full["completion_unknown"] != false
+        || full["duplicate"] != false
+        || full["execution_replayed"] != false
+        || full["request_id_scope"] != "bridge_local"
+        || full["jobs_scope"] != "remote_job"
+        || map.keys().any(|k| {
+            !matches!(
+                k.as_str(),
+                "ok" | "request_id" | "request_state" | "operation" | "accepted_at"
+                    | "finished_at" | "completion_unknown" | "duplicate" | "execution_replayed"
+                    | "jobs" | "submissions" | "jobs_scope" | "request_id_scope" | "next_action"
+            )
+        })
+    {
+        return None;
+    }
+    let request_id = full["request_id"].as_str().filter(|id| !id.is_empty())?;
+    let jobs = full["jobs"].as_array()?;
+    let rows = full["submissions"].as_array()?;
+    if jobs.is_empty() || jobs.len() != rows.len() || validate_job_handles(jobs).is_err() {
+        return None;
+    }
+    let mut result_ids = Vec::with_capacity(rows.len());
+    let mut seen = std::collections::HashSet::new();
+    for (job, row) in jobs.iter().zip(rows) {
+        let target = job["target"].as_str()?;
+        if row["target"] != target
+            || row["asset_id"] != target
+            || row["job_id"] != job["job_id"]
+            || row.get("artifact_paths") != job.get("artifact_paths")
+            || row["launch_state"] != "acknowledged"
+            || row["launched"] != true
+            || row.as_object()?.keys().any(|k| {
+                !matches!(
+                    k.as_str(),
+                    "host" | "job_id" | "session" | "launcher" | "launch_state" | "launched"
+                        | "result_id" | "asset_id" | "target" | "artifact_paths"
+                )
+            })
+        {
+            return None;
+        }
+        let id = row["result_id"].as_str()?;
+        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) || !seen.insert(id) {
+            return None;
+        }
+        result_ids.push(id);
+    }
+    Some(json!({
+        "ok": true,
+        "view": "brief",
+        "request_id": request_id,
+        "request_state": "complete",
+        "request_id_scope": "bridge_local",
+        "jobs": jobs,
+        "jobs_scope": "remote_job",
+        "result_ids": result_ids,
+        "result_ids_scope": "bridge_local"
+    }))
+}
+
 /// One job row: the id is always reported, `launched` only when the launcher said so.
 fn job_row(handle: &crate::jobs::JobHandle, outcome: &crate::execution::ExecOutcome) -> Value {
     let acknowledged = handle.state == crate::jobs::LaunchState::Acknowledged;
@@ -2675,6 +2756,72 @@ mod tests {
         (0..count)
             .map(|i| json!({"target":format!("asset-{i:012}"),"job_id":format!("{i:08x}")}))
             .collect()
+    }
+
+    fn acknowledged_job_submission() -> Value {
+        let jobs = job_test_handles(2);
+        let submissions: Vec<_> = jobs.iter().enumerate().map(|(i, job)| json!({
+            "host": format!("fixture-{i}"), "asset_id":job["target"],
+            "target":job["target"], "job_id":job["job_id"],
+            "launch_state":"acknowledged", "launched":true,
+            "result_id":format!("{i:032x}"), "launcher":"setsid",
+            "session":format!("jms-{:08x}", i)
+        })).collect();
+        json!({
+            "ok":true, "operation":"jms_submit_job", "request_id":"fixture",
+            "request_state":"complete", "request_id_scope":"bridge_local",
+            "jobs_scope":"remote_job", "completion_unknown":false,
+            "execution_replayed":false, "duplicate":false,
+            "jobs":jobs, "submissions":submissions
+        })
+    }
+
+    #[test]
+    fn brief_job_submit_keeps_exact_continuation_and_local_ids() {
+        let mut full = acknowledged_job_submission();
+        full["jobs"][1]["artifact_paths"] = json!(["/tmp/model-metric.json"]);
+        full["submissions"][1]["artifact_paths"] = full["jobs"][1]["artifact_paths"].clone();
+        let brief = brief_job_submission(&full).expect("clearly acknowledged inline launch");
+        assert_eq!(brief["view"], "brief");
+        assert_eq!(brief["jobs"], full["jobs"]);
+        assert_eq!(brief["request_id"], full["request_id"]);
+        assert_eq!(brief["request_id_scope"], full["request_id_scope"]);
+        assert_eq!(brief["jobs_scope"], full["jobs_scope"]);
+        assert_eq!(brief["result_ids_scope"], "bridge_local");
+        assert_eq!(brief["result_ids"], json!([
+            full["submissions"][0]["result_id"], full["submissions"][1]["result_id"]
+        ]));
+        assert!(brief.get("submissions").is_none());
+        assert!(brief.to_string().len() < full.to_string().len());
+        assert_eq!(full["submissions"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn brief_job_submit_keeps_full_receipts_when_evidence_is_unclear() {
+        let full = acknowledged_job_submission();
+        for (field, value) in [
+            ("staged", json!(true)), ("ok", json!(false)), ("duplicate", json!(true)),
+            ("completion_unknown", json!(true)), ("execution_replayed", json!(true)),
+            ("request_state", json!("running")), ("diagnostic", json!("extra")),
+        ] {
+            let mut atypical = full.clone();
+            atypical[field] = value;
+            assert!(brief_job_submission(&atypical).is_none(), "{field}");
+        }
+        for (field, value) in [
+            ("target", json!("different")),
+            ("job_id", json!("aaaaabcd")),
+            ("launch_state", json!("unknown")),
+            ("result_id", full["submissions"][1]["result_id"].clone()),
+            ("note", json!("diagnostic")),
+        ] {
+            let mut atypical = full.clone();
+            atypical["submissions"][0][field] = value;
+            assert!(brief_job_submission(&atypical).is_none(), "{field}");
+        }
+        let mut mismatched = full.clone();
+        mismatched["submissions"].as_array_mut().unwrap().swap(0, 1);
+        assert!(brief_job_submission(&mismatched).is_none());
     }
 
     #[test]
