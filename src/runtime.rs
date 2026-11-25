@@ -2102,7 +2102,19 @@ fn stage_job_batch(store: &ResultStore, scope: JobBatch, mut value: Value) -> Br
             mark_job_recovery(&mut result, section);
         }
     }
+    // Full diagnostic rows are local; keep this separate from the portable job
+    // status action and never discard usable handles to fit an optional hint.
+    result["diagnostics_action"] = local_result_read_action(&result_id);
+    if serde_json::to_vec(&result)?.len() > OPERATION_BUDGET {
+        result.as_object_mut().expect("staged object").remove("diagnostics_action");
+    }
     Ok(result)
+}
+
+fn local_result_read_action(result_id: &str) -> Value {
+    json!({"tool":"read_result","arguments":{
+        "result_id":result_id,"stream":"result","offset":0,"limit":4096
+    }})
 }
 
 fn load_job_handles(store: &ResultStore, input: &Value) -> BridgeResult<Vec<Value>> {
@@ -2461,9 +2473,7 @@ pub fn stage_if_large(
     summary.insert("result_id_scope".into(), json!("bridge_local"));
     summary.insert(
         "next_action".into(),
-        json!({"tool":"read_result","arguments":{
-            "result_id":result_id,"stream":"result","offset":0,"limit":4096
-        }}),
+        local_result_read_action(&result_id),
     );
 
     // Business-level shape the caller usually needs, without the bulk.
@@ -2694,6 +2704,76 @@ mod tests {
         let mut raw = raw;
         mark_job_recovery(&mut raw, "jobs");
         assert_eq!(full, raw);
+    }
+
+    #[tokio::test]
+    async fn staged_job_diagnostics_do_not_replace_portable_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, format!(
+            "[bastion]\nurl = 'http://127.0.0.1:1'\nlogin_user = 'fixture'\nsession_token = 'offline-test'\n[bridge]\nstate_dir = '{}'\n",
+            dir.path().join("state").display(),
+        )).unwrap();
+        let runtime = BridgeRuntime::start(Some(&config), false).await.unwrap();
+        let server = crate::mcp::BridgeServer::new(runtime.clone());
+        let raw = json!({
+            "ok":false,"completion_unknown":true,"jobs":job_test_handles(1),
+            "submissions":[
+                {"launch_state":"acknowledged"},
+                {"execution_state":"not_started","executed":false,"completion_unknown":false},
+                {"execution_state":"unknown","executed":null,"completion_unknown":true,
+                 "detail":"测试".repeat(3000)}
+            ]
+        });
+        let staged = stage_job_batch(&runtime.store, JobBatch::Submit, raw.clone()).unwrap();
+        assert_eq!(staged["next_action"]["arguments"]["operation"], "jms_job_status");
+        let compact = crate::views::compact("job", &staged, &Map::new(), &std::collections::HashMap::new());
+        assert_eq!(compact["next_action"], staged["next_action"]);
+        assert_eq!(compact["diagnostics_action"], staged["diagnostics_action"]);
+        let local = &compact["diagnostics_action"];
+        assert_eq!(local["tool"], "read_result");
+        assert_eq!(local["arguments"], json!({
+            "result_id":staged["result_id"],"stream":"result","offset":0,"limit":4096
+        }));
+        let mut args = local["arguments"].as_object().unwrap().clone();
+        let mut complete = String::new();
+        let mut pages = 0;
+        loop {
+            let page = server.dispatch(local["tool"].as_str().unwrap(), args.clone()).await.unwrap();
+            complete.push_str(page["text"].as_str().unwrap());
+            pages += 1;
+            if page["eof"] == true {
+                break;
+            }
+            let next = page["next_offset"].as_u64().unwrap();
+            assert!(next > args["offset"].as_u64().unwrap());
+            args.insert("offset".into(), json!(next));
+        }
+        assert!(pages > 1);
+        let stored: Value = serde_json::from_str(&complete).unwrap();
+        assert_eq!(stored["submissions"], raw["submissions"]);
+        assert!(stored.get("diagnostics_action").is_none());
+        runtime.shutdown().await;
+    }
+
+    #[test]
+    fn diagnostics_action_yields_to_a_near_budget_inline_handle_array() {
+        let (_dir, store) = job_test_store();
+        let make = |size| json!({
+            "jobs":[{"target":"a","job_id":"12345678"},{"target":"x".repeat(size),"job_id":"12345679"}],
+            "submissions":["x".repeat(OPERATION_BUDGET)]
+        });
+        let baseline = stage_job_batch(&store, JobBatch::Submit, make(1)).unwrap();
+        let mut bare = baseline.clone();
+        bare.as_object_mut().unwrap().remove("diagnostics_action");
+        // Keep the number of digits of the serialized payload size constant.
+        let size = 1 + OPERATION_BUDGET - bare.to_string().len() - 4;
+        let input = make(size);
+        let near = stage_job_batch(&store, JobBatch::Submit, input.clone()).unwrap();
+        assert_eq!(near["jobs"], input["jobs"]);
+        assert!(near.get("diagnostics_action").is_none());
+        assert!(near.to_string().len() <= OPERATION_BUDGET);
+        assert!(load_job_handles(&store, &near["jobs"]).is_ok());
     }
 
     #[test]
