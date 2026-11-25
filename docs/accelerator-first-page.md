@@ -60,3 +60,9 @@ Stale, incomplete and duplicate address states plus the heterogeneous size
 bound have Rust unit coverage. Both loopback transports checked an unresolved
 selector (only two permitted assets probed) and a heterogeneous node with all
 observed devices free but incomplete telemetry (IDs and model mapping retained).
+
+A first-page host label is selected across the address, name and canonical ID
+fields of all returned rows. If every eligible label for a row collides or
+cannot be printed, that row has a unique display-only label and
+`host_is_row_label: true`. Use the original request and saved details to
+identify that row; do not send the display label as a target selector.

@@ -683,6 +683,31 @@ fn printable_model(model: &&str) -> bool {
         b.is_ascii_alphanumeric() || b" .:-_+()/".contains(&b))
 }
 
+const SUMMARY_IDENTITY_KEYS: [&str; 3] = ["address", "host", "asset_id"];
+
+fn identity_fields(row: &Value) -> impl Iterator<Item = &str> {
+    SUMMARY_IDENTITY_KEYS.iter().filter_map(|key| row.get(*key).and_then(Value::as_str))
+}
+
+fn scheduling_identity(rows: &[Value], index: usize) -> (String, bool) {
+    if let Some(label) = identity_fields(&rows[index]).find(|candidate| {
+        !candidate.is_empty() && candidate.len() <= 96
+            && candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b".:-_%".contains(&b))
+            && !rows.iter().enumerate().any(|(other, row)| {
+                other != index && identity_fields(row).any(|label| label == *candidate)
+            })
+    }) {
+        return (label.to_owned(), false);
+    }
+    let mut fallback = format!("target-{}", index + 1);
+    // A positional label is display-only. Do not let it collide with a real
+    // selector (including the labels of rows before this one).
+    while rows.iter().flat_map(identity_fields).any(|label| label == fallback) {
+        fallback.insert(0, '_');
+    }
+    (fallback, true)
+}
+
 /// Compact scheduling evidence from the inspector's already-validated snapshot.
 pub(crate) fn scheduling_summary(value: &Value) -> Option<Value> {
     let input = value.get("hosts")?.as_array()?;
@@ -694,13 +719,7 @@ pub(crate) fn scheduling_summary(value: &Value) -> Option<Value> {
     let heterogeneous = known_models.next().is_some_and(|first| known_models.any(|model| model != first));
     let mut hosts = Vec::with_capacity(input.len());
     for (index, row) in input.iter().enumerate() {
-        let id = ["address", "host", "asset_id"].iter()
-            .filter_map(|k| row.get(*k).and_then(Value::as_str).map(|v| (*k, v)))
-            .find(|(key, v)| !v.is_empty() && v.len() <= 96 &&
-                v.bytes().all(|b| b.is_ascii_alphanumeric() || b".:-_%".contains(&b))
-                && input.iter().filter(|other| other.get(*key).and_then(Value::as_str) == Some(*v)).count() == 1)
-            .map(|(_, v)| v)
-            .map(str::to_owned).unwrap_or_else(|| format!("target-{}", index + 1));
+        let (id, positional) = scheduling_identity(input, index);
         let raw_state = row.get("state")?.as_str()?;
         let devices = row.get("devices")?.as_array()?;
         let errors = row.get("errors").and_then(Value::as_array).is_some_and(|x| !x.is_empty());
@@ -736,6 +755,9 @@ pub(crate) fn scheduling_summary(value: &Value) -> Option<Value> {
             }
         };
         let mut host = json!({"host":id,"state":state});
+        if positional {
+            host["host_is_row_label"] = json!(true);
+        }
         if !devices.is_empty() || state == "no_accelerator_detected" {
             host["free"] = json!(free);
             host["total"] = json!(devices.len());
@@ -844,6 +866,30 @@ mod tests {
             assert_eq!(first["hosts"][index]["host"], full["hosts"][index]["host"]);
             assert_eq!(first["hosts"][index]["free_device_model_indexes"][15], 3);
         }
+    }
+
+    #[test]
+    fn scheduling_summary_identity_is_unique_across_fields_and_fallbacks() {
+        let rows = json!([
+            {"address":"192.0.2.10","host":"free-short","asset_id":"asset-a","state":"free","whole_node_available":true,"devices":[["gpu:0","free",0]]},
+            {"address":"192.0.2.20","host":"192.0.2.10","asset_id":"asset-b","state":"busy","devices":[["gpu:0","busy",10]]},
+            {"address":"192.0.2.20","host":"asset-b","asset_id":"asset-c","state":"down","devices":[]},
+            {"host":"target-5","state":"down","devices":[]},
+            {"host":"!!cannot-be-a-selector!!","state":"unknown","devices":[]},
+            {"host":"_target-5","state":"down","devices":[]},
+            {"host":"unresolved","state":"unknown","reason":"unresolved_target","devices":[]}
+        ]);
+        let fixture = json!({"hosts":rows,"device_columns":["id"],"inventory_stale":false});
+        let view = scheduling_summary(&fixture).unwrap();
+        let host_rows = view["hosts"].as_array().unwrap();
+        let labels: Vec<_> = host_rows.iter().map(|row| row["host"].as_str().unwrap()).collect();
+        assert_eq!(labels, ["free-short", "target-2", "asset-c", "target-5", "__target-5", "_target-5", "unresolved"]);
+        assert_eq!(host_rows[0]["state"], "free");
+        assert_eq!(host_rows[1]["state"], "busy");
+        assert_eq!(host_rows[1]["host_is_row_label"], true);
+        assert_eq!(host_rows[4]["host_is_row_label"], true);
+        assert_eq!(host_rows[6]["reason"], "unresolved_target");
+        assert!(host_rows[0].get("host_is_row_label").is_none());
     }
 
     #[test]
