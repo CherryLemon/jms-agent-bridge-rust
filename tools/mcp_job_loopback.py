@@ -28,6 +28,7 @@ class LoopbackJobs:
         self.jobs = {}
         self.counts = Counter()
         self.per_asset = {key: Counter() for key in ("ssh_launch", "ssh_status", "ssh_logs")}
+        self.status_counts_by_job = Counter()
         self.status_handlers = 0
         self.peak_status_handlers = 0
         self.errors = []
@@ -215,6 +216,7 @@ class LoopbackJobs:
             if b"echo \"status=" in packet:
                 self.counts["ssh_status"] += 1
                 self.per_asset["ssh_status"][asset] += 1
+                self.status_counts_by_job[job] += 1
                 if self.jobs[job] is None:
                     self.jobs[job] = time.monotonic() + row["pending_seconds"]
                 if time.monotonic() < self.jobs[job]:
