@@ -606,11 +606,13 @@ stored JSON 11,469 UTF-8 bytes while two distinct pending pairs stay inline.
 The first diagnostic page uses the emitted local action, subsequent pages
 resume after a process restart with the same state, and a foreign state
 rejects the result ID. An independent bridge can still wait on both exact
-inline pairs without reenlisting any terminal job.
+inline pairs without reenlisting any terminal job. Both returned rows must
+actually have been observed running, and the fresh phase must probe exactly
+the expected identities. A pending echo with no successful status read fails.
 
 In the second case ten bounded handles with metadata overflow the summary.
 A typed pending reference works on the originating bridge and is rejected
-by a fresh state before touching the fixture backend. The full pending array
+by a fresh state without a new SSH operation. The full pending array
 can be recovered from the local JSON while the origin still exists. The
 test hands two exact materialized pairs to the fresh bridge; it does not
 claim that an origin-local ref can survive loss of its only result store.
@@ -619,10 +621,17 @@ Three repetitions per transport with the release source at
 `dfef3d401031d35368435666f4053eb9662f50fb`, binary SHA-256
 `4f85afa5d5773be7ab646ece6115df7e31cb9efcadcb12650a2bbbed05ae932b`:
 
-| Transport | Diagnostic-only workflows | Pages / foreign ID rejections | Typed-overflow workflows | Typed pages / foreign ref rejections | Launches / backend operations during local reads |
+| Transport | Diagnostic-only workflows | Pages / foreign ID rejections | Typed-overflow workflows | Typed pages / foreign ref rejections | Launches / SSH operations during local reads |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | stdio | 3 | 9 / 3 | 3 | 12 / 3 | 0 / 0 |
 | HTTP | 3 | 9 / 3 | 3 | 12 / 3 | 0 / 0 |
+
+Each transport observed 60 fresh SSH status probes for inline pairs and
+60 for pairs materialized from the typed result. Each workflow verifies
+that only its two expected identities were probed, without requiring a
+fixed polling count. Both staged summary shapes must fit 8,192 UTF-8
+bytes and retain the incomplete top-level outcome. Normal catalog requests
+are not included in the zero SSH operations column.
 
 This compares local recovery semantics, not production, cross-machine
 latency, or actual artifacts. Fixture bytes are pinned separately from

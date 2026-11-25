@@ -1,8 +1,9 @@
+from collections import Counter
 import copy
 import json
 import unittest
 
-from mcp_job_staged_wait import FIXTURE, check_payload, check_staged, seeded_case
+from mcp_job_staged_wait import FIXTURE, check_payload, check_staged, require_observed_pending, seeded_case
 from mcp_job_staged_result import read_action
 
 
@@ -13,12 +14,13 @@ class StagedWaitTest(unittest.TestCase):
         self.rid = "a" * 32
 
     def test_check_staged_keeps_two_pending_pairs_and_local_action(self):
-        receipt = dict(staged=True, operation="jms_job_wait", finished=False, pending=self.pending,
+        receipt = dict(ok=False, staged=True, operation="jms_job_wait", finished=False, pending=self.pending,
                        pending_scope="remote_job", result_id_scope="bridge_local",
                        bytes=11469, result_id=self.rid, diagnostics_action=read_action(self.rid, 0))
         self.assertEqual(check_staged(receipt, self.pending), (11469, self.rid))
         for fields in (dict(pending=self.pending[::-1]), dict(next_action=read_action(self.rid, 0)),
-                       dict(diagnostics_action=read_action(self.rid, 1))):
+                       dict(diagnostics_action=read_action(self.rid, 1)), dict(ok=True),
+                       dict(note="数" * 3000)):
             with self.subTest(fields=fields), self.assertRaises(RuntimeError):
                 check_staged({**receipt, **fields}, self.pending)
 
@@ -32,7 +34,7 @@ class StagedWaitTest(unittest.TestCase):
                     dict(target=h["target"], job_id=h["job_id"], path=p, verified=False,
                          options={"expected_asset_id": h["target"]}) for p in h["artifact_paths"]])
             status.append(row)
-        payload = dict(finished=False, pending=self.pending, status=status)
+        payload = dict(ok=False, finished=False, pending=self.pending, status=status)
         check_payload(payload, self.handles)
         with self.assertRaises(RuntimeError):
             check_payload({**payload, "pending": [self.handles[0], *self.pending]}, self.handles)
@@ -40,6 +42,30 @@ class StagedWaitTest(unittest.TestCase):
         altered["status"][0]["artifact_refs"][0]["verified"] = True
         with self.assertRaises(RuntimeError):
             check_payload(altered, self.handles)
+
+
+    def test_foreign_wait_requires_new_observations_for_exact_pairs(self):
+        rows = [dict(target=h["target"], job_id=h["job_id"], status="running", ok=True)
+                for h in self.pending]
+        keys = [(h["target"], h["job_id"].encode()) for h in self.pending]
+        old = (self.handles[0]["target"], self.handles[0]["job_id"].encode())
+        follow = dict(ok=False, finished=False, pending=self.pending, status=rows)
+        before = Counter({keys[0]: 4, keys[1]: 6, old: 2})
+        genuine = before + Counter({keys[0]: 1, keys[1]: 3})
+        self.assertEqual(require_observed_pending(follow, self.pending, before, genuine), 4)
+        unknown = [{**row, "status": "unknown", "ok": False, "probed": False,
+                    "reason": "inventory_timeout"} for row in rows]
+        for actual, after in (
+            ({**follow, "inventory_timed_out": True, "status": unknown}, before),
+            ({**follow, "status": [{**rows[0], "probed": False}, rows[1]]}, genuine),
+            ({**follow, "status": [{**rows[0], "ok": False}, rows[1]]}, genuine),
+            ({**follow, "status": [{**rows[0], "target": "foreign"}, rows[1]]}, genuine),
+            (follow, before),
+            (follow, before + Counter({keys[0]: 3})),
+            (follow, genuine + Counter({old: 1})),
+        ):
+            with self.subTest(actual=actual, after=after), self.assertRaises(RuntimeError):
+                require_observed_pending(actual, self.pending, before, after)
 
 
 if __name__ == "__main__":

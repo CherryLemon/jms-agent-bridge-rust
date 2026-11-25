@@ -29,7 +29,15 @@ def seeded_case(fixture):
     return {**fixture, "targets": [row]}, handles
 
 
+def check_summary_budget(staged):
+    if len(json.dumps(staged, ensure_ascii=False, separators=(",", ":")).encode()) > 8192:
+        raise RuntimeError("compact staged wait summary exceeds 8192 UTF-8 bytes")
+    if staged.get("ok") is not False or staged.get("finished") is not False:
+        raise RuntimeError("staged wait changed the top-level incomplete outcome")
+
+
 def check_staged(staged, running):
+    check_summary_budget(staged)
     total, rid = staged["bytes"], staged["result_id"]
     if (staged["staged"] is not True or staged["operation"] != "jms_job_wait"
             or staged["finished"] is not False or staged["pending"] != running
@@ -44,7 +52,8 @@ def check_staged(staged, running):
 
 
 def check_payload(payload, handles):
-    if (payload["finished"] is not False or payload["pending"] != handles[-2:]
+    if (payload.get("ok") is not False or payload["finished"] is not False
+            or payload["pending"] != handles[-2:]
             or payload.get("next_action") is not None
             or "diagnostics_action" in payload or len(payload["status"]) != len(handles)):
         raise RuntimeError("staged payload changed mixed wait evidence")
@@ -65,7 +74,29 @@ def check_payload(payload, handles):
 
 
 def backend_ops(backend):
-    return {k: v for k, v in backend.counts.items() if k.startswith("ssh_")}
+    with backend.lock:
+        return {k: v for k, v in backend.counts.items() if k.startswith("ssh_")}
+
+
+def status_snapshot(backend):
+    with backend.lock:
+        return backend.status_counts_by_job.copy()
+
+
+def require_observed_pending(follow, handles, before, after):
+    expected = {(h["target"], h["job_id"]) for h in handles}
+    rows = follow.get("status", [])
+    actual = {(r.get("target"), r.get("job_id")) for r in rows}
+    if (follow.get("pending") != handles or actual != expected or len(rows) != len(handles)
+            or follow.get("ok") is not False or follow.get("finished") is not False
+            or follow.get("inventory_timed_out") is True
+            or any(r.get("status") != "running" or r.get("ok") is not True
+                   or r.get("probed") is False for r in rows)):
+        raise RuntimeError("fresh bridge did not observe both exact pending jobs running")
+    delta = after - before
+    if set(delta) != {(target, job_id.encode()) for target, job_id in expected}:
+        raise RuntimeError("foreign status phase did not probe exactly the expected identities")
+    return delta.total()
 
 
 def sample(binary, fixture, mode, root):
@@ -102,14 +133,15 @@ def sample(binary, fixture, mode, root):
             require_denied(Client(guarded(exchange, action), legacy=False), action)
             if backend_ops(backend) != before_reads:
                 raise RuntimeError("local diagnostics triggered a synthetic backend operation")
-            follow = Client(exchange, legacy=False).job("wait", jobs=staged["pending"], timeout=2, interval=0.5)
-            if follow["pending"] != handles[-2:] or [r["job_id"] for r in follow["status"]] != [h["job_id"] for h in handles[-2:]]:
-                raise RuntimeError("independent bridge could not reuse exactly the inline pending pairs")
+            before_follow = status_snapshot(backend)
+            follow = Client(exchange, legacy=False).job("wait", jobs=staged["pending"], timeout=5, interval=0.5)
+            foreign_probes = require_observed_pending(follow, handles[-2:], before_follow,
+                                                       status_snapshot(backend))
         if backend.errors or set(backend_ops(backend)) != {"ssh_status"}:
             raise RuntimeError("read-only wait called an unexpected synthetic operation")
     return Counter(staged_waits=1, local_pages=len(chunks), foreign_id_denied=1,
                    staged_bytes=total, portable_pending_pairs=2, failed_rows_retained=6,
-                   status_probes=before_reads["ssh_status"])
+                   status_probes=before_reads["ssh_status"], foreign_inline_status_probes=foreign_probes)
 
 
 def overflow_sample(binary, fixture, mode, root):
@@ -127,6 +159,7 @@ def overflow_sample(binary, fixture, mode, root):
         with connected(binary, origin, backend.config, mode) as exchange:
             client = Client(exchange, legacy=False)
             staged = client.job("wait", jobs=handles, timeout=3, interval=0.5)
+            check_summary_budget(staged)
             rid = staged["result_id"]
             typed = {"ref": rid}
             if (staged["pending"] != typed or staged["pending_scope"] != "bridge_local"
@@ -142,7 +175,10 @@ def overflow_sample(binary, fixture, mode, root):
                 chunks.append(part)
             if backend_ops(backend) != read_before:
                 raise RuntimeError("local page read reached canned backend")
-            portable = json.loads("".join(chunks))["pending"]
+            payload = json.loads("".join(chunks))
+            if payload.get("ok") is not False or payload.get("finished") is not False:
+                raise RuntimeError("typed payload changed the top-level incomplete outcome")
+            portable = payload["pending"]
             if portable != handles:
                 raise RuntimeError("local diagnostics did not retain exact pending pairs")
             again = client.job("wait", jobs=typed, timeout=1, interval=0.5)
@@ -158,14 +194,16 @@ def overflow_sample(binary, fixture, mode, root):
                 raise RuntimeError("foreign continuation reached synthetic backend")
             # Only a bounded portable unit is needed to establish fresh-state reuse.
             # The unchanged original array would simply stage again.
+            before_follow = status_snapshot(backend)
             resumed = Client(exchange, legacy=False).job("wait", jobs=portable[:2],
-                                                         timeout=2, interval=0.5)
-            if resumed.get("pending") != portable[:2]:
-                raise RuntimeError("fresh bridge did not consume the materialized pairs")
+                                                         timeout=5, interval=0.5)
+            foreign_probes = require_observed_pending(resumed, portable[:2], before_follow,
+                                                       status_snapshot(backend))
         if backend.errors or set(backend_ops(backend)) != {"ssh_status"}:
             raise RuntimeError("unexpected backend operation")
     return Counter(typed_refs_local=1, typed_refs_foreign_denied=1, typed_local_pages=len(chunks),
-                   materialized_pending_pairs=len(portable), materialized_pairs_reused=2)
+                   materialized_pending_pairs=len(portable), materialized_pairs_reused=2,
+                   foreign_materialized_status_probes=foreign_probes)
 
 
 def main():
@@ -186,7 +224,7 @@ def main():
                 events.update(sample(a.binary.resolve(), fixture, mode, Path(directory)))
             with tempfile.TemporaryDirectory(prefix="jms-staged-handles-") as directory:
                 events.update(overflow_sample(a.binary.resolve(), fixture, mode, Path(directory)))
-        results[mode] = {**events, "launches": 0, "remote_logs": 0, "backend_ops_during_local_reads": 0}
+        results[mode] = {**events, "launches": 0, "remote_logs": 0, "ssh_ops_during_local_reads": 0}
     with a.binary.open("rb") as binary:
         sha = hashlib.file_digest(binary, "sha256").hexdigest()
     print(json.dumps({"scope": "local canned staged wait, preseeded status only",
