@@ -9,6 +9,9 @@ made for that selector. Other requested targets are unaffected.
 - Read `host`, `state`, and, when available, `free`/`total`. `unknown` counts
   unverified devices. For a partially usable node only, `free_devices` lists
   verified IDs; `free_devices_more` indicates omitted IDs, when applicable.
+  `count_scope=observed` distinguishes a count from an incomplete sample.
+  Heterogeneous results include bounded `models`; a mixed partial node can map
+  `free_devices` to model indices in the same order (`null` means unavailable).
 - A busy machine with confirmed processes but uniformly low utilization may
   report `activity=occupied_low_util`. It is not free. A shortened `reason` is
   provided for unknown/incomplete evidence. An inventory-stale response does
@@ -46,12 +49,14 @@ case exceeds the old generic output budget.
 
 | Transport | Nodes | Decision calls old/new | Decision result tokens old/new | Full detail calls old/new | Full detail result tokens old/new | SSH snapshot + enrichment (both) |
 |---|---:|---:|---:|---:|---:|---:|
-| stdio | 1 | 1 / 1 | 412 / 120 | 2 / 2 | 1080 / 788 | 1 + 0 |
-| stdio | 4 | 1 / 1 | 2314 / 235 | 4 / 4 | 6380 / 4316 | 4 + 2 |
-| stdio | 8 | 5 / 1 | 5651 / 434 | 11 / 7 | 13736 / 8525 | 8 + 4 |
-| http | 1 | 1 / 1 | 408 / 110 | 2 / 2 | 1073 / 776 | 1 + 0 |
-| http | 4 | 1 / 1 | 2316 / 231 | 4 / 4 | 6398 / 4302 | 4 + 2 |
-| http | 8 | 5 / 1 | 5650 / 424 | 11 / 7 | 13743 / 8504 | 8 + 4 |
+| stdio | 1 | 1 / 1 | 412 / 112 | 2 / 2 | 1080 / 771 | 1 + 0 |
+| stdio | 4 | 1 / 1 | 2314 / 239 | 4 / 4 | 6380 / 4308 | 4 + 2 |
+| stdio | 8 | 5 / 1 | 5651 / 440 | 11 / 7 | 13736 / 8533 | 8 + 4 |
+| http | 1 | 1 / 1 | 408 / 110 | 2 / 2 | 1073 / 769 | 1 + 0 |
+| http | 4 | 1 / 1 | 2316 / 235 | 4 / 4 | 6398 / 4305 | 4 + 2 |
+| http | 8 | 5 / 1 | 5650 / 439 | 11 / 7 | 13743 / 8500 | 8 + 4 |
 
-Stale and incomplete states also have Rust unit coverage. The missing-target
-check ran on both transports: only the two permitted assets were probed.
+Stale, incomplete and duplicate address states plus the heterogeneous size
+bound have Rust unit coverage. Both loopback transports checked an unresolved
+selector (only two permitted assets probed) and a heterogeneous node with all
+observed devices free but incomplete telemetry (IDs and model mapping retained).

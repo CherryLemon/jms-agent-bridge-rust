@@ -33,7 +33,9 @@ class AcceleratorFixture(LoopbackJobs):
         time.sleep(row["latency"])
         states = {"free":["free"]*8, "partial":["free"]*6+["busy"]*7+["unknown"]*3,
                   "busy":["busy"]*16, "unknown":["unknown"]*16}[row["state"]]
-        devices = [{"id":f"hygon:{i}","state":state,"model":"fixture-accelerator",
+        states = row.get("device_states", states)
+        models = row.get("models", ["fixture-accelerator"]*len(states))
+        devices = [{"id":f"hygon:{i}","state":state,"model":models[i],
                     "util_pct":0.0 if state != "unknown" else None,
                     "memory_used_mib":(2.05078125 if state=="free" else 121703.53515625),
                     "memory_total_mib":147440.1171875}
@@ -41,7 +43,7 @@ class AcceleratorFixture(LoopbackJobs):
         busy = [d["id"] for d in devices if d["state"] == "busy"]
         return encode(dict(state=row["state"], devices=devices,
             processes=[{"pid":1, "devices":busy}] if busy else [],
-            errors=["process query incomplete"] if row["state"] == "unknown" else [],
+            errors=["process query incomplete"] if row["state"] == "unknown" or row.get("incomplete") else [],
             sampled_at=100, whole_node_available=row["state"]=="free")) + b"\n"
 
 
@@ -137,6 +139,32 @@ def check_unresolved(b, mode):
     print(json.dumps({"mode":mode,"unresolved_target":"pass","permitted_ssh_snapshots":2}),flush=True)
 
 
+
+def check_mixed_models(b, mode):
+    rows = [{"id":f"00000000-0000-4000-8000-{i+1:012d}","name":f"model-{i+1}",
+             "state":state,"latency":0,"models":models,
+             "device_states":["free"]*len(models),"incomplete":state=="partial"}
+            for i,(state,models) in enumerate((("partial",["BW1101","S5000"]),
+                ("free",["H100"]*8)))]
+    with tempfile.TemporaryDirectory(prefix="jms-accelerator-models-") as d:
+        root=Path(d)
+        with AcceleratorFixture(root, {"targets":rows}).serving() as backend:
+            with connected(b, root, backend.config, mode, timeout=120) as ex:
+                c=Client(ex, False)
+                compact=c.tool("first","call",operation="jms_accelerator_status",
+                               arguments={"targets":[r["id"] for r in rows]})
+                p,f=compact["hosts"]
+                assert p["state"]=="partial" and p["count_scope"]=="observed"
+                assert p["free"]==p["total"]==2 and p["free_devices"]==["hygon:0","hygon:1"],p
+                assert [p["models"][i] for i in p["free_device_model_indexes"]]==["BW1101","S5000"],p
+                assert f["models"]==["H100"] and "free_devices" not in f,f
+                raw=read_all(c,compact["details_action"])
+                assert [d["model"] for d in raw["hosts"][0]["devices"]]==["BW1101","S5000"]
+                assert backend.counts["ssh_snapshot"]==2 and backend.counts["ssh_enrich"]==0
+                assert not backend.errors,backend.errors
+    print(json.dumps({"mode":mode,"mixed_models":"pass"}),flush=True)
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary",type=Path,required=True)
@@ -145,7 +173,9 @@ def main():
     args=parser.parse_args()
     import tiktoken
     enc=tiktoken.get_encoding("o200k_base")
-    if args.candidate: check_unresolved(args.binary.resolve(),args.mode)
+    if args.candidate:
+        check_unresolved(args.binary.resolve(),args.mode)
+        check_mixed_models(args.binary.resolve(),args.mode)
     for n in (1,4,8):
         print(json.dumps(sample(args.binary.resolve(),args.mode,n,args.candidate,
                                lambda s:len(enc.encode_ordinary(s)))),flush=True)

@@ -590,6 +590,11 @@ pub fn compact_host(host: &Map<String, Value>) -> Value {
         "models".into(),
         Value::Array(models.into_iter().map(Value::from).collect()),
     );
+    if models_are_heterogeneous(&row["models"]) && host.get("state").and_then(Value::as_str) == Some("partial") {
+        row.insert("free_device_model_pairs".into(), Value::Array(devices.iter()
+            .filter(|d| d.get("state").and_then(Value::as_str) == Some("free"))
+            .map(|d| json!([d["id"],d["model"]])).collect()));
+    }
     row.insert(
         "free_devices".into(),
         Value::Array(
@@ -665,6 +670,19 @@ pub fn compact_host(host: &Map<String, Value>) -> Value {
     Value::Object(row)
 }
 
+fn models_are_heterogeneous(models: &Value) -> bool {
+    models.as_array().is_some_and(|items| items.len() > 1)
+}
+
+fn summary_strings(value: &Value) -> impl Iterator<Item = &str> {
+    value.as_array().into_iter().flatten().filter_map(Value::as_str)
+}
+
+fn printable_model(model: &&str) -> bool {
+    !model.is_empty() && model.len() <= 40 && model.bytes().all(|b|
+        b.is_ascii_alphanumeric() || b" .:-_+()/".contains(&b))
+}
+
 /// Compact scheduling evidence from the inspector's already-validated snapshot.
 pub(crate) fn scheduling_summary(value: &Value) -> Option<Value> {
     let input = value.get("hosts")?.as_array()?;
@@ -672,12 +690,16 @@ pub(crate) fn scheduling_summary(value: &Value) -> Option<Value> {
         return None;
     }
     let stale = value.get("inventory_stale")?.as_bool()?;
+    let mut known_models = input.iter().flat_map(|row| summary_strings(&row["models"]));
+    let heterogeneous = known_models.next().is_some_and(|first| known_models.any(|model| model != first));
     let mut hosts = Vec::with_capacity(input.len());
     for (index, row) in input.iter().enumerate() {
         let id = ["address", "host", "asset_id"].iter()
-            .filter_map(|k| row.get(*k).and_then(Value::as_str))
-            .find(|s| !s.is_empty() && s.len() <= 96 &&
-                s.bytes().all(|b| b.is_ascii_alphanumeric() || b".:-_%".contains(&b)))
+            .filter_map(|k| row.get(*k).and_then(Value::as_str).map(|v| (*k, v)))
+            .find(|(key, v)| !v.is_empty() && v.len() <= 96 &&
+                v.bytes().all(|b| b.is_ascii_alphanumeric() || b".:-_%".contains(&b))
+                && input.iter().filter(|other| other.get(*key).and_then(Value::as_str) == Some(*v)).count() == 1)
+            .map(|(_, v)| v)
             .map(str::to_owned).unwrap_or_else(|| format!("target-{}", index + 1));
         let raw_state = row.get("state")?.as_str()?;
         let devices = row.get("devices")?.as_array()?;
@@ -718,7 +740,22 @@ pub(crate) fn scheduling_summary(value: &Value) -> Option<Value> {
             host["free"] = json!(free);
             host["total"] = json!(devices.len());
         }
+        if errors && !devices.is_empty() { host["count_scope"] = json!("observed"); }
         if unknown > 0 { host["unknown"] = json!(unknown); }
+        if heterogeneous {
+            let all: Vec<_> = summary_strings(&row["models"]).collect();
+            let shown: Vec<_> = all.iter().copied().filter(printable_model).take(4).collect();
+            if !shown.is_empty() { host["models"] = json!(shown); }
+            if shown.len() < all.len() { host["models_more"] = json!(all.len() - shown.len()); }
+            if state == "partial" && all.len() > 1 && !free_ids.is_empty() {
+                let pairs = row.get("free_device_model_pairs").and_then(Value::as_array);
+                let indexes: Vec<_> = free_ids.iter().map(|id| pairs.and_then(|data|
+                    data.iter().find(|pair| pair.get(0).and_then(Value::as_str) == Some(*id)))
+                    .and_then(|pair| pair.get(1).and_then(Value::as_str))
+                    .and_then(|model| shown.iter().position(|s| *s == model))).collect();
+                host["free_device_model_indexes"] = json!(indexes);
+            }
+        }
         if matches!(state, "busy" | "memory_held") {
             let util: Vec<_> = devices.iter().filter_map(|d| d.get(2).and_then(Value::as_f64)).collect();
             if util.iter().any(|u| *u >= 5.0) {
@@ -729,7 +766,7 @@ pub(crate) fn scheduling_summary(value: &Value) -> Option<Value> {
                 host["activity"] = json!("occupied_low_util");
             }
         }
-        if state == "partial" && free < devices.len() {
+        if state == "partial" && free > 0 {
             host["free_devices"] = json!(free_ids);
             if free_ids.len() < free {
                 host["free_devices_more"] = json!(free - free_ids.len());
@@ -768,7 +805,7 @@ mod tests {
         let view = scheduling_summary(&fixture).unwrap();
         assert_eq!(view["hosts"][0], json!({"host":"free","state":"free","free":1,"total":1}));
         assert_eq!(view["hosts"][1], json!({"host":"partial","state":"partial","free":1,"total":2,
-            "unknown":1,"free_devices":["gpu:0"],"reason":"incomplete_sample"}));
+            "unknown":1,"free_devices":["gpu:0"],"reason":"incomplete_sample","count_scope":"observed"}));
         assert_eq!(view["hosts"][2]["activity"], "occupied_low_util");
         assert_eq!(view["hosts"][3]["reason"], "unreachable");
         assert_eq!(view["hosts"][4]["state"], "unknown");
@@ -779,6 +816,8 @@ mod tests {
         let view = scheduling_summary(&incomplete).unwrap();
         assert_eq!(view["hosts"][0]["state"], "partial");
         assert_eq!(view["hosts"][0]["reason"], "incomplete_sample");
+        assert_eq!(view["hosts"][0]["free_devices"], json!(["gpu:0"]));
+        assert_eq!(view["hosts"][0]["count_scope"], "observed");
         let mut stale = fixture;
         stale["inventory_stale"] = json!(true);
         let view = scheduling_summary(&stale).unwrap();
@@ -786,6 +825,25 @@ mod tests {
         assert_eq!(view["hosts"][0]["free"], 0);
         assert_eq!(view["hosts"][0]["reason"], "inventory_stale");
         assert_eq!(view["hosts"][2]["state"], "busy");
+    }
+
+    #[test]
+    fn heterogeneous_summary_is_bounded_and_disambiguates_addresses() {
+        let models: Vec<_> = (0..4).map(|i| format!("Model-{i}-{}", "x".repeat(30))).collect();
+        let devices: Vec<_> = (0..16).map(|i| json!([format!("gpu:{i}:long-ident-123456"),"free",0])).collect();
+        let pairs: Vec<_> = devices.iter().enumerate().map(|(i, device)|
+            json!([device[0], models[i%4]])).collect();
+        let rows: Vec<_> = (0..8).map(|i| json!({"host":format!("fixture-{i}-{}", "x".repeat(80)),
+            "address":"192.0.2.1","state":"partial","devices":devices,
+            "models":models,"free_device_model_pairs":pairs,"errors":["incomplete"]})).collect();
+        let full = json!({"hosts":rows,"device_columns":["id","state","util_pct"],"inventory_stale":false});
+        let first = scheduling_summary(&full).unwrap();
+        assert!(first.to_string().len() < 7800, "leave room for the staging envelope");
+        assert_eq!(first["hosts"].as_array().unwrap().len(), 8);
+        for index in 0..8 {
+            assert_eq!(first["hosts"][index]["host"], full["hosts"][index]["host"]);
+            assert_eq!(first["hosts"][index]["free_device_model_indexes"][15], 3);
+        }
     }
 
     #[test]
