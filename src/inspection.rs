@@ -105,43 +105,44 @@ impl AcceleratorInspector {
             }
         }
         let inventory = self.catalog.ensure().await?;
-        let mut hosts: Vec<Host> = Vec::new();
-        for target in targets {
-            let resolved = inventory.resolve(std::slice::from_ref(target))?;
-            if resolved.len() != 1 {
-                return Err(BridgeError::invalid(
-                    "each inspection target must resolve to exactly one machine",
-                ));
+        let mut hosts: Vec<(usize, Host)> = Vec::new();
+        let mut ordered = Vec::new();
+        for (index, target) in targets.iter().enumerate() {
+            match inventory.resolve(std::slice::from_ref(target)) {
+                Ok(resolved) if resolved.len() == 1 => {
+                    let host = resolved.into_iter().next().expect("one host");
+                    if !hosts.iter().any(|(_, existing)| existing.asset_id == host.asset_id) {
+                        hosts.push((index, host));
+                    }
+                }
+                // Invalid syntax is still rejected before resolution. An exact unavailable
+                // selector is a per-target verdict and never enters the SSH execution lane.
+                result => {
+                    let error = result.err().map(|e| e.message())
+                        .unwrap_or_else(|| "target did not resolve uniquely".to_string());
+                    ordered.push((index, json!({"host":target,"state":"unknown",
+                        "whole_node_available":false,"reason":"unresolved_target",
+                        "devices":[],"errors":[error]})));
+                }
             }
-            let host = resolved.into_iter().next().expect("one host");
-            if !hosts
-                .iter()
-                .any(|existing| existing.asset_id == host.asset_id)
-            {
-                hosts.push(host);
-            }
-        }
-        if hosts.len() > MAX_HOSTS {
-            return Err(BridgeError::invalid(
-                "inspection resolved to more than 8 machines",
-            ));
         }
         // Inspection uses reserved execution capacity and the shared connections.
         let mut set = tokio::task::JoinSet::new();
-        for host in hosts {
+        for (index, host) in hosts {
             let runner = self.runner.clone();
             let store = self.store.clone();
-            set.spawn(async move { inspect_host(runner, store, host, timeout).await });
+            set.spawn(async move { (index, inspect_host(runner, store, host, timeout).await) });
         }
-        let mut rows: Vec<Value> = Vec::new();
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok(row) => rows.push(row),
+                Ok(row) => ordered.push(row),
                 Err(error) => {
                     return Err(BridgeError::ssh(format!("inspection task failed: {error}")))
                 }
             }
         }
+        ordered.sort_unstable_by_key(|(index, _)| *index);
+        let rows: Vec<_> = ordered.into_iter().map(|(_, row)| row).collect();
         let ok = rows
             .iter()
             .all(|row| row["errors"].as_array().map(Vec::is_empty).unwrap_or(true));
@@ -561,6 +562,7 @@ pub fn compact_host(host: &Map<String, Value>) -> Value {
     for key in [
         "host",
         "address",
+        "asset_id",
         "state",
         "sampled_at",
         "collected_at",
@@ -574,6 +576,9 @@ pub fn compact_host(host: &Map<String, Value>) -> Value {
             host.get(key).cloned().unwrap_or(Value::Null),
         );
     }
+    if let Some(reason) = host.get("reason") {
+        row.insert("reason".into(), reason.clone());
+    }
     let mut models: Vec<String> = devices
         .iter()
         .filter_map(|device| device.get("model").and_then(Value::as_str))
@@ -585,6 +590,11 @@ pub fn compact_host(host: &Map<String, Value>) -> Value {
         "models".into(),
         Value::Array(models.into_iter().map(Value::from).collect()),
     );
+    if models_are_heterogeneous(&row["models"]) && host.get("state").and_then(Value::as_str) == Some("partial") {
+        row.insert("free_device_model_pairs".into(), Value::Array(devices.iter()
+            .filter(|d| d.get("state").and_then(Value::as_str) == Some("free"))
+            .map(|d| json!([d["id"],d["model"]])).collect()));
+    }
     row.insert(
         "free_devices".into(),
         Value::Array(
@@ -660,6 +670,142 @@ pub fn compact_host(host: &Map<String, Value>) -> Value {
     Value::Object(row)
 }
 
+fn models_are_heterogeneous(models: &Value) -> bool {
+    models.as_array().is_some_and(|items| items.len() > 1)
+}
+
+fn summary_strings(value: &Value) -> impl Iterator<Item = &str> {
+    value.as_array().into_iter().flatten().filter_map(Value::as_str)
+}
+
+fn printable_model(model: &&str) -> bool {
+    !model.is_empty() && model.len() <= 40 && model.bytes().all(|b|
+        b.is_ascii_alphanumeric() || b" .:-_+()/".contains(&b))
+}
+
+const SUMMARY_IDENTITY_KEYS: [&str; 3] = ["address", "host", "asset_id"];
+
+fn identity_fields(row: &Value) -> impl Iterator<Item = &str> {
+    SUMMARY_IDENTITY_KEYS.iter().filter_map(|key| row.get(*key).and_then(Value::as_str))
+}
+
+fn scheduling_identity(rows: &[Value], index: usize) -> (String, bool) {
+    if let Some(label) = identity_fields(&rows[index]).find(|candidate| {
+        !candidate.is_empty() && candidate.len() <= 96
+            && candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b".:-_%".contains(&b))
+            && !rows.iter().enumerate().any(|(other, row)| {
+                other != index && identity_fields(row).any(|label| label == *candidate)
+            })
+    }) {
+        return (label.to_owned(), false);
+    }
+    let mut fallback = format!("target-{}", index + 1);
+    // A positional label is display-only. Do not let it collide with a real
+    // selector (including the labels of rows before this one).
+    while rows.iter().flat_map(identity_fields).any(|label| label == fallback) {
+        fallback.insert(0, '_');
+    }
+    (fallback, true)
+}
+
+/// Compact scheduling evidence from the inspector's already-validated snapshot.
+pub(crate) fn scheduling_summary(value: &Value) -> Option<Value> {
+    let input = value.get("hosts")?.as_array()?;
+    if input.is_empty() || input.len() > MAX_HOSTS || !value.get("device_columns")?.is_array() {
+        return None;
+    }
+    let stale = value.get("inventory_stale")?.as_bool()?;
+    let mut known_models = input.iter().flat_map(|row| summary_strings(&row["models"]));
+    let heterogeneous = known_models.next().is_some_and(|first| known_models.any(|model| model != first));
+    let mut hosts = Vec::with_capacity(input.len());
+    for (index, row) in input.iter().enumerate() {
+        let (id, positional) = scheduling_identity(input, index);
+        let raw_state = row.get("state")?.as_str()?;
+        let devices = row.get("devices")?.as_array()?;
+        let errors = row.get("errors").and_then(Value::as_array).is_some_and(|x| !x.is_empty());
+        let claims_free = matches!(raw_state, "free" | "partial");
+        let whole_node = row.get("whole_node_available").and_then(Value::as_bool) == Some(true);
+        let allow_free = claims_free && !stale && (raw_state != "free" || (whole_node && !errors));
+        let mut free = 0;
+        let mut unknown = 0;
+        let mut free_ids = Vec::new();
+        for device in devices {
+            match device.get(1).and_then(Value::as_str) {
+                Some("free") if allow_free => {
+                    free += 1;
+                    if let Some(id) = device.get(0).and_then(Value::as_str).filter(|id|
+                        !id.is_empty() && id.len() <= 24 && id.bytes().all(|b|
+                            b.is_ascii_alphanumeric() || b".:-_".contains(&b)))
+                    {
+                        if free_ids.len() < 16 { free_ids.push(id); }
+                    }
+                }
+                Some("busy" | "unhealthy" | "memory_held") => {}
+                _ => unknown += 1,
+            }
+        }
+        let state = if free > 0 && free == devices.len() && whole_node && !errors {
+            "free"
+        } else if free > 0 {
+            "partial"
+        } else {
+            match raw_state {
+                "busy" | "unhealthy" | "memory_held" | "no_accelerator_detected" => raw_state,
+                _ => "unknown",
+            }
+        };
+        let mut host = json!({"host":id,"state":state});
+        if positional {
+            host["host_is_row_label"] = json!(true);
+        }
+        if !devices.is_empty() || state == "no_accelerator_detected" {
+            host["free"] = json!(free);
+            host["total"] = json!(devices.len());
+        }
+        if errors && !devices.is_empty() { host["count_scope"] = json!("observed"); }
+        if unknown > 0 { host["unknown"] = json!(unknown); }
+        if heterogeneous {
+            let all: Vec<_> = summary_strings(&row["models"]).collect();
+            let shown: Vec<_> = all.iter().copied().filter(printable_model).take(4).collect();
+            if !shown.is_empty() { host["models"] = json!(shown); }
+            if shown.len() < all.len() { host["models_more"] = json!(all.len() - shown.len()); }
+            if state == "partial" && all.len() > 1 && !free_ids.is_empty() {
+                let pairs = row.get("free_device_model_pairs").and_then(Value::as_array);
+                let indexes: Vec<_> = free_ids.iter().map(|id| pairs.and_then(|data|
+                    data.iter().find(|pair| pair.get(0).and_then(Value::as_str) == Some(*id)))
+                    .and_then(|pair| pair.get(1).and_then(Value::as_str))
+                    .and_then(|model| shown.iter().position(|s| *s == model))).collect();
+                host["free_device_model_indexes"] = json!(indexes);
+            }
+        }
+        if matches!(state, "busy" | "memory_held") {
+            let util: Vec<_> = devices.iter().filter_map(|d| d.get(2).and_then(Value::as_f64)).collect();
+            if util.iter().any(|u| *u >= 5.0) {
+                host["activity"] = json!("active");
+            } else if !devices.is_empty() && util.len() == devices.len()
+                && row.get("process_count").and_then(Value::as_u64).is_some_and(|n| n > 0)
+            {
+                host["activity"] = json!("occupied_low_util");
+            }
+        }
+        if state == "partial" && free > 0 {
+            host["free_devices"] = json!(free_ids);
+            if free_ids.len() < free {
+                host["free_devices_more"] = json!(free - free_ids.len());
+            }
+        }
+        let reason = if stale && claims_free { Some("inventory_stale") }
+        else if row.get("reason").and_then(Value::as_str) == Some("unresolved_target") { Some("unresolved_target") }
+        else if raw_state == "down" { Some("unreachable") }
+        else if row.get("backpressure").is_some() { Some("collector_unavailable") }
+        else if errors || unknown > 0 || state == "unknown" { Some("incomplete_sample") }
+        else { None };
+        if let Some(reason) = reason { host["reason"] = json!(reason); }
+        hosts.push(host);
+    }
+    Some(json!({"hosts":hosts,"inventory_stale":stale,"snapshot_only":true}))
+}
+
 fn take_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -667,6 +813,84 @@ fn take_chars(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduling_summary_counts_unknown_and_never_promotes_stale_or_incomplete() {
+        let fixture = json!({"device_columns":["id","state","util_pct"],"inventory_stale":false,
+            "hosts":[
+                {"host":"free","state":"free","whole_node_available":true,"devices":[["gpu:0","free",0]]},
+                {"host":"partial","state":"partial","devices":[["gpu:0","free",0],["gpu:1","unknown",null]],"errors":["process query incomplete"]},
+                {"host":"resident","state":"busy","devices":[["gpu:0","busy",0]],"process_count":1},
+                {"host":"down","state":"down","devices":[]},
+                {"host":"unproven","state":"free","whole_node_available":false,"devices":[["gpu:0","free",0]]}
+            ]});
+        let view = scheduling_summary(&fixture).unwrap();
+        assert_eq!(view["hosts"][0], json!({"host":"free","state":"free","free":1,"total":1}));
+        assert_eq!(view["hosts"][1], json!({"host":"partial","state":"partial","free":1,"total":2,
+            "unknown":1,"free_devices":["gpu:0"],"reason":"incomplete_sample","count_scope":"observed"}));
+        assert_eq!(view["hosts"][2]["activity"], "occupied_low_util");
+        assert_eq!(view["hosts"][3]["reason"], "unreachable");
+        assert_eq!(view["hosts"][4]["state"], "unknown");
+        let mut incomplete = fixture.clone();
+        incomplete["hosts"][0]["state"] = json!("partial");
+        incomplete["hosts"][0]["whole_node_available"] = json!(false);
+        incomplete["hosts"][0]["errors"] = json!(["other device class unavailable"]);
+        let view = scheduling_summary(&incomplete).unwrap();
+        assert_eq!(view["hosts"][0]["state"], "partial");
+        assert_eq!(view["hosts"][0]["reason"], "incomplete_sample");
+        assert_eq!(view["hosts"][0]["free_devices"], json!(["gpu:0"]));
+        assert_eq!(view["hosts"][0]["count_scope"], "observed");
+        let mut stale = fixture;
+        stale["inventory_stale"] = json!(true);
+        let view = scheduling_summary(&stale).unwrap();
+        assert_eq!(view["hosts"][0]["state"], "unknown");
+        assert_eq!(view["hosts"][0]["free"], 0);
+        assert_eq!(view["hosts"][0]["reason"], "inventory_stale");
+        assert_eq!(view["hosts"][2]["state"], "busy");
+    }
+
+    #[test]
+    fn heterogeneous_summary_is_bounded_and_disambiguates_addresses() {
+        let models: Vec<_> = (0..4).map(|i| format!("Model-{i}-{}", "x".repeat(30))).collect();
+        let devices: Vec<_> = (0..16).map(|i| json!([format!("gpu:{i}:long-ident-123456"),"free",0])).collect();
+        let pairs: Vec<_> = devices.iter().enumerate().map(|(i, device)|
+            json!([device[0], models[i%4]])).collect();
+        let rows: Vec<_> = (0..8).map(|i| json!({"host":format!("fixture-{i}-{}", "x".repeat(80)),
+            "address":"192.0.2.1","state":"partial","devices":devices,
+            "models":models,"free_device_model_pairs":pairs,"errors":["incomplete"]})).collect();
+        let full = json!({"hosts":rows,"device_columns":["id","state","util_pct"],"inventory_stale":false});
+        let first = scheduling_summary(&full).unwrap();
+        assert!(first.to_string().len() < 7800, "leave room for the staging envelope");
+        assert_eq!(first["hosts"].as_array().unwrap().len(), 8);
+        for index in 0..8 {
+            assert_eq!(first["hosts"][index]["host"], full["hosts"][index]["host"]);
+            assert_eq!(first["hosts"][index]["free_device_model_indexes"][15], 3);
+        }
+    }
+
+    #[test]
+    fn scheduling_summary_identity_is_unique_across_fields_and_fallbacks() {
+        let rows = json!([
+            {"address":"192.0.2.10","host":"free-short","asset_id":"asset-a","state":"free","whole_node_available":true,"devices":[["gpu:0","free",0]]},
+            {"address":"192.0.2.20","host":"192.0.2.10","asset_id":"asset-b","state":"busy","devices":[["gpu:0","busy",10]]},
+            {"address":"192.0.2.20","host":"asset-b","asset_id":"asset-c","state":"down","devices":[]},
+            {"host":"target-5","state":"down","devices":[]},
+            {"host":"!!cannot-be-a-selector!!","state":"unknown","devices":[]},
+            {"host":"_target-5","state":"down","devices":[]},
+            {"host":"unresolved","state":"unknown","reason":"unresolved_target","devices":[]}
+        ]);
+        let fixture = json!({"hosts":rows,"device_columns":["id"],"inventory_stale":false});
+        let view = scheduling_summary(&fixture).unwrap();
+        let host_rows = view["hosts"].as_array().unwrap();
+        let labels: Vec<_> = host_rows.iter().map(|row| row["host"].as_str().unwrap()).collect();
+        assert_eq!(labels, ["free-short", "target-2", "asset-c", "target-5", "__target-5", "_target-5", "unresolved"]);
+        assert_eq!(host_rows[0]["state"], "free");
+        assert_eq!(host_rows[1]["state"], "busy");
+        assert_eq!(host_rows[1]["host_is_row_label"], true);
+        assert_eq!(host_rows[4]["host_is_row_label"], true);
+        assert_eq!(host_rows[6]["reason"], "unresolved_target");
+        assert!(host_rows[0].get("host_is_row_label").is_none());
+    }
 
     #[test]
     fn node_payload_embeds_all_three_modules() {

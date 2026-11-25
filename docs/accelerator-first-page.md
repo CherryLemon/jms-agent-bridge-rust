@@ -1,0 +1,68 @@
+# Accelerator status first response
+
+`call(operation="jms_accelerator_status", arguments={...})` defaults to a compact
+scheduling snapshot. Each resolved asset contributes one row in request order
+(aliases resolving to the same asset retain the existing deduplication). A valid
+exact selector missing from inventory yields an unresolved row; no SSH probe is
+made for that selector. Other requested targets are unaffected.
+
+- Read `host`, `state`, and, when available, `free`/`total`. `unknown` counts
+  unverified devices. For a partially usable node only, `free_devices` lists
+  verified IDs; `free_devices_more` indicates omitted IDs, when applicable.
+  `count_scope=observed` distinguishes a count from an incomplete sample.
+  Heterogeneous results include bounded `models`; a mixed partial node can map
+  `free_devices` to model indices in the same order (`null` means unavailable).
+- A busy machine with confirmed processes but uniformly low utilization may
+  report `activity=occupied_low_util`. It is not free. A shortened `reason` is
+  provided for unknown/incomplete evidence. An inventory-stale response does
+  not offer a formerly free or partial asset as available.
+- This is a snapshot, not a reservation. Recheck selected devices immediately
+  before allocating them.
+- Small compact responses use `details_action` to open the original detailed
+  snapshot. If a response stages, `next_action` retains the prior saved-result
+  form and `diagnostics_action` can open the detailed snapshot directly.
+  Neither continuation re-probes the machine. Use `detail="full"` for the
+  previous detailed envelope when it fits, and the same stored result when it
+  does not.
+
+## Related paths
+
+`job status`, `job list`, their legacy aliases, and large legacy
+`jms_list_assets` pages use generic output staging. The generic envelope may
+retain small scalar fields but only has a text preview for long row arrays.
+Use smaller inventory pages where possible. Typed submit/wait staging already
+preserves handles and resume instructions; offset-based log paging already
+preserves a typed cursor. This change leaves those contracts untouched. This
+is a static audit of paths, not evidence of live failure on those operations.
+
+## Offline acceptance
+
+`tools/mcp_accelerator_first_page.py` runs the same synthetic 1/4/8 asset input
+over stdio and Streamable HTTP. It verifies that the snapshot answers the
+allocation question in one call, all requested verdicts are present and in
+order, and reading detail pages adds no SSH probes. Report allocation
+decision and full-detail workflows separately. Token figures use local
+`o200k_base`, not provider-billed usage.
+
+Matched synthetic results: one run per target count and transport. The 8-node
+case exceeds the old generic output budget.
+
+| Transport | Nodes | Decision calls old/new | Decision result tokens old/new | Full detail calls old/new | Full detail result tokens old/new | SSH snapshot + enrichment (both) |
+|---|---:|---:|---:|---:|---:|---:|
+| stdio | 1 | 1 / 1 | 412 / 112 | 2 / 2 | 1080 / 771 | 1 + 0 |
+| stdio | 4 | 1 / 1 | 2314 / 239 | 4 / 4 | 6380 / 4308 | 4 + 2 |
+| stdio | 8 | 5 / 1 | 5651 / 440 | 11 / 7 | 13736 / 8533 | 8 + 4 |
+| http | 1 | 1 / 1 | 408 / 110 | 2 / 2 | 1073 / 769 | 1 + 0 |
+| http | 4 | 1 / 1 | 2316 / 235 | 4 / 4 | 6398 / 4305 | 4 + 2 |
+| http | 8 | 5 / 1 | 5650 / 439 | 11 / 7 | 13743 / 8500 | 8 + 4 |
+
+Stale, incomplete and duplicate address states plus the heterogeneous size
+bound have Rust unit coverage. Both loopback transports checked an unresolved
+selector (only two permitted assets probed) and a heterogeneous node with all
+observed devices free but incomplete telemetry (IDs and model mapping retained).
+
+A first-page host label is selected across the address, name and canonical ID
+fields of all returned rows. If every eligible label for a row collides or
+cannot be printed, that row has a unique display-only label and
+`host_is_row_label: true`. Use the original request and saved details to
+identify that row; do not send the display label as a target selector.

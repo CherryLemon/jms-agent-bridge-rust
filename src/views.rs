@@ -377,6 +377,22 @@ fn compact_inner(
         return value.clone();
     }
     if operation == "jms_accelerator_status" {
+        if map.get("staged") == Some(&Value::Bool(true)) {
+            return value.clone();
+        }
+        if let Some(result_id) = map.get("result_id").and_then(Value::as_str) {
+            if let Some(mut first) = crate::inspection::scheduling_summary(value) {
+                first["ok"] = value["ok"].clone();
+                first["result_id"] = Value::from(result_id);
+                first["result_id_scope"] = Value::from("bridge_local");
+                first["details_action"] = serde_json::json!({
+                    "tool":"read_result","arguments":{
+                        "result_id":result_id,"stream":"result","offset":0,"limit":4096
+                    }
+                });
+                return first;
+            }
+        }
         let mut out = Map::new();
         for (key, item) in map {
             if key == "policy" || key == "details" {

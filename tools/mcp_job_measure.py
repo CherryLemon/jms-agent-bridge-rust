@@ -29,7 +29,7 @@ CASES = {
 
 
 @contextmanager
-def connected(binary, root, config, mode, *, state="state"):
+def connected(binary, root, config, mode, *, state="state", timeout=30):
     command = [str(binary), "serve", "--config", str(config), "--no-lock"]
     if mode == "stdio":
         command.append("--stdio")
@@ -46,8 +46,8 @@ def connected(binary, root, config, mode, *, state="state"):
         stdout=subprocess.PIPE, stderr=errors,
     ) as process:
         try:
-            exchange = ((lambda body, reply: stdio(process, body, reply, timeout=30)) if mode == "stdio"
-                        else (lambda body, reply: exchange_http(port, body, reply, timeout=30)))
+            exchange = ((lambda body, reply: stdio(process, body, reply, timeout=timeout)) if mode == "stdio"
+                        else (lambda body, reply: exchange_http(port, body, reply, timeout=timeout)))
             if mode == "http":
                 await_http(port, process)
             yield exchange
