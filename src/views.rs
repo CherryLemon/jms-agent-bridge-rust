@@ -179,13 +179,14 @@ pub fn compact(
 }
 
 /// Staging fields worth keeping, in the order they are attached.
-const STAGING_KEYS: [&str; 8] = [
+const STAGING_KEYS: [&str; 9] = [
     "staged",
     "operation",
     "bytes",
     "result_id",
     "result_id_scope",
     "next_action",
+    "diagnostics_action",
     "preview",
     "note",
 ];

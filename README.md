@@ -214,6 +214,13 @@ Listings are paged (`offset`/`limit`, `next_offset` in the answer) and a `call` 
 response above 8 KiB is saved whole: the reply then carries `staged: true`, a
 business summary and a `result_id` that `read_result(stream="result")` reads back.
 
+When a staged Job submit or batch wait has room in its summary, it also
+includes `diagnostics_action`. Call it on the same bridge to read the complete
+local JSON, including per-target outcomes. Continue using the page's
+`next_offset`. This does not replace the remote status `next_action`, the
+`jobs` or `pending` handles, or their typed continuation references. If the
+hint does not fit, use the local `result_id` and `stream="result"` directly.
+
 For truncated `run` output, each affected stream in `preview_ranges` lists
 `shown` and `omitted` source byte offsets as half-open ranges, independent of
 JSON escaping or lossy text encoding. Stdout previews a prefix and stderr a
