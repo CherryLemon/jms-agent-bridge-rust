@@ -937,6 +937,12 @@ pub fn decode(raw: &[u8], options: &FsOptions, stderr: &[u8]) -> Value {
     if !warnings.is_empty() {
         state.insert("warnings".into(), Value::Array(warnings));
     }
+    if options.action == "search" && options.literal.unwrap_or(true)
+        && options.pattern.contains('|') && offset == 0 && output.is_empty()
+        && !incomplete && !has_errors(&state)
+    {
+        state.insert("hint".into(), json!("Literal match; set literal=false for alternation."));
+    }
     if depth_limited {
         state.insert("depth_limited".into(), Value::Bool(true));
     }
