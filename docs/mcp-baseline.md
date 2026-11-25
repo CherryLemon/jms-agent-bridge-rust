@@ -636,3 +636,46 @@ are not included in the zero SSH operations column.
 This compares local recovery semantics, not production, cross-machine
 latency, or actual artifacts. Fixture bytes are pinned separately from
 the generated case states and metadata.
+
+### Offline rollback to an older bridge
+
+The harness discards the fully acknowledged public Job submit response at
+the application boundary, then replaces the candidate process with the
+previous binary. Both processes use the same temporary state but never run
+concurrently. The previous client uses legacy `call request_status`,
+`read_result`, legacy `call jms_job_status` and `call jms_job_logs`. No
+write or replay is allowed during recovery. Only after the previous client
+finishes does the harness compare the recovered IDs with the discarded
+response. The SSH fixture returns canned receipts and output; it launches
+no actual command. Zero SSH probes during local receipt and result reads
+does not imply zero catalog requests.
+
+Build the revisions separately from clean source, using distinct Cargo
+target directories, then run:
+
+```sh
+python3 tools/mcp_job_rollback.py \
+  --candidate /path/to/candidate/jms-bridge \
+  --candidate-git-sha f0a6c1d68785c373da01e521ac97f64d2afbd049 \
+  --previous /path/to/previous/jms-bridge \
+  --previous-git-sha 4b0e956aa9e4d7bb8a1173462744e76cc2587c7e \
+  --repeats 3
+```
+
+Rust 1.89 locked release, Paramiko 3.5.1, one acknowledged launch per
+synthetic workflow. Fixture SHA-256:
+`0f63ff03bc9f98417b56d6d26c68e53c55c995e1df30b43d20d9636c056170ac`.
+Candidate binary SHA-256:
+`cccf364c9061e756186677a2abc0d460af9849b8c2f47dfc6d70fad408cf080e`.
+Previous binary SHA-256:
+`d78d4f3aecd8b360e466c8571c50da4dc8818dbedeb10e42be85b4a58bf145ef`.
+
+| Transport | Completed workflows | Candidate / previous tool calls | Recovered receipts / saved results | SSH launch / status / logs | Duplicate launches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| stdio | 3 | 3 / 12 | 3 / 3 | 3 / 3 / 3 | 0 |
+| HTTP | 3 | 3 / 12 | 3 / 3 | 3 / 3 / 3 | 0 |
+
+Counts exclude transport startup RPCs. This checks only the documented
+candidate-to-previous pair and the one-target completed case. It does
+not validate all old versions, staged result/action support in an old
+client, a live deployment rollback, or model-provider token usage.
