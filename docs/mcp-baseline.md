@@ -595,3 +595,35 @@ remain available to older clients. Use `--require-next-action` in the staged Job
 log test to verify the emitted action against a candidate release. This applies
 to generic staged operations; job batch continuation keeps its existing
 pending/handle semantics.
+
+### Offline: staged batch wait and pending-handle scope
+
+`tools/mcp_job_staged_wait.py` runs the public paired `job/wait` against one
+canned loopback asset. Job IDs and states are seeded directly; no launch,
+remote log read, file read, or shell command execution occurs. In one case,
+six terminal failure rows and 24 unverified metadata references make the
+stored JSON 11,469 UTF-8 bytes while two distinct pending pairs stay inline.
+The first diagnostic page uses the emitted local action, subsequent pages
+resume after a process restart with the same state, and a foreign state
+rejects the result ID. An independent bridge can still wait on both exact
+inline pairs without reenlisting any terminal job.
+
+In the second case ten bounded handles with metadata overflow the summary.
+A typed pending reference works on the originating bridge and is rejected
+by a fresh state before touching the fixture backend. The full pending array
+can be recovered from the local JSON while the origin still exists. The
+test hands two exact materialized pairs to the fresh bridge; it does not
+claim that an origin-local ref can survive loss of its only result store.
+
+Three repetitions per transport with the release source at
+`dfef3d401031d35368435666f4053eb9662f50fb`, binary SHA-256
+`4f85afa5d5773be7ab646ece6115df7e31cb9efcadcb12650a2bbbed05ae932b`:
+
+| Transport | Diagnostic-only workflows | Pages / foreign ID rejections | Typed-overflow workflows | Typed pages / foreign ref rejections | Launches / backend operations during local reads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| stdio | 3 | 9 / 3 | 3 | 12 / 3 | 0 / 0 |
+| HTTP | 3 | 9 / 3 | 3 | 12 / 3 | 0 / 0 |
+
+This compares local recovery semantics, not production, cross-machine
+latency, or actual artifacts. Fixture bytes are pinned separately from
+the generated case states and metadata.
