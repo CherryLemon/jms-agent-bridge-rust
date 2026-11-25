@@ -105,43 +105,44 @@ impl AcceleratorInspector {
             }
         }
         let inventory = self.catalog.ensure().await?;
-        let mut hosts: Vec<Host> = Vec::new();
-        for target in targets {
-            let resolved = inventory.resolve(std::slice::from_ref(target))?;
-            if resolved.len() != 1 {
-                return Err(BridgeError::invalid(
-                    "each inspection target must resolve to exactly one machine",
-                ));
+        let mut hosts: Vec<(usize, Host)> = Vec::new();
+        let mut ordered = Vec::new();
+        for (index, target) in targets.iter().enumerate() {
+            match inventory.resolve(std::slice::from_ref(target)) {
+                Ok(resolved) if resolved.len() == 1 => {
+                    let host = resolved.into_iter().next().expect("one host");
+                    if !hosts.iter().any(|(_, existing)| existing.asset_id == host.asset_id) {
+                        hosts.push((index, host));
+                    }
+                }
+                // Invalid syntax is still rejected before resolution. An exact unavailable
+                // selector is a per-target verdict and never enters the SSH execution lane.
+                result => {
+                    let error = result.err().map(|e| e.message())
+                        .unwrap_or_else(|| "target did not resolve uniquely".to_string());
+                    ordered.push((index, json!({"host":target,"state":"unknown",
+                        "whole_node_available":false,"reason":"unresolved_target",
+                        "devices":[],"errors":[error]})));
+                }
             }
-            let host = resolved.into_iter().next().expect("one host");
-            if !hosts
-                .iter()
-                .any(|existing| existing.asset_id == host.asset_id)
-            {
-                hosts.push(host);
-            }
-        }
-        if hosts.len() > MAX_HOSTS {
-            return Err(BridgeError::invalid(
-                "inspection resolved to more than 8 machines",
-            ));
         }
         // Inspection uses reserved execution capacity and the shared connections.
         let mut set = tokio::task::JoinSet::new();
-        for host in hosts {
+        for (index, host) in hosts {
             let runner = self.runner.clone();
             let store = self.store.clone();
-            set.spawn(async move { inspect_host(runner, store, host, timeout).await });
+            set.spawn(async move { (index, inspect_host(runner, store, host, timeout).await) });
         }
-        let mut rows: Vec<Value> = Vec::new();
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok(row) => rows.push(row),
+                Ok(row) => ordered.push(row),
                 Err(error) => {
                     return Err(BridgeError::ssh(format!("inspection task failed: {error}")))
                 }
             }
         }
+        ordered.sort_unstable_by_key(|(index, _)| *index);
+        let rows: Vec<_> = ordered.into_iter().map(|(_, row)| row).collect();
         let ok = rows
             .iter()
             .all(|row| row["errors"].as_array().map(Vec::is_empty).unwrap_or(true));
@@ -561,6 +562,7 @@ pub fn compact_host(host: &Map<String, Value>) -> Value {
     for key in [
         "host",
         "address",
+        "asset_id",
         "state",
         "sampled_at",
         "collected_at",
@@ -573,6 +575,9 @@ pub fn compact_host(host: &Map<String, Value>) -> Value {
             key.to_string(),
             host.get(key).cloned().unwrap_or(Value::Null),
         );
+    }
+    if let Some(reason) = host.get("reason") {
+        row.insert("reason".into(), reason.clone());
     }
     let mut models: Vec<String> = devices
         .iter()
@@ -660,6 +665,88 @@ pub fn compact_host(host: &Map<String, Value>) -> Value {
     Value::Object(row)
 }
 
+/// Compact scheduling evidence from the inspector's already-validated snapshot.
+pub(crate) fn scheduling_summary(value: &Value) -> Option<Value> {
+    let input = value.get("hosts")?.as_array()?;
+    if input.is_empty() || input.len() > MAX_HOSTS || !value.get("device_columns")?.is_array() {
+        return None;
+    }
+    let stale = value.get("inventory_stale")?.as_bool()?;
+    let mut hosts = Vec::with_capacity(input.len());
+    for (index, row) in input.iter().enumerate() {
+        let id = ["address", "host", "asset_id"].iter()
+            .filter_map(|k| row.get(*k).and_then(Value::as_str))
+            .find(|s| !s.is_empty() && s.len() <= 96 &&
+                s.bytes().all(|b| b.is_ascii_alphanumeric() || b".:-_%".contains(&b)))
+            .map(str::to_owned).unwrap_or_else(|| format!("target-{}", index + 1));
+        let raw_state = row.get("state")?.as_str()?;
+        let devices = row.get("devices")?.as_array()?;
+        let errors = row.get("errors").and_then(Value::as_array).is_some_and(|x| !x.is_empty());
+        let claims_free = matches!(raw_state, "free" | "partial");
+        let whole_node = row.get("whole_node_available").and_then(Value::as_bool) == Some(true);
+        let allow_free = claims_free && !stale && (raw_state != "free" || (whole_node && !errors));
+        let mut free = 0;
+        let mut unknown = 0;
+        let mut free_ids = Vec::new();
+        for device in devices {
+            match device.get(1).and_then(Value::as_str) {
+                Some("free") if allow_free => {
+                    free += 1;
+                    if let Some(id) = device.get(0).and_then(Value::as_str).filter(|id|
+                        !id.is_empty() && id.len() <= 24 && id.bytes().all(|b|
+                            b.is_ascii_alphanumeric() || b".:-_".contains(&b)))
+                    {
+                        if free_ids.len() < 16 { free_ids.push(id); }
+                    }
+                }
+                Some("busy" | "unhealthy" | "memory_held") => {}
+                _ => unknown += 1,
+            }
+        }
+        let state = if free > 0 && free == devices.len() && whole_node && !errors {
+            "free"
+        } else if free > 0 {
+            "partial"
+        } else {
+            match raw_state {
+                "busy" | "unhealthy" | "memory_held" | "no_accelerator_detected" => raw_state,
+                _ => "unknown",
+            }
+        };
+        let mut host = json!({"host":id,"state":state});
+        if !devices.is_empty() || state == "no_accelerator_detected" {
+            host["free"] = json!(free);
+            host["total"] = json!(devices.len());
+        }
+        if unknown > 0 { host["unknown"] = json!(unknown); }
+        if matches!(state, "busy" | "memory_held") {
+            let util: Vec<_> = devices.iter().filter_map(|d| d.get(2).and_then(Value::as_f64)).collect();
+            if util.iter().any(|u| *u >= 5.0) {
+                host["activity"] = json!("active");
+            } else if !devices.is_empty() && util.len() == devices.len()
+                && row.get("process_count").and_then(Value::as_u64).is_some_and(|n| n > 0)
+            {
+                host["activity"] = json!("occupied_low_util");
+            }
+        }
+        if state == "partial" && free < devices.len() {
+            host["free_devices"] = json!(free_ids);
+            if free_ids.len() < free {
+                host["free_devices_more"] = json!(free - free_ids.len());
+            }
+        }
+        let reason = if stale && claims_free { Some("inventory_stale") }
+        else if row.get("reason").and_then(Value::as_str) == Some("unresolved_target") { Some("unresolved_target") }
+        else if raw_state == "down" { Some("unreachable") }
+        else if row.get("backpressure").is_some() { Some("collector_unavailable") }
+        else if errors || unknown > 0 || state == "unknown" { Some("incomplete_sample") }
+        else { None };
+        if let Some(reason) = reason { host["reason"] = json!(reason); }
+        hosts.push(host);
+    }
+    Some(json!({"hosts":hosts,"inventory_stale":stale,"snapshot_only":true}))
+}
+
 fn take_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -667,6 +754,39 @@ fn take_chars(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduling_summary_counts_unknown_and_never_promotes_stale_or_incomplete() {
+        let fixture = json!({"device_columns":["id","state","util_pct"],"inventory_stale":false,
+            "hosts":[
+                {"host":"free","state":"free","whole_node_available":true,"devices":[["gpu:0","free",0]]},
+                {"host":"partial","state":"partial","devices":[["gpu:0","free",0],["gpu:1","unknown",null]],"errors":["process query incomplete"]},
+                {"host":"resident","state":"busy","devices":[["gpu:0","busy",0]],"process_count":1},
+                {"host":"down","state":"down","devices":[]},
+                {"host":"unproven","state":"free","whole_node_available":false,"devices":[["gpu:0","free",0]]}
+            ]});
+        let view = scheduling_summary(&fixture).unwrap();
+        assert_eq!(view["hosts"][0], json!({"host":"free","state":"free","free":1,"total":1}));
+        assert_eq!(view["hosts"][1], json!({"host":"partial","state":"partial","free":1,"total":2,
+            "unknown":1,"free_devices":["gpu:0"],"reason":"incomplete_sample"}));
+        assert_eq!(view["hosts"][2]["activity"], "occupied_low_util");
+        assert_eq!(view["hosts"][3]["reason"], "unreachable");
+        assert_eq!(view["hosts"][4]["state"], "unknown");
+        let mut incomplete = fixture.clone();
+        incomplete["hosts"][0]["state"] = json!("partial");
+        incomplete["hosts"][0]["whole_node_available"] = json!(false);
+        incomplete["hosts"][0]["errors"] = json!(["other device class unavailable"]);
+        let view = scheduling_summary(&incomplete).unwrap();
+        assert_eq!(view["hosts"][0]["state"], "partial");
+        assert_eq!(view["hosts"][0]["reason"], "incomplete_sample");
+        let mut stale = fixture;
+        stale["inventory_stale"] = json!(true);
+        let view = scheduling_summary(&stale).unwrap();
+        assert_eq!(view["hosts"][0]["state"], "unknown");
+        assert_eq!(view["hosts"][0]["free"], 0);
+        assert_eq!(view["hosts"][0]["reason"], "inventory_stale");
+        assert_eq!(view["hosts"][2]["state"], "busy");
+    }
 
     #[test]
     fn node_payload_embeds_all_three_modules() {

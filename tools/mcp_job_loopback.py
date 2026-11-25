@@ -17,6 +17,8 @@ from mcp_baseline import encode
 
 
 class LoopbackJobs:
+    packet_limit = 32768
+
     def __init__(self, root, case):
         from paramiko import RSAKey
 
@@ -161,7 +163,7 @@ class LoopbackJobs:
             packet = bytearray()
             while chunk := channel.recv(65536):
                 packet.extend(chunk)
-                if len(packet) > 32768:
+                if len(packet) > self.packet_limit:
                     raise ValueError("oversize fixture operation")
             nonce = re.search(rb"START([0-9a-f]{32})", packet).group(1)
             self.marker(channel, b"\x1eSTART" + nonce + b"\x1f")

@@ -2557,6 +2557,19 @@ pub fn stage_if_large(
         local_result_read_action(&result_id),
     );
 
+    if operation == crate::inspection::OPERATION {
+        if let Some(Value::Object(first_page)) = crate::inspection::scheduling_summary(&value) {
+            summary.extend(first_page);
+            if let Some(raw_id) = value.get("result_id").and_then(Value::as_str) {
+                summary.insert("diagnostics_action".into(), local_result_read_action(raw_id));
+            }
+            if serde_json::to_vec(&summary)?.len() <= budget {
+                return Ok(Value::Object(summary));
+            }
+            for key in ["hosts", "inventory_stale", "snapshot_only", "diagnostics_action"] { summary.remove(key); }
+        }
+    }
+
     // Business-level shape the caller usually needs, without the bulk.
     // Short state fields stay on top: a staged reply must still tell the caller whether
     // the work finished and how to continue.
@@ -3700,6 +3713,29 @@ mod tests {
         let value = json!({"ok": true, "host": "h1"});
         let out = stage_if_large(&store, "jms_job_status", value.clone()).unwrap();
         assert_eq!(out, value);
+    }
+
+    #[test]
+    fn oversized_accelerator_keeps_all_hosts_and_both_detail_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ResultStore::new(directory.path().to_path_buf(), 3600.0, 3600.0).unwrap();
+        let raw_id = store.save_json(&json!({"raw":"diagnostics"}), Map::new()).unwrap();
+        let hosts: Vec<_> = (0..8).map(|i| json!({"host":format!("fixture-{i}"),
+            "state":"free","whole_node_available":true,"devices":[["gpu:0","free",0]],
+            "occupants":["x".repeat(1600)]})).collect();
+        let original = json!({"ok":true,"result_id":raw_id,"inventory_stale":false,
+            "device_columns":["id","state","util_pct"],"hosts":hosts});
+        let out = stage_if_large(&store, crate::inspection::OPERATION, original.clone()).unwrap();
+        assert_eq!(out["staged"], true);
+        assert!(out.get("preview").is_none());
+        assert_eq!(out["hosts"].as_array().unwrap().len(), 8);
+        assert_eq!(out["hosts"][7], json!({"host":"fixture-7","state":"free","free":1,"total":1}));
+        let outer_id = out["result_id"].as_str().unwrap();
+        assert_eq!(out["next_action"], local_result_read_action(outer_id));
+        assert_eq!(out["diagnostics_action"], local_result_read_action(&raw_id));
+        let stored = std::fs::read(store.path(outer_id, "result").unwrap()).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&stored).unwrap(), original);
+        assert!(out.to_string().len() <= OPERATION_BUDGET);
     }
 
     #[test]
