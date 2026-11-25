@@ -229,13 +229,14 @@ reuse handle. Running is not completion; reads honour cursors.",
         },
         ToolSpec {
             name: "job",
-            description: "Detached jobs. Submit needs request_id. Pass returned jobs to wait. See discover.",
+            description: "Submit with request_id; view=brief saves tokens. Pass jobs to wait.",
             input_schema: json!({
                 "type":"object",
                 "additionalProperties":false,
                 "required":["action"],
                 "properties":{
                     "action":{"enum":["submit","wait","logs","status","cancel","list"]},
+                    "view":{"enum":["full","brief"],"description":"Submit only. Brief is for fresh, fully acknowledged inline submits. jobs remains directly usable; result_ids align by position. Full is the default."},
                     "request_id":request_id_property(),
                     "targets":array_of_strings("", None),
                     "target":{"type":"string","minLength":1},
@@ -1129,6 +1130,7 @@ fn public_view(name: &str, schema: Value) -> Value {
         "terminal" => &["action", "target", "session", "script", "input", "options"],
         "job" => &[
             "action",
+            "view",
             "request_id",
             "targets",
             "target",

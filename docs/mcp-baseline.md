@@ -679,3 +679,65 @@ Counts exclude transport startup RPCs. This checks only the documented
 candidate-to-previous pair and the one-target completed case. It does
 not validate all old versions, staged result/action support in an old
 client, a live deployment rollback, or model-provider token usage.
+
+### Opt-in brief Job submission receipt
+
+Use `job(action="submit", view="brief", request_id=…, …)` when the
+next stage only needs the jobs, the request receipt ID, and the launcher
+result IDs. A fresh, fully acknowledged inline response with `view:"brief"`
+returns one `jobs` array, directly accepted by `job(action="wait")`.
+`result_ids[i]` is the launch result for `jobs[i]` and can be opened
+with `read_result`. Job handles belong to the remote job; request and
+result IDs belong to the originating bridge. All identities and artifact
+paths used by the follow-up are retained.
+
+The full/default view and legacy `call` are unchanged. Missing, extra,
+or mismatched evidence, failures, staged replies, and ambiguous or
+duplicate/replayed submissions return the existing full or staged
+shape. The view is removed before mutation fingerprinting. Receipt
+reconciliation through `call request_status` retains the durable
+full submission rows, and changing the view with the same request ID
+does not launch another job. No new short target alias is introduced.
+
+```sh
+python3 tools/mcp_job_brief_measure.py --binary target/release/jms-bridge \
+  --case one-target --repeats 3
+python3 tools/mcp_job_brief_measure.py --binary target/release/jms-bridge \
+  --case above-concurrency --repeats 1
+```
+
+This loopback benchmark is separate from provider token accounting. It
+counts the exact tool result text as the input contribution and the
+tool name plus compact argument JSON as a visible output proxy with
+`o200k_base`. It also verifies result content and exact job identities,
+one launch and one log read per target, and observed status coverage.
+A separate conformance run uses the original launcher result and
+checks that changing the response view retains the request identity and
+does not replay. Those conformance calls are not included in the measured
+completed work. No provider, model reasoning, cache, or live remote
+system is contacted.
+
+With Rust 1.89 locked release (SHA-256
+`3d220fae385909ea75e2b291dd43739b80f41fde1daee9392d6a8d0dd6cdef62`),
+both transports completed three one-target tasks and one six-target
+task per view. Each cell is the mean per completed task across both
+transports. The two token columns count just the workload; startup
+declarations and separate conformance calls are excluded.
+
+| Workload | View | MCP calls | Submit input | All result input | Call output proxy | Result + 5 × output |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| One target | Legacy | 3 | 153.8 | 257.3 | 153.0 | 1,022.3 |
+| One target | Full | 3 | 269.2 | 387.2 | 140.0 | 1,087.2 |
+| One target | Brief | 3 | 98.7 | 216.7 | 144.0 | 936.7 |
+| Six targets | Legacy | 13 | 591.5 | 1,247.0 | 760.0 | 5,047.0 |
+| Six targets | Full | 8 | 899.0 | 1,560.0 | 609.0 | 4,605.0 |
+| Six targets | Brief | 8 | 342.5 | 1,002.5 | 612.0 | 4,062.5 |
+
+Brief saves 13.8% and 11.8% against the full view respectively on
+this weighted proxy. Compared with legacy it saves 8.4% and 19.5%.
+Across both workloads there were no extra calls relative to full,
+no duplicate launches, and no change in observed launch, status, or
+log probe counts; each is exactly one per target per variant.
+The advertised startup envelope including instructions is 7,142 bytes
+(1,785 estimated tokens). Defaults are unchanged. Billing and live
+client behavior still need to be measured separately.
