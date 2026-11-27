@@ -268,6 +268,9 @@ the bridge never substitutes it or sends the rejected call.
   `execution_replayed: false` plus the stored result; it does not run again.
   Recover a lost reply with `call(operation="request_status")` or
   `meta(ref="request:<id>")`.
+  A compact `run` reply with a saved request ID and unknown completion
+  includes a read-only `next_action` for that receipt. It does not rerun the
+  command or change any per-target execution state.
 * Set `[bridge].require_request_id = true` in the server config to reject mutations
   without a caller-generated ID. It covers run, Fs upload/download (download
   writes a local file), terminal open/exec/write/close, and job submit/cancel.
