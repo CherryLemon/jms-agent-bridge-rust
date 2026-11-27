@@ -219,6 +219,29 @@ fn attach_staging(projected: Value, staged: Option<Map<String, Value>>) -> Value
     Value::Object(out)
 }
 
+// This is a presentation-only link. Use the identity returned by the journal,
+// never an argument that did not produce a saved receipt.
+fn link_run_reconciliation(value: &Map<String, Value>, out: &mut Map<String, Value>) {
+    if value.get("operation").and_then(Value::as_str) != Some("run")
+        || !get_bool(value, "completion_unknown")
+        || get_bool(value, "staged")
+    {
+        return;
+    }
+    let Some(id) = value.get("request_id").and_then(Value::as_str) else {
+        return;
+    };
+    out.entry("next_action").or_insert_with(|| {
+        serde_json::json!({
+            "tool": "call",
+            "arguments": {
+                "operation": "request_status",
+                "arguments": {"request_id": id}
+            }
+        })
+    });
+}
+
 fn compact_inner(
     tool: &str,
     value: &Value,
@@ -255,7 +278,11 @@ fn compact_inner(
     }
     if tool == "run" || (tool == "call" && operation == "jms_exec") {
         let Some(Value::Array(results)) = map.get("results") else {
-            return value.clone();
+            let mut out = map.clone();
+            if tool == "run" {
+                link_run_reconciliation(map, &mut out);
+            }
+            return Value::Object(out);
         };
         let rows: Vec<Value> = results
             .iter()
@@ -271,7 +298,11 @@ fn compact_inner(
         if get_bool(map, "inventory_stale") {
             out.insert("inventory_stale".into(), Value::Bool(true));
         }
-        return Value::Object(receipt_flags(map, out));
+        let mut out = receipt_flags(map, out);
+        if tool == "run" {
+            link_run_reconciliation(map, &mut out);
+        }
+        return Value::Object(out);
     }
     if tool == "fs" || (tool == "call" && operation == "jms_fs") {
         // Unknown or failed execution must retain transport diagnostics inline.
@@ -586,6 +617,7 @@ mod tests {
         let row = &view["results"][0];
         assert_eq!(row["completion_unknown"], true);
         assert_eq!(row["execution_state"], "unknown");
+        assert!(view.get("next_action").is_none());
         // Failed rows keep their full diagnostic payload.
         assert!(row.get("timing").is_some());
     }

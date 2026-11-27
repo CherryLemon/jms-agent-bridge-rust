@@ -35,6 +35,7 @@ max_parallel = 2\n",
         .await
         .expect("runtime starts without network");
     let server = BridgeServer::new(runtime.clone());
+    compact_run_uncertainty_links_only_the_saved_receipt(&runtime, &server).await;
 
     // Eight tools stay advertised, with closed schemas.
     let tools = server.tool_specs();
@@ -1637,6 +1638,70 @@ async fn seed_saved_run(
         .execute(id, "run", &business, |_| async { Ok(value) })
         .await
         .unwrap();
+}
+
+async fn compact_run_uncertainty_links_only_the_saved_receipt(
+    runtime: &BridgeRuntime,
+    server: &BridgeServer,
+) {
+    let cases = [
+        ("unknown", Value::Null, true, 255, "execution", false),
+        ("not_started", json!(false), false, 75, "shell_startup", false),
+        ("completed", json!(true), false, 1, "", false),
+        ("completed", json!(true), false, 0, "", true),
+    ];
+    for (i, (state, executed, unknown, exit, stage, ok)) in cases.into_iter().enumerate() {
+        let id = format!("offline-run-action-{i}");
+        let targets = vec!["fixture-only".to_string()];
+        let mut rows = vec![json!({
+            "host":"fixture-only","ok":ok,"execution_state":state,"exit_code":exit,
+            "executed":executed,"completion_unknown":unknown
+        })];
+        if !stage.is_empty() {
+            rows[0]["failure_stage"] = json!(stage);
+        }
+        if unknown {
+            rows.push(json!({"host":"fixture-only-ready","ok":true,
+                "execution_state":"completed","exit_code":0}));
+        }
+        seed_saved_run(runtime, &id, &targets, 4096, json!({"ok":ok,"results":rows})).await;
+        let args = object(json!({"targets":targets,"script":":","request_id":id}));
+        let out = server.dispatch("run", args.clone()).await.unwrap();
+        assert_eq!(out["results"][0]["exit_code"], exit);
+        assert_eq!(out["results"][0]["execution_state"], state);
+        if !stage.is_empty() {
+            assert_eq!(out["results"][0]["failure_stage"], stage);
+        }
+        if unknown {
+            let action = &out["next_action"];
+            assert_eq!(action["tool"], "call");
+            assert_eq!(action["arguments"]["arguments"]["request_id"], id);
+            let lookup = server.dispatch("call", object(action["arguments"].clone())).await.unwrap();
+            assert_eq!(lookup["request_id"], id);
+            assert_eq!(lookup["completion_unknown"], true);
+            assert_eq!(lookup["results"][0]["executed"], Value::Null);
+            assert_eq!(lookup["results"][1]["exit_code"], 0);
+            assert!(lookup.get("next_action").is_none());
+            let mut full = args;
+            full.insert("detail".into(), json!("full"));
+            assert!(server.dispatch("run", full).await.unwrap().get("next_action").is_none());
+        } else {
+            assert!(out.get("next_action").is_none());
+        }
+    }
+    let id = "offline-run-interrupted-action";
+    let business = json!({
+        "targets":["fixture-only"], "script":":", "cwd":null, "env":null,
+        "container":null, "image":null, "docker_args":null, "session_id":null,
+        "timeout":60, "max_output_bytes":4096, "allow_dangerous":false
+    });
+    runtime.journal.claim(id, "run", &business).unwrap();
+    let out = server.dispatch("run", object(json!({
+        "targets":["fixture-only"],"script":":","request_id":id
+    }))).await.unwrap();
+    assert_eq!(out["request_state"], "interrupted");
+    assert_eq!(out["next_action"]["arguments"]["arguments"]["request_id"], id);
+    assert!(out.get("results").is_none());
 }
 
 async fn run_saved_view_fanout_and_paging(runtime: &BridgeRuntime, server: &BridgeServer) {
